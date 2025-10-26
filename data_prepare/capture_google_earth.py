@@ -31,14 +31,14 @@ def capture_kml_screenshots_ge_pro(kml_folder, output_folder):
     
     print("等待Google Earth Pro启动...")
     time.sleep(5)  # 等待Google Earth完全加载
-    
-    # 设置Google Earth截图选项（首次运行可能需要设置）
-    # 这里可以添加代码来设置默认截图选项
+    output_path = os.path.join(output_folder, f"0000.png")
     
     for kml_file in kml_files:
         kml_path = os.path.join(kml_folder, kml_file)
         base_name = os.path.splitext(kml_file)[0]
-        output_path = os.path.join(output_folder, f"{base_name}.jpg")
+        while not os.path.exists(output_path):
+            time.sleep(10)
+        output_path = os.path.join(output_folder, f"{base_name}.png")
         if os.path.exists(output_path):
             continue
         
@@ -56,7 +56,7 @@ def capture_kml_screenshots_ge_pro(kml_folder, output_folder):
             time.sleep(1)
             pyautogui.press('enter')
             pyautogui.press('enter')
-            time.sleep(15)  # 等待KML加载，可能需要更长时间取决于文件大小
+            time.sleep(30)  # 等待KML加载，可能需要更长时间取决于文件大小
             # pyautogui.click(x=500, y=1300)  # 点击"保存图像"
             # time.sleep(1)            
             # pyautogui.click(x=2500, y=1300)  # 点击"保存图像"
@@ -65,22 +65,13 @@ def capture_kml_screenshots_ge_pro(kml_folder, output_folder):
             # time.sleep(1)
             # pyautogui.click(x=2500, y=200)  # 点击"保存图像"
             # time.sleep(1)
-            pyautogui.click(x=1300, y=170)  # 点击"保存图像"
-            time.sleep(3)       
+            pyautogui.click(x=1200, y=150)  # 点击"保存图像"
+            time.sleep(1)       
             # # 在保存对话框中设置文件名和路径
             pyautogui.write(output_path)
             time.sleep(1)
             pyautogui.press('enter')
             pyautogui.press('enter')
-            time.sleep(3)  # 等待保存完成
-            
-            # # 关闭截图对话框（如果有）
-            # pyautogui.press('esc')
-            # time.sleep(2)
-            
-            # # 关闭当前KML (可选)
-            # pyautogui.hotkey('ctrl', 'shift', 'w')
-            # time.sleep(2)
             
         except Exception as e:
             print(f"处理文件 {kml_file} 时出错: {e}")
@@ -121,7 +112,7 @@ def process_kml_file(input_path, output_folder):
 
             range_elem = lookat.find('kml:range', ns)
             if range_elem is not None:
-                range_elem.text = '512'
+                range_elem.text = '1024'
 
         # 确保输出文件夹存在
         os.makedirs(output_folder, exist_ok=True)
@@ -160,12 +151,12 @@ def batch_process_kml_files(input_folder, output_folder):
 
 def batch_process():
     input_folder = r'D:\intern\university1652-first-key\first-key'
-    output_folder = r'D:\intern\data\kml_512'
+    output_folder = r'D:\intern\data\kml_1024'
     batch_process_kml_files(input_folder, output_folder)
 
 
 if __name__=='__main__':
     # batch_process()
-    kml_folder = r'D:\intern\data\kml_512'
-    output_folder = r'D:\intern\data\image_512'
+    kml_folder = r'D:\intern\data\kml_1024'
+    output_folder = r'D:\intern\data\image_1024'
     capture_kml_screenshots_ge_pro(kml_folder, output_folder)

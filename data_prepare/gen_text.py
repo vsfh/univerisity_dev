@@ -17,7 +17,8 @@ def call_with_messages(index):
         "content": [],
     }
     
-    img_list = glob.glob(fr"D:\intern\University-Release\test\gallery_drone\{index}\*.jpeg")
+    # img_list = glob.glob(fr"D:\intern\University-Release\test\gallery_drone\{index}\*.jpeg")
+    img_list = glob.glob(fr"D:\intern\University-Release\train\drone\{index}\*.jpeg")
     for i in range(1):
         img_path = random.choice(img_list)
         base64_image = encode_image(img_path)
@@ -27,14 +28,14 @@ def call_with_messages(index):
             }
         )
            
-    user_message['content'].append( {"type": "text", "text": "describe the satellite view of the target building in the images' center for user to find them on the satellite image in few sentences"})
+    user_message['content'].append( {"type": "text", "text": "describe the satellite view of the region in the image within 45 tokens unique for people to find the region on the map"})
     client = OpenAI(
         # 若没有配置环境变量，请用百炼API Key将下行替换为：api_key="sk-xxx"
         api_key='sk-c50916c57fbe41ffb70c09be373c9136',
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
     )
     completion = client.chat.completions.create(
-        model="qwen-vl-max-latest", # 此处以qwen-vl-max-latest为例，可按需更换模型名称。模型列表：https://help.aliyun.com/zh/model-studio/models
+        model="qwen-vl-max-2025-08-13", # 此处以qwen-vl-max-latest为例，可按需更换模型名称。模型列表：https://help.aliyun.com/zh/model-studio/models
         messages=[
             {
                 "role": "system",
@@ -62,8 +63,9 @@ def call_with_messages(index):
 
 if __name__ == '__main__':
     import os
-    for index in os.listdir(r'D:\intern\University-Release\test\gallery_drone'):
-        output_path = fr'D:\intern\data\drone_text\{index}.json'
+    # for index in os.listdir(r'D:\intern\University-Release\test\gallery_drone'):
+    for index in os.listdir(r'D:\intern\University-Release\train\drone'):
+        output_path = fr'D:\intern\data\drone_text_sec\{index}.json'
         if os.path.exists(output_path):
             continue
         message = call_with_messages(index)
