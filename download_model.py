@@ -1,6 +1,5 @@
 import torch
 import os
-os.environ['HF_TOKEN'] = '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'
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 os.environ['HF_HOME'] = '/home/SATA4T/gregory/hf_cache'
 device = "cuda" if torch.cuda.is_available() else "cpu"
