@@ -1,0 +1,2 @@
+proxychains /home/SATA4T/gregory/zero/ZeroStereo/env/bin/python find_bbox.py
+proxychains /home/SATA4T/gregory/zero/ZeroStereo/env/bin/python feature_extract.py
