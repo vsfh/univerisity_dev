@@ -14,8 +14,8 @@ import json
 # --- Configuration ---
 # It's good practice to use variables for paths for easier modification
 MODEL_PATH = "/home/SATA4T/gregory/hf_cache/models--google--siglip-base-patch16-224/snapshots/7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed"
-DRONE_VIEW_FOLDER = "/home/SATA4T/gregory/data/drone_view"
-IMAGE_FOLDER = "/home/SATA4T/gregory/data/image_1024"
+DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
+IMAGE_FOLDER = "/data/feihong/image_1024"
 
 NUM_EPOCHS = 40
 BATCH_SIZE = 5
