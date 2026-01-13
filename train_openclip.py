@@ -453,8 +453,8 @@ if __name__ == '__main__':
         print(f"Created experiment directory: {save_dir}")
 
     # Run training
-    # main(save_dir)
+    main(save_dir)
     
     # Run evaluation
-    eval(True)  # Extract features
-    eval(False) # Calculate metrics
+    # eval(True)  # Extract features
+    # eval(False) # Calculate metrics

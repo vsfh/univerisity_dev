@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from transformers import Blip2Processor, Blip2ForConditionalGeneration
+from transformers import Blip2Processor, Blip2ForConditionalGeneration, Blip2TextEmbeddings
 from PIL import Image
 from tqdm import tqdm
 import os
@@ -27,13 +27,13 @@ DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
 IMAGE_FOLDER = "/data/feihong/image_1024"
 
 NUM_EPOCHS = 40
-BATCH_SIZE = 10
+BATCH_SIZE = 2
 LEARNING_RATE = 1e-5
-DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 PROJECTION_DIM = 768
 
 # LoRA Configuration
-USE_LORA = True  # Set to False to disable LoRA
+USE_LORA = False  # Set to False to disable LoRA
 LORA_R = 16  # LoRA rank
 LORA_ALPHA = 32  # LoRA alpha scaling parameter
 LORA_DROPOUT = 0.1  # LoRA dropout
@@ -51,7 +51,7 @@ class TargetSearchDataset(Dataset):
         
         self.crop_size = 2160 // 5 * 3  # 1296
         self.mode = mode
-        self.remove = ['**', '\n', 'noun', 'phrases', 'Phrase', 'Noun', 'Summary', 'Environment', '32 tokens']
+        self.remove = ['**', '\n', 'noun', 'phrases', 'Phrase', 'Noun', 'Summary', 'Environment', '32 tokens', 'Description', '()']
 
     def __len__(self):
         return len(self.image_paths)
@@ -126,7 +126,7 @@ class TargetSearchDataset(Dataset):
         # Process images and text with BLIP-2 processor
         query_inputs = self.processor(images=query_image, return_tensors="pt")
         search_inputs = self.processor(images=augmented_crop_image, return_tensors="pt")
-        text_inputs = self.processor(text=text_description, return_tensors="pt", padding="max_length", truncation=True, max_length=32)
+        text_inputs = self.processor(text=text_description, return_tensors="pt", padding="max_length", truncation=True, max_length=128)
         
         return {
             'target_pixel_values': query_inputs['pixel_values'][0],
@@ -143,9 +143,10 @@ class Encoder(nn.Module):
         
         # Load BLIP-2 model
         try:
+            self.module_dtype = torch.float16 if "cuda" in str(DEVICE) else torch.float32
             self.blip2_model = Blip2ForConditionalGeneration.from_pretrained(
                 model_name,
-                torch_dtype=torch.float16 if "cuda" in str(DEVICE) else torch.float32,
+                torch_dtype=self.module_dtype,
                 cache_dir=CACHE_DIR
             )
             
@@ -158,8 +159,12 @@ class Encoder(nn.Module):
             
             self.vision_model = self.blip2_model.vision_model
             self.qformer = self.blip2_model.qformer
-            self.language_model = self.blip2_model.language_model
-            
+            # self.language_model = self.blip2_model.language_model
+            self.embeddings = Blip2TextEmbeddings.from_pretrained(
+                model_name,
+                torch_dtype=self.module_dtype,
+                cache_dir=CACHE_DIR
+            )
             # Get feature dimensions
             self.feature_dim = self.vision_model.config.hidden_size
             self.text_feature_dim = self.qformer.config.hidden_size
@@ -175,25 +180,27 @@ class Encoder(nn.Module):
             nn.Linear(self.feature_dim, self.feature_dim * 2),
             nn.ReLU(),
             nn.Linear(self.feature_dim * 2, proj_dim)
-        )
+        ).to(self.module_dtype)
         
         self.text_projector = nn.Sequential(
             nn.Linear(self.text_feature_dim, self.text_feature_dim * 2),
             nn.ReLU(),
             nn.Linear(self.text_feature_dim * 2, proj_dim)
-        )
+        ).to(self.module_dtype)
         
         # Fusion MLP
         self.fusion_mlp = nn.Sequential(
             nn.Linear(proj_dim * 2, proj_dim * 2),
             nn.ReLU(),
             nn.Linear(proj_dim * 2, proj_dim)
-        )
+        ).to(self.module_dtype)
 
     def ref_forward(self, pixel_values):
         # BLIP-2 vision model processing
         vision_outputs = self.vision_model(pixel_values)
         vision_features = vision_outputs.last_hidden_state
+
+        vision_features = vision_features[:,:-1,:]
         
         B, N, D = vision_features.shape
         H = W = int(N**0.5)
@@ -424,7 +431,7 @@ def eval(run=False):
             encoder.blip2_model = PeftModel.from_pretrained(encoder.blip2_model, lora_path)
             encoder.vision_model = encoder.blip2_model.vision_model
             encoder.qformer = encoder.blip2_model.qformer
-            encoder.language_model = encoder.blip2_model.language_model
+            # encoder.language_model = encoder.blip2_model.language_model
         
         # Load projection heads and other weights
         if os.path.exists(model_path):
@@ -534,8 +541,8 @@ if __name__ == '__main__':
         print(f"Created experiment directory: {save_dir}")
 
     # Run training
-    # main(save_dir)
+    main(save_dir)
     
     # Run evaluation
-    eval(True)  # Extract features
-    eval(False) # Calculate metrics
+    # eval(True)  # Extract features
+    # eval(False) # Calculate metrics

@@ -21,7 +21,7 @@ IMAGE_FOLDER = "/data/feihong/image_1024"
 NUM_EPOCHS = 40
 BATCH_SIZE = 10
 LEARNING_RATE = 1e-5
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
 PROJECTION_DIM = 768
 
 
@@ -163,6 +163,7 @@ class Encoder(nn.Module):
     def ref_forward(self, pixel_values):
         outputs = self.vision_model(pixel_values)
         patch_tokens = outputs.last_hidden_state
+        patch_tokens = patch_tokens[:,:-1,:]
         
         B, N, D = patch_tokens.shape
         H = W = int(N**0.5)
