@@ -1,12 +1,13 @@
-import torch
-from transformers import CLIPModel, CLIPProcessor, SiglipModel, SiglipProcessor
+# import torch
+# from transformers import CLIPModel, CLIPProcessor, SiglipModel, SiglipProcessor
+import glob
 from PIL import Image
 import numpy as np
 import os
 os.environ['HF_HOME'] = '/home/SATA4T/gregory/hf_cache'
 from tqdm import tqdm
 img_root = '/weka/data/lab/yan/huzhang/huzhang/gregory/code/X-VLM/data/image_1024'
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# device = "cuda" if torch.cuda.is_available() else "cpu"
 custom_cache_path = "/home/SATA4T/gregory/hf_cache"
 def clip_siglip_feature_extraction(image_folder = "image_512",output_folder = "features"):
     # Load models and processors
@@ -243,15 +244,32 @@ def search_img(search_img_num, name):
     print('save ok')
     
         
+def split_set():
+    n_train = -400
+    output_dir = '/data/feihong/ckpt'
+    drone_img_list = glob.glob('/data/feihong/drone_view/*/*/image-01.jpeg')
+    train_list = drone_img_list[:n_train]
+    test_list = drone_img_list[n_train:]
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "train.txt"), "w") as f:
+        for path in train_list:
+            f.write(path+'\n')
+    f.close()
+    with open(os.path.join(output_dir, "test.txt"), "w") as f:
+        for path in test_list:
+            f.write(path+'\n')
+    f.close()
+        
 if __name__ == '__main__':
-    clip_siglip_large_feature_extraction(img_root, '/data/lab/yan/huzhang/huzhang/gregory/data/features_dict', large=True)
-    clip_siglip_large_feature_extraction(img_root, '/data/lab/yan/huzhang/huzhang/gregory/data/features_dict', large=False)
+    # clip_siglip_large_feature_extraction(img_root, '/data/lab/yan/huzhang/huzhang/gregory/data/features_dict', large=True)
+    # clip_siglip_large_feature_extraction(img_root, '/data/lab/yan/huzhang/huzhang/gregory/data/features_dict', large=False)
     # clip_siglip_feature_extraction('first_site', 'features_query')
     # eva_clip_feature_extraction('first_site', 'features_query')
-    eva_clip_large_feature_extraction(img_root, '/data/lab/yan/huzhang/huzhang/gregory/data/features_dict')
+    # eva_clip_large_feature_extraction(img_root, '/data/lab/yan/huzhang/huzhang/gregory/data/features_dict')
     # search_img(100, '_clip_l')
     # search_img(100, '_clip')
     # search_img(100, '_siglip')
     # search_img(100, '_siglip_l')
     # search_img(100, '_eva_clip_l')
     # search_img(100, '_eva_clip_b')
+    split_set()

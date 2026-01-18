@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from transformers import CLIPModel, CLIPProcessor
+from transformers import AutoImageProcessor, AutoModel, AutoTokenizer
 from PIL import Image
 from tqdm import tqdm
 import os
@@ -13,8 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 import json
 
 # --- Configuration ---
-MODEL_NAME = "openai/clip-vit-base-patch32"
-# MODEL_NAME = "openai/clip-vit-large-patch14"
+MODEL_NAME = "google/siglip-base-patch16-224"
 CACHE_DIR = "/data/feihong/hf_cache"
 DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
 IMAGE_FOLDER = "/data/feihong/image_1024"
@@ -22,14 +21,17 @@ IMAGE_FOLDER = "/data/feihong/image_1024"
 NUM_EPOCHS = 40
 BATCH_SIZE = 20
 LEARNING_RATE = 1e-5
-DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 PROJECTION_DIM = 768
 
 
 class TargetSearchDataset(Dataset):
-    def __init__(self, image_pairs, processor, img_to_text_dict, mode="train"):
+    def __init__(
+        self, image_pairs, processor, tokenizer, img_to_text_dict, mode="train"
+    ):
         self.image_paths = image_pairs
         self.processor = processor
+        self.tokenizer = tokenizer
         self.img_to_text_dict = img_to_text_dict
 
         self.crop_size = 2160 // 5 * 3  # 1296
@@ -44,6 +46,8 @@ class TargetSearchDataset(Dataset):
             "Summary",
             "Environment",
             "32 tokens",
+            "Description",
+            "()",
         ]
 
     def __len__(self):
@@ -124,17 +128,16 @@ class TargetSearchDataset(Dataset):
             )
             index = 4
 
-        # Process images and text with CLIP processor
-        query_inputs = self.processor(images=query_image, return_tensors="pt")
-        search_inputs = self.processor(images=augmented_crop_image, return_tensors="pt")
-        text_inputs = self.processor(
-            text=text_description,
-            return_tensors="pt",
+        text_inputs = self.tokenizer(
+            [text_description],
             padding="max_length",
             truncation=True,
-            max_length=77,
+            max_length=64,
+            return_tensors="pt",
         )
-
+        query_inputs = self.preprocess(query_image)
+        search_inputs = self.preprocess(augmented_crop_image)
+        
         return {
             "target_pixel_values": query_inputs["pixel_values"][0],
             "search_pixel_values": search_inputs["pixel_values"][0],
@@ -148,26 +151,18 @@ class Encoder(nn.Module):
     def __init__(self, model_name, proj_dim=768):
         super().__init__()
 
-        # Load CLIP model
         try:
-            self.clip_model = CLIPModel.from_pretrained(model_name, cache_dir=CACHE_DIR)
-            self.vision_model = self.clip_model.vision_model
-            self.text_model = self.clip_model.text_model
+            self.model = AutoModel.from_pretrained(model_name, cache_dir=CACHE_DIR)
+            self.vision_model = self.model.vision_model
+            self.text_model = self.model.text_model
+
             self.feature_dim = self.vision_model.config.hidden_size
             self.text_feature_dim = self.text_model.config.hidden_size
         except Exception as e:
-            print(f"Error loading CLIP model: {e}")
+            print(f"Error loading SIGLIP model: {e}")
             raise
 
-        # Vision Pooling
         self.pool = nn.AdaptiveAvgPool2d((3, 3))
-
-        # Projection Heads
-        # self.vision_projector = nn.Sequential(
-        #     nn.Linear(self.feature_dim, self.feature_dim * 2),
-        #     nn.ReLU(),
-        #     nn.Linear(self.feature_dim * 2, proj_dim)
-        # )
 
         self.text_projector = nn.Sequential(
             nn.Linear(self.text_feature_dim, self.text_feature_dim * 2),
@@ -175,49 +170,30 @@ class Encoder(nn.Module):
             nn.Linear(self.text_feature_dim * 2, proj_dim),
         )
 
-        # Fusion MLP
-        # self.fusion_mlp = nn.Sequential(
-        #     nn.Linear(proj_dim * 2, proj_dim * 2),
-        #     nn.ReLU(),
-        #     nn.Linear(proj_dim * 2, proj_dim)
-        # )
-
     def ref_forward(self, pixel_values):
-        outputs = self.vision_model(pixel_values)
-        patch_tokens = outputs.last_hidden_state
-        patch_tokens = patch_tokens[:, :-1, :]
+        vision_outputs = self.vision_model(pixel_values)
+        vision_features = vision_outputs.last_hidden_state
 
-        B, N, D = patch_tokens.shape
+        B, N, D = vision_features.shape
         H = W = int(N**0.5)
 
-        patch_tokens_for_pooling = patch_tokens.permute(0, 2, 1).reshape(B, D, H, W)
+        patch_tokens_for_pooling = vision_features.permute(0, 2, 1).reshape(B, D, H, W)
         pooled_features = self.pool(patch_tokens_for_pooling)
         final_features = pooled_features.flatten(2).permute(0, 2, 1)
 
-        # projected_features = self.vision_projector(final_features)
-        return final_features  # [B, 9, 768]
+        return final_features
 
     def query_forward(self, pixel_values):
         pooled_features = self.vision_model(pixel_values).pooler_output
-        # projected_features = self.vision_projector(pooled_features)
-        return pooled_features  # [B, 768]
+        return pooled_features
 
-    def text_forward(self, input_ids, attention_mask):
-        outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
-        pooler_output = outputs.pooler_output
-
-        # mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
-        # sum_embeddings = torch.sum(last_hidden_state * mask_expanded, 1)
-        # sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
-        # mean_pooled_features = sum_embeddings / sum_mask
-
-        projected_features = self.text_projector(pooler_output)
-        return projected_features  # [B, 768]
-
-    # def forward_fusion(self, vision_feat, text_feat):
-    #     combined_input = torch.cat([vision_feat, text_feat], dim=1)
-    #     fused_feat = self.fusion_mlp(combined_input)
-    #     return fused_feat
+    def text_forward(self, input_ids, attention_mask=None):
+        text_outputs = self.text_model(
+            input_ids=input_ids, attention_mask=attention_mask
+        )
+        pooler_output = text_outputs.pooler_output
+        proj_feature = self.text_projector(pooler_output)
+        return proj_feature
 
 
 def info_nce_loss(query_feats, candidate_feats, positive_indices, temperature=0.07):
@@ -233,6 +209,26 @@ def main(save_path):
     writer = SummaryWriter(f"runs/{exp_name}")
 
     print("Gathering image pairs...")
+    image_pairs = []
+    for query_path in tqdm(glob(f"{DRONE_VIEW_FOLDER}/*/*/image-01.jpeg")):
+        name = query_path.split("/")[-2]
+        search_path = f"{IMAGE_FOLDER}/{name}.png"
+        if os.path.exists(search_path):
+            image_pairs.append((query_path, search_path))
+    print(f"Found {len(image_pairs)} valid pairs.")
+
+    print("Loading models and processor...")
+    processor = AutoImageProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
+
+    model = Encoder(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM).to(DEVICE)
+    model.train()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+
+    img_to_text_dict = json.load(open("/data/feihong/drone_text_single_long.json", "r"))
+
+    print("Setting up dataset and dataloader...")
+    # Load training image pairs from /data/feihong/ckpt/train.txt
     train_image_pairs = []
     with open("/data/feihong/ckpt/train.txt", "r") as f:
         for line in f:
@@ -249,20 +245,11 @@ def main(save_path):
             search_path = f"{IMAGE_FOLDER}/{name}.png"
             if os.path.exists(search_path):
                 test_image_pairs.append((query_path, search_path))
-
-    print("Loading models and processor...")
-    processor = CLIPProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
-
-    model = Encoder(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM).to(DEVICE)
-    model.train()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-
-    img_to_text_dict = json.load(open("/data/feihong/drone_text_single_long.json", "r"))
-
-    print("Setting up dataset and dataloader...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     train_dataset = TargetSearchDataset(
         image_pairs=train_image_pairs,
         processor=processor,
+        tokenizer=tokenizer,
         img_to_text_dict=img_to_text_dict,
     )
     train_dataloader = DataLoader(
@@ -272,6 +259,7 @@ def main(save_path):
     test_dataset = TargetSearchDataset(
         image_pairs=test_image_pairs,
         processor=processor,
+        tokenizer=tokenizer,
         img_to_text_dict=img_to_text_dict,
         mode="test",
     )
@@ -290,13 +278,12 @@ def main(save_path):
             target_pixel_values = batch["target_pixel_values"].to(DEVICE)
             search_pixel_values = batch["search_pixel_values"].to(DEVICE)
             input_ids = batch["input_ids"].to(DEVICE)
-            attention_mask = batch["attention_mask"].to(DEVICE)
             local_indices = batch["index"].to(DEVICE)
 
             anchor_feats = model.query_forward(target_pixel_values)
             grid_feats = model.ref_forward(search_pixel_values)
             candidate_feats = grid_feats.reshape(-1, PROJECTION_DIM)
-            text_feats = model.text_forward(input_ids, attention_mask)
+            text_feats = model.text_forward(input_ids)
 
             positive_indices = torch.zeros(
                 local_indices.shape[0], local_indices.shape[0] * 9, device=DEVICE
@@ -314,19 +301,18 @@ def main(save_path):
             positive_indices[row_indices_flat, global_positive_indices] = 0.95
 
             # combined_query_feats = model.forward_fusion(anchor_feats, text_feats)
-            # img_text_loss = info_nce_loss(combined_query_feats, candidate_feats, positive_indices)
-            img_loss = info_nce_loss(anchor_feats, candidate_feats, positive_indices)
-            text_loss = info_nce_loss(text_feats, candidate_feats, positive_indices)
-            loss = img_loss + text_loss
+            img_text_loss = info_nce_loss(
+                anchor_feats, candidate_feats, positive_indices
+            ) + info_nce_loss(text_feats, candidate_feats, positive_indices)
 
-            # loss = img_text_loss
+            loss = img_text_loss
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
-            progress_bar.set_postfix({"img_text_loss": f"{loss.item():.4f}"})
+            progress_bar.set_postfix({"img_text_loss": f"{img_text_loss.item():.4f}"})
             writer.add_scalar(
                 "Loss/train_batch", loss.item(), epoch * len(train_dataloader) + i
             )
@@ -344,6 +330,7 @@ def main(save_path):
 
         if txt_val_loss < min_loss:
             os.makedirs(save_path, exist_ok=True)
+            # Save full model state dict (including projection heads)
             torch.save(model.state_dict(), f"{save_path}/best.pth")
             min_loss = txt_val_loss
             not_update = 0
@@ -365,7 +352,6 @@ def validation(model, loader, epoch):
         target_pixel_values = batch["target_pixel_values"].to(DEVICE)
         search_pixel_values = batch["search_pixel_values"].to(DEVICE)
         input_ids = batch["input_ids"].to(DEVICE)
-        attention_mask = batch["attention_mask"].to(DEVICE)
         local_indices = batch["index"].to(DEVICE)
 
         batch_offsets = torch.arange(local_indices.shape[0], device=DEVICE) * 9
@@ -374,7 +360,7 @@ def validation(model, loader, epoch):
         with torch.no_grad():
             anchor_feats = model.query_forward(target_pixel_values)
             grid_feats = model.ref_forward(search_pixel_values)
-            text_feats = model.text_forward(input_ids, attention_mask)
+            text_feats = model.text_forward(input_ids)
 
             candidate_feats = grid_feats.reshape(-1, PROJECTION_DIM)
 
@@ -400,12 +386,16 @@ def eval(run=False):
         img_to_text_dict = json.load(
             open("/data/feihong/drone_text_single_long.json", "r")
         )
-        processor = CLIPProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
+        processor = AutoImageProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
         encoder = Encoder(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM).to(DEVICE)
-        model_path = f"../ckpt/train_clip/best.pth"
+        model_path = f"../ckpt/train_siglip_proj/best.pth"
+
         if os.path.exists(model_path):
-            encoder.load_state_dict(torch.load(model_path, map_location="cpu"))
+            encoder.load_state_dict(
+                torch.load(model_path, map_location="cpu"), strict=False
+            )
         encoder.eval()
 
         res_search = {}
@@ -450,20 +440,19 @@ def eval(run=False):
                     search_inputs = processor(images=search_image, return_tensors="pt")[
                         "pixel_values"
                     ].to(DEVICE)
-                    text_inputs = processor(
-                        text=text_description,
-                        return_tensors="pt",
+                    text_inputs = tokenizer(
+                        text_description,
                         padding="max_length",
                         truncation=True,
-                        max_length=77,
+                        max_length=64,
+                        return_tensors="pt",
                     )
                     input_ids = text_inputs["input_ids"].to(DEVICE)
-                    attention_mask = text_inputs["attention_mask"].to(DEVICE)
 
                     with torch.no_grad():
                         anchor_feats = encoder.query_forward(query_inputs)
                         grid_feats = encoder.ref_forward(search_inputs)
-                        text_feats = encoder.text_forward(input_ids, attention_mask)
+                        text_feats = encoder.text_forward(input_ids)
                         fused_query_feats = anchor_feats + text_feats
 
                     res_search[name] = grid_feats.cpu().numpy()
@@ -471,12 +460,12 @@ def eval(run=False):
                 except Exception as e:
                     print(f"Error processing {name}: {e}")
 
-        np.savez("eval_search_clip.npz", **res_search)
-        np.savez("eval_fused_query_clip.npz", **res_fused_query)
+        np.savez("eval_search_siglip.npz", **res_search)
+        np.savez("eval_fused_query_siglip.npz", **res_fused_query)
         print("Evaluation feature extraction complete.")
     else:
-        search_res = np.load("eval_search_clip.npz")
-        fused_query_res = np.load("eval_fused_query_clip.npz")
+        search_res = np.load("eval_search_siglip.npz")
+        fused_query_res = np.load("eval_fused_query_siglip.npz")
 
         distances = json.load(open("/data/feihong/ckpt/distances.json", "r"))
         test_num = 100
@@ -532,7 +521,7 @@ def eval(run=False):
 
 
 if __name__ == "__main__":
-    exp_name = "train_clip"
+    exp_name = "train_siglip_proj"
     save_dir = f"../ckpt/{exp_name}"
 
     if os.path.exists(save_dir):

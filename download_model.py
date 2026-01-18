@@ -71,7 +71,7 @@ def qwen():
         "Qwen/Qwen3-VL-4B-Instruct", dtype="auto", device_map="auto"
     )
     processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-4B-Instruct")
-    
+
 def nvemb():
     from transformers import AutoImageProcessor, AutoModel
     model_name = "nvidia/NV-Embed-v1"
@@ -114,20 +114,20 @@ def download_vision_models(cache_dir=None, models_to_download=None):
     # 定義所有可用的模型
     all_models = {
         'siglip': {
-            'base': 'google/siglip-base-patch16-224',
-            # 'large': 'google/siglip-large-patch16-256'
+            # 'base': 'google/siglip-base-patch16-224',
+            'large': 'google/siglip-large-patch16-256'
         },
         'clip': {
-            'base': 'openai/clip-vit-base-patch32',
-            # 'large': 'openai/clip-vit-large-patch14'
+            # 'base': 'openai/clip-vit-base-patch32',
+            'large': 'openai/clip-vit-large-patch14'
         },
         'openclip': {
-            'base': 'ViT-B-32',
-            # 'large': 'ViT-L-14'
+            # 'base': 'ViT-B-32',
+            'large': 'ViT-L-14'
         },
         'evaclip': {
-            'base': 'hf-hub:timm/eva02_base_patch16_clip_224.merged2b_s8b_b131k',
-            # 'large': 'hf-hub:timm/eva02_large_patch14_clip_336.merged2b_s6b_b61k'
+            # 'base': 'hf-hub:timm/eva02_base_patch16_clip_224.merged2b_s8b_b131k',
+            'large': 'hf-hub:timm/eva02_large_patch14_clip_336.merged2b_s6b_b61k'
         },
         'blip2': {
             'base': 'Salesforce/blip2-opt-2.7b',
@@ -232,4 +232,4 @@ def download_vision_models(cache_dir=None, models_to_download=None):
     return downloaded_models
 
 if __name__=='__main__':
-    download_vision_models()
+    qwen()
