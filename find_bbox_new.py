@@ -7,7 +7,7 @@ from loguru import logger
 from tqdm import tqdm
 import cv2
 import numpy as np
-
+import random
 try:
     from perceptron.tensorstream import VisionType
     from perceptron.tensorstream.ops import tensor_stream_token_view, modality_mask
@@ -19,8 +19,8 @@ HF_PATH = "PerceptronAI/Isaac-0.1"
 CACHE_DIR = "/data/feihong/hf_cache"
 INPUT_DIR = "/data/feihong/image_1024"
 OUTPUT_DIR = "/data/feihong/univerisity_dev/runs/img"
-OUTPUT_JSON = "bbox_results_new.json"
-NUM_IMAGES = 100
+OUTPUT_JSON = "runs/bbox_isaac.json"
+NUM_IMAGES = 1650
 PROMPT = "Locate and provide the bounding box for the single building positioned at the center of this aerial image. Focus on the main central structure only."
 
 os.environ["HF_HOME"] = CACHE_DIR
@@ -48,7 +48,47 @@ model.eval()
 
 logger.info(f"Model loaded on {device} with dtype {dtype}")
 
+def format_satellite_img_bbox(
+    image,
+    target_size = (640, 640),
+):
+    """
+    Process satellite image with appropriate augmentation and update bbox coordinates.
 
+    Args:
+        image: Input satellite image
+        bbox: Original bbox [x1, y1, x2, y2] in image coordinates, or None
+        mode: 'train' for random augmentation, 'test' for deterministic
+        target_size: Output image size (width, height)
+
+    Returns:
+        Tuple of (processed image, normalized bbox [x1, y1, x2, y2] in [0, 1])
+    """
+    width, height = image.size
+    target_width, target_height = target_size
+
+    if width > height:
+        new_width = height
+        left = (width - new_width) // 2
+        right = left + new_width
+        top = 0
+        bottom = height
+    elif height > width:
+        new_height = width
+        top = (height - new_height) // 2
+        bottom = top + new_height
+        left = 0
+        right = width
+    else:
+        left, top, right, bottom = 0, 0, width, height
+
+    image = image.crop((left, top, right, bottom))
+    image = image.resize((target_width, target_height), Image.Resampling.BILINEAR)
+
+    scale_x = target_width / (right - left)
+
+    return image, scale_x, left
+    
 def document_to_messages(document, vision_token="<image>"):
     messages, images = [], []
     for item in document:
@@ -58,9 +98,10 @@ def document_to_messages(document, vision_token="<image>"):
             )
         elif item.get("type") == "image" and item.get("content"):
             img = Image.open(item["content"]).convert("RGB")
-            images.append(img)
+            normalize_img, scale_x, left = format_satellite_img_bbox(img)
+            images.append(normalize_img)
             messages.append({"role": item.get("role", "user"), "content": vision_token})
-    return messages, images
+    return messages, images, scale_x, left
 
 
 def decode_tensor_stream(tensor_stream, tokenizer):
@@ -87,6 +128,7 @@ def fine_tune_bbox():
     """
     Interactive bounding box fine-tuning using OpenCV.
     Load bbox results, display images with bboxes, allow dragging to adjust.
+    Skip images already in bbox_changed_res.json.
     Save changes to bbox_changed_res.json.
     Press 'q' to quit, 'Enter' to save and proceed to next image.
     """
@@ -99,12 +141,23 @@ def fine_tune_bbox():
     with open(INPUT_JSON, "r") as f:
         bbox_data = json.load(f)
 
+    changed_results = {}
+    if os.path.exists(OUTPUT_JSON) and os.path.getsize(OUTPUT_JSON) > 0:
+        with open(OUTPUT_JSON, "r") as f:
+            changed_results = json.load(f)
+        logger.info(f"Loaded {len(changed_results)} existing changed results")
+
     image_names = sorted([k for k in bbox_data.keys()])[:NUM_IMAGES]
-    if not image_names:
-        logger.error("No images found in bbox results")
+
+    processed_names = [name for name in image_names if name not in changed_results]
+    if not processed_names:
+        logger.info("All images have been processed. No remaining images to fine-tune.")
         return
 
-    changed_results = {}
+    remaining_names = [name for name in image_names if name not in changed_results]
+    if not remaining_names:
+        logger.info("All images have been processed. No remaining images to fine-tune.")
+        return
 
     current_idx = 0
     current_image_name = None
@@ -310,7 +363,7 @@ def fine_tune_bbox():
         nonlocal current_bbox_scaled, original_bbox_scaled, scale_factor, pad_x, pad_y
 
         current_idx = idx
-        current_image_name = image_names[current_idx]
+        current_image_name = remaining_names[current_idx]
 
         img_path = os.path.join(IMAGE_DIR, current_image_name)
         if not os.path.exists(img_path):
@@ -334,7 +387,9 @@ def fine_tune_bbox():
     cv2.namedWindow(WINDOW_NAME)
     cv2.setMouseCallback(WINDOW_NAME, mouse_callback)
 
-    logger.info(f"Starting bbox fine-tuning for {len(image_names)} images")
+    logger.info(
+        f"Starting bbox fine-tuning for {len(remaining_names)} images (skipped {len(changed_results)} already processed)"
+    )
     logger.info("Controls: Enter=Save&Next, n=Next, p=Prev, r=Reset, q=Quit")
 
     load_image(0)
@@ -358,14 +413,19 @@ def fine_tune_bbox():
             changed_results[current_image_name] = bbox_original
             logger.info(f"Saved bbox for {current_image_name}: {bbox_original}")
 
-            if current_idx < len(image_names) - 1:
+            if current_idx < len(remaining_names) - 1:
                 load_image(current_idx + 1)
             else:
                 logger.info("Reached last image")
-                load_image(current_idx)
+                with open(OUTPUT_JSON, "w") as f:
+                    json.dump(changed_results, f, indent=2)
+                logger.info(
+                    f"All images processed. Saved {len(changed_results)} results to {OUTPUT_JSON}"
+                )
+                break
 
         elif key == ord("n") or key == 2555904:
-            if current_idx < len(image_names) - 1:
+            if current_idx < len(remaining_names) - 1:
                 load_image(current_idx + 1)
 
         elif key == ord("p") or key == 2424832:
@@ -378,14 +438,47 @@ def fine_tune_bbox():
 
     cv2.destroyAllWindows()
 
-    if changed_results:
-        with open(OUTPUT_JSON, "w") as f:
-            json.dump(changed_results, f, indent=2)
-        logger.info(
-            f"Fine-tuning complete. Saved {len(changed_results)} changed results to {OUTPUT_JSON}"
-        )
-    else:
-        logger.info("Fine-tuning complete. No changes made.")
+
+def calculate_iou(bbox1, bbox2):
+    x1_1, y1_1, x2_1, y2_1 = bbox1
+    x1_2, y1_2, x2_2, y2_2 = bbox2
+
+    inter_x1 = max(x1_1, x1_2)
+    inter_y1 = max(y1_1, y1_2)
+    inter_x2 = min(x2_1, x2_2)
+    inter_y2 = min(y2_1, y2_2)
+
+    inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+
+    area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+    area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+
+    union_area = area1 + area2 - inter_area
+
+    if union_area == 0:
+        return 0.0
+
+    return inter_area / union_area
+
+
+def replace_low_iou_bboxes(input_json, output_json, target_bbox, iou_threshold=0.5):
+    with open(input_json, "r") as f:
+        bbox_data = json.load(f)
+
+    replacement_count = 0
+
+    for img_name, bbox in bbox_data.items():
+        iou = calculate_iou(bbox, target_bbox)
+        if iou < iou_threshold:
+            bbox_data[img_name] = target_bbox
+            replacement_count += 1
+
+    with open(output_json, "w") as f:
+        json.dump(bbox_data, f, indent=2)
+
+    logger.info(
+        f"Replaced {replacement_count}/{len(bbox_data)} bboxes with target bbox (IoU threshold: {iou_threshold})"
+    )
 
 
 def generate_bbox_response(image_path):
@@ -395,7 +488,7 @@ def generate_bbox_response(image_path):
         {"type": "text", "content": PROMPT, "role": "user"},
     ]
 
-    messages, images = document_to_messages(document, vision_token=config.vision_token)
+    messages, images, scale_x, left = document_to_messages(document, vision_token=config.vision_token)
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
@@ -415,7 +508,7 @@ def generate_bbox_response(image_path):
             generated_ids[0], skip_special_tokens=False
         )
 
-    return generated_text, images[0] if images else None
+    return generated_text, images[0] if images else None, scale_x, left
 
 
 def main():
@@ -431,7 +524,7 @@ def main():
             continue
 
         logger.info(f"Processing {img_name}")
-        generated_text, image = generate_bbox_response(img_path)
+        generated_text, image, scale_x, left = generate_bbox_response(img_path)
 
         boxes = extract_points(generated_text, expected="box")
         if not boxes:
@@ -439,15 +532,15 @@ def main():
             continue
 
         box = boxes[0]
-        img_width, img_height = image.size
+        img_width, img_height = 3840, 2160
 
         norm_x1, norm_y1 = box.top_left.x, box.top_left.y
         norm_x2, norm_y2 = box.bottom_right.x, box.bottom_right.y
 
-        x1 = int((norm_x1 / 1000.0) * img_width)
-        y1 = int((norm_y1 / 1000.0) * img_height)
-        x2 = int((norm_x2 / 1000.0) * img_width)
-        y2 = int((norm_y2 / 1000.0) * img_height)
+        x1 = int(norm_x1 / scale_x)+left
+        y1 = int(norm_y1 / scale_x)
+        x2 = int(norm_x2 / scale_x)+left
+        y2 = int(norm_y2 / scale_x)
 
         x1 = max(0, min(x1, img_width - 1))
         y1 = max(0, min(y1, img_height - 1))
@@ -469,7 +562,11 @@ def main():
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--finetune":
-        fine_tune_bbox()
-    else:
-        main()
+    TARGET_BBOX = [1700, 900, 2100, 1300]
+    IOU_THRESHOLD = 0.5
+
+    # fine_tune_bbox()
+    # replace_low_iou_bboxes(
+    #     OUTPUT_JSON, "bbox_iou_replaced.json", TARGET_BBOX, IOU_THRESHOLD
+    # )
+    main()

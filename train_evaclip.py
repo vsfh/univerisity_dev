@@ -534,6 +534,136 @@ def eval(run=False):
         )
 
 
+def eval_denseuav(run=False):
+    DENSE_UAV_ROOT = "/data/feihong/DenseUAV"
+    TEST_DENSE_FILE = "/data/feihong/ckpt/test_dense.txt"
+
+    def calcu_cos(a, b):
+        a_norm = a / np.linalg.norm(a)
+        b_norm = b / np.linalg.norm(b, axis=1, keepdims=True)
+        return np.dot(b_norm, a_norm[..., None]).flatten()
+
+    if run:
+        img_to_text_dict = json.load(
+            open("/data/feihong/drone_text_single_long.json", "r")
+        )
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            MODEL_NAME, cache_dir=CACHE_DIR
+        )
+        tokenizer = open_clip.get_tokenizer(MODEL_NAME)
+
+        encoder = Encoder(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM).to(DEVICE)
+        model_path = f"../ckpt/train_evaclip_proj/best.pth"
+        if os.path.exists(model_path):
+            encoder.load_state_dict(torch.load(model_path, map_location="cpu"))
+        encoder.eval()
+
+        res_search = {}
+        res_fused_query = {}
+
+        print("Setting up dataset and dataloader for eval_denseuav...")
+        eval_list = []
+        with open(TEST_DENSE_FILE, "r") as f:
+            for line in f:
+                query_path = line.strip()
+                eval_list.append(query_path)
+
+        for img_path in tqdm(eval_list):
+            parts = img_path.split("/")
+            drone_id = parts[-2]
+            is_train = "train" in parts
+
+            if is_train:
+                search_path = f"{DENSE_UAV_ROOT}/train/satellite/{drone_id}/H100.tif"
+            else:
+                search_path = (
+                    f"{DENSE_UAV_ROOT}/test/gallery_satellite/{drone_id}/H100.tif"
+                )
+
+            if os.path.exists(search_path):
+                try:
+                    query_image = Image.open(img_path).convert("RGB")
+                    search_image = Image.open(search_path).convert("RGB")
+                    search_image = search_image.resize((640, 640))
+
+                    text_name = drone_id + "_01"
+                    text_description = img_to_text_dict.get(text_name, "")
+                    for noun in [
+                        "**",
+                        "\n",
+                        "noun",
+                        "phrases",
+                        "Phrase",
+                        "Noun",
+                        "Summary",
+                        "Environment",
+                        "32 tokens",
+                    ]:
+                        text_description = text_description.replace(noun, "")
+
+                    query_image_tensor = preprocess(query_image).unsqueeze(0).to(DEVICE)
+                    search_image_tensor = (
+                        preprocess(search_image).unsqueeze(0).to(DEVICE)
+                    )
+                    text_tokens = tokenizer([text_description]).to(DEVICE)
+
+                    with torch.no_grad():
+                        anchor_feats = encoder.query_forward(query_image_tensor)
+                        grid_feats = encoder.ref_forward(search_image_tensor)
+                        fused_query_feats = anchor_feats
+
+                    res_search[drone_id] = grid_feats.cpu().numpy()
+                    res_fused_query[drone_id] = fused_query_feats.cpu().numpy()
+                except Exception as e:
+                    print(f"Error processing {drone_id}: {e}")
+
+        np.savez("eval_denseuav_search.npz", **res_search)
+        np.savez("eval_denseuav_fused_query.npz", **res_fused_query)
+        print("Evaluation feature extraction complete.")
+    else:
+        search_res = np.load("eval_denseuav_search.npz")
+        fused_query_res = np.load("eval_denseuav_fused_query.npz")
+
+        test_list = [k for k in search_res.keys()]
+        res = {}
+        top1 = 0
+        top5 = 0
+        top10 = 0
+
+        if not test_list:
+            print("No evaluation data found in npz files.")
+            return
+
+        for key in tqdm(test_list):
+            fused_query_feature = fused_query_res[key]
+
+            ex_img_list = random.sample(test_list, min(99, len(test_list) - 1))
+            if key in ex_img_list:
+                ex_img_list.remove(key)
+            ex_img_list.append(key)
+            right_num = len(ex_img_list) - 1
+
+            res[key] = []
+            for img_name in ex_img_list:
+                cos_sim_grid = calcu_cos(fused_query_feature, search_res[img_name])
+                res[key].append(cos_sim_grid)
+
+            img_res = np.array(res[key]).mean(1).argsort()[-15:][::-1]
+
+            if right_num in img_res[:1]:
+                top1 += 1
+            if right_num in img_res[:5]:
+                top5 += 1
+            if right_num in img_res[:10]:
+                top10 += 1
+
+        print(f"Top 1: {top1} / {len(test_list)} ({top1 / len(test_list) * 100:.2f}%)")
+        print(f"Top 5: {top5} / {len(test_list)} ({top5 / len(test_list) * 100:.2f}%)")
+        print(
+            f"Top 10: {top10} / {len(test_list)} ({top10 / len(test_list) * 100:.2f}%)"
+        )
+
+
 if __name__ == "__main__":
     exp_name = "train_evaclip_proj"
     save_dir = f"../ckpt/{exp_name}"
@@ -549,5 +679,9 @@ if __name__ == "__main__":
     # main(save_dir)
 
     # Run evaluation
-    eval(True)  # Extract features
-    eval(False) # Calculate metrics
+    # eval(True)  # Extract features
+    # eval(False)  # Calculate metrics
+
+    eval_denseuav(True)  # Extract features
+    eval_denseuav(False)  # Extract features
+

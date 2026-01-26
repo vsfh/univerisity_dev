@@ -12,21 +12,22 @@ import shutil
 from pathlib import Path
 import tempfile
 
+
 def extract_and_copy_400_images():
     # ================== EDIT THESE TWO PATHS ==================
-    DEST_DIR = "/home/SATA4T/StereoFromCarla20k"            # CHANGE ME
+    DEST_DIR = "/home/SATA4T/StereoFromCarla20k"  # CHANGE ME
     # =========================================================
-
 
     dest_path = Path(DEST_DIR).expanduser().resolve()
     dest_path.mkdir(parents=True, exist_ok=True)
 
-    tmp_dir = '/home/SATA4T/StereoFromCarla_output'
+    tmp_dir = "/home/SATA4T/StereoFromCarla_output"
     tmp_path = Path(tmp_dir)
 
-
     # Find all 'left' folders to locate triplets
-    left_folders = [Path(folder) for folder in glob('/home/SATA4T/StereoFromCarla_output/*/*/left')]
+    left_folders = [
+        Path(folder) for folder in glob("/home/SATA4T/StereoFromCarla_output/*/*/left")
+    ]
     if not left_folders:
         print("No 'left' folders found in zip!")
         return
@@ -50,8 +51,13 @@ def extract_and_copy_400_images():
                 continue
 
             # Get and sort images
-            images = [f for f in folder.iterdir() 
-                        if f.is_file() and f.suffix.lower() in {'.jpg','.jpeg','.png','.bmp','.tif','.tiff','.webp'}]
+            images = [
+                f
+                for f in folder.iterdir()
+                if f.is_file()
+                and f.suffix.lower()
+                in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+            ]
             if len(images) < 400:
                 print(f"  [SKIP] {name}/ : only {len(images)} images")
                 continue
@@ -79,7 +85,9 @@ def extract_and_copy_400_images():
 
 def zip():
     # Configure logging
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
 
     # Define paths
     root_dir = Path("/home/SATA4T/StereoFromCarla")
@@ -107,7 +115,9 @@ def zip():
                     for target_folder in desired_subfolders:
                         target_path = subfolder / target_folder
                         if target_path.exists():
-                            folder_paths.append((target_path, target_path.relative_to(root_dir)))
+                            folder_paths.append(
+                                (target_path, target_path.relative_to(root_dir))
+                            )
                     # Add right folder from baseline_010
                     baseline_path = subfolder / "baseline_010"
                     right_path = baseline_path / "right"
@@ -127,17 +137,37 @@ def zip():
         # Use multiprocessing to process folders
         with Pool() as pool:
             results = []
-            for folder_paths in tqdm(pool.imap_unordered(process_folder, folders), total=len(folders), desc="Processing folders"):
+            for folder_paths in tqdm(
+                pool.imap_unordered(process_folder, folders),
+                total=len(folders),
+                desc="Processing folders",
+            ):
                 results.extend(folder_paths)
 
         logging.info(f"Total paths to zip: {len(results)}")
 
         # Create zip file
-        with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as zipf:
+        with zipfile.ZipFile(
+            output_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=9
+        ) as zipf:
             for folder_path, relative_path in tqdm(results, desc="Zipping files"):
                 add_folder_to_zip(zipf, folder_path, relative_path)
 
         logging.info(f"Zip file created at: {output_zip}")
 
+
+def write_train_test_split_dense_uav():
+    from natsort import natsorted
+    from glob import glob
+
+    root = "/data/feihong/DenseUAV"
+    drone_list = natsorted(glob(f"{root}/*/*rone/*5/H80.JPG"))
+
+    output_path = "/data/feihong/ckpt/test_dense.txt"
+    with open(output_path, "w") as f:
+        for path in drone_list:
+            f.write(path + "\n")
+
+
 if __name__ == "__main__":
-    extract_and_copy_400_images()
+    write_train_test_split_dense_uav()
