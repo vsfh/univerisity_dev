@@ -54,11 +54,6 @@ def get_image_paths(key):
     return drone_path, satellite_path
 
 
-def scale_bbox(bbox, scale):
-    """Scale bbox by a factor."""
-    return [coord * scale for coord in bbox]
-
-
 def apply_letterbox(image, target_size):
     """Apply letterbox resizing maintaining aspect ratio."""
     orig_w, orig_h = image.size
@@ -94,42 +89,15 @@ def convert_bbox_to_original(bbox_scaled, scale, pad_x, pad_y):
     return [x1, y1, x2, y2]
 
 
-def draw_combined_image(drone_img, satellite_img_scaled, bbox_scaled, key):
-    """Draw drone and satellite images side by side with bbox on satellite."""
+def draw_drone_window(drone_img, key):
+    """Draw drone image in its own window."""
     drone_array = np.array(drone_img)
-    satellite_array = np.array(satellite_img_scaled)
-
     drone_bgr = cv2.cvtColor(drone_array, cv2.COLOR_RGB2BGR)
-    satellite_bgr = cv2.cvtColor(satellite_array, cv2.COLOR_RGB2BGR)
 
     drone_h, drone_w = drone_bgr.shape[:2]
-    sat_h, sat_w = satellite_bgr.shape[:2]
-
-    combined_h = max(drone_h, sat_h)
-    combined_w = drone_w + sat_w + 20
-
-    combined = np.zeros((combined_h, combined_w, 3), dtype=np.uint8)
-
-    drone_y_offset = (combined_h - drone_h) // 2
-
-    combined[drone_y_offset : drone_y_offset + drone_h, :drone_w] = drone_bgr
-    combined[0:sat_h, drone_w + 20 : drone_w + 20 + sat_w] = satellite_bgr
-
-    x1, y1, x2, y2 = [int(c) for c in bbox_scaled]
-    sat_x1 = drone_w + 20 + x1
-    sat_y1 = y1
-    sat_x2 = drone_w + 20 + x2
-    sat_y2 = y2
-
-    cv2.rectangle(combined, (sat_x1, sat_y1), (sat_x2, sat_y2), (0, 0, 255), 4)
-
-    cv2.circle(combined, (sat_x1, sat_y1), HANDLE_SIZE, (0, 255, 255), -1)
-    cv2.circle(combined, (sat_x2, sat_y2), HANDLE_SIZE, (0, 255, 255), -1)
-    cv2.circle(combined, (sat_x1, sat_y2), HANDLE_SIZE, (0, 255, 255), -1)
-    cv2.circle(combined, (sat_x2, sat_y1), HANDLE_SIZE, (0, 255, 255), -1)
 
     cv2.putText(
-        combined,
+        drone_bgr,
         f"Key: {key}",
         (10, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
@@ -138,7 +106,45 @@ def draw_combined_image(drone_img, satellite_img_scaled, bbox_scaled, key):
         2,
     )
     cv2.putText(
-        combined,
+        drone_bgr,
+        f"Size: {drone_w}x{drone_h}",
+        (10, 60),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 0),
+        2,
+    )
+
+    return drone_bgr
+
+
+def draw_satellite_window(satellite_img_scaled, bbox_scaled, key):
+    """Draw satellite image with bbox in its own window."""
+    sat_array = np.array(satellite_img_scaled)
+    sat_bgr = cv2.cvtColor(sat_array, cv2.COLOR_RGB2BGR)
+
+    sat_h, sat_w = sat_bgr.shape[:2]
+
+    x1, y1, x2, y2 = [int(c) for c in bbox_scaled]
+
+    cv2.rectangle(sat_bgr, (x1, y1), (x2, y2), (0, 0, 255), 4)
+
+    cv2.circle(sat_bgr, (x1, y1), HANDLE_SIZE, (0, 255, 255), -1)
+    cv2.circle(sat_bgr, (x2, y2), HANDLE_SIZE, (0, 255, 255), -1)
+    cv2.circle(sat_bgr, (x1, y2), HANDLE_SIZE, (0, 255, 255), -1)
+    cv2.circle(sat_bgr, (x2, y1), HANDLE_SIZE, (0, 255, 255), -1)
+
+    cv2.putText(
+        sat_bgr,
+        f"Key: {key}",
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 255, 0),
+        2,
+    )
+    cv2.putText(
+        sat_bgr,
         f"Bbox: [{x1}, {y1}, {x2}, {y2}]",
         (10, 60),
         cv2.FONT_HERSHEY_SIMPLEX,
@@ -147,34 +153,25 @@ def draw_combined_image(drone_img, satellite_img_scaled, bbox_scaled, key):
         2,
     )
     cv2.putText(
-        combined,
-        f"Drone: {drone_w}x{drone_h}",
-        (10, combined_h - 40),
+        sat_bgr,
+        f"Size: {sat_w}x{sat_h}",
+        (10, sat_h - 20),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
-        (255, 255, 255),
+        (0, 255, 0),
         1,
     )
     cv2.putText(
-        combined,
-        f"Satellite: {sat_w}x{sat_h}",
-        (drone_w + 30, combined_h - 40),
+        sat_bgr,
+        "Click & drag bbox to adjust",
+        (10, sat_h - 50),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
-        (255, 255, 255),
-        1,
-    )
-    cv2.putText(
-        combined,
-        "Enter=Save&Next, n=Next, p=Prev, r=Reset, q=Quit",
-        (10, combined_h - 15),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (255, 255, 255),
+        (255, 255, 0),
         1,
     )
 
-    return combined
+    return sat_bgr
 
 
 def main():
@@ -194,7 +191,6 @@ def main():
     current_idx = 0
     current_key = None
     original_drone = None
-    original_satellite = None
     scaled_satellite = None
     current_bbox_scaled = None
     original_bbox_scaled = None
@@ -208,7 +204,8 @@ def main():
     resize_edge = None
     image_loaded = False
 
-    WINDOW_NAME = "BBox Fine-tuning"
+    DRONE_WINDOW = "Drone View"
+    SAT_WINDOW = "Satellite View"
 
     def mouse_callback(event, x, y, flags, param):
         nonlocal \
@@ -222,84 +219,53 @@ def main():
         if not image_loaded or current_bbox_scaled is None or scaled_satellite is None:
             return
 
-        drone_w = original_drone.size[0] if original_drone else 0
-
         x1, y1, x2, y2 = current_bbox_scaled
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
 
         margin = HANDLE_SIZE + 5
 
-        sat_x1 = x1
-        sat_y1 = y1
-        sat_x2 = x2
-        sat_y2 = y2
-
         if event == cv2.EVENT_LBUTTONDOWN:
-            if (
-                sat_x1 - margin <= x <= sat_x1 + margin
-                and sat_y1 - margin <= y <= sat_y1 + margin
-            ):
+            if x1 - margin <= x <= x1 + margin and y1 - margin <= y <= y1 + margin:
                 dragging = True
                 drag_start = (x, y)
                 bbox_start = list(current_bbox_scaled)
                 resize_edge = "tl"
-            elif (
-                sat_x2 - margin <= x <= sat_x2 + margin
-                and sat_y2 - margin <= y <= sat_y2 + margin
-            ):
+            elif x2 - margin <= x <= x2 + margin and y2 - margin <= y <= y2 + margin:
                 dragging = True
                 drag_start = (x, y)
                 bbox_start = list(current_bbox_scaled)
                 resize_edge = "br"
-            elif (
-                sat_x2 - margin <= x <= sat_x2 + margin
-                and sat_y1 - margin <= y <= sat_y1 + margin
-            ):
+            elif x2 - margin <= x <= x2 + margin and y1 - margin <= y <= y1 + margin:
                 dragging = True
                 drag_start = (x, y)
                 bbox_start = list(current_bbox_scaled)
                 resize_edge = "tr"
-            elif (
-                sat_x1 - margin <= x <= sat_x1 + margin
-                and sat_y2 - margin <= y <= sat_y2 + margin
-            ):
+            elif x1 - margin <= x <= x1 + margin and y2 - margin <= y <= y2 + margin:
                 dragging = True
                 drag_start = (x, y)
                 bbox_start = list(current_bbox_scaled)
                 resize_edge = "bl"
-            elif (
-                sat_x1 - margin <= x <= sat_x2 + margin
-                and sat_y1 - margin <= y <= sat_y1 + margin
-            ):
+            elif x1 - margin <= x <= x2 + margin and y1 - margin <= y <= y1 + margin:
                 dragging = True
                 drag_start = (x, y)
                 bbox_start = list(current_bbox_scaled)
                 resize_edge = "t"
-            elif (
-                sat_x1 - margin <= x <= sat_x2 + margin
-                and sat_y2 - margin <= y <= sat_y2 + margin
-            ):
+            elif x1 - margin <= x <= x2 + margin and y2 - margin <= y <= y2 + margin:
                 dragging = True
                 drag_start = (x, y)
                 bbox_start = list(current_bbox_scaled)
                 resize_edge = "b"
-            elif (
-                sat_x1 <= x <= sat_x1 + margin
-                and sat_y1 - margin <= y <= sat_y2 + margin
-            ):
+            elif x1 <= x <= x1 + margin and y1 - margin <= y <= y2 + margin:
                 dragging = True
                 drag_start = (x, y)
                 bbox_start = list(current_bbox_scaled)
                 resize_edge = "l"
-            elif (
-                sat_x2 - margin <= x <= sat_x2 + margin
-                and sat_y1 - margin <= y <= sat_y2 + margin
-            ):
+            elif x2 - margin <= x <= x2 + margin and y1 - margin <= y <= y2 + margin:
                 dragging = True
                 drag_start = (x, y)
                 bbox_start = list(current_bbox_scaled)
                 resize_edge = "r"
-            elif sat_x1 <= x <= sat_x2 and sat_y1 <= y <= sat_y2:
+            elif x1 <= x <= x2 and y1 <= y <= y2:
                 dragging = True
                 drag_start = (x, y)
                 bbox_start = list(current_bbox_scaled)
@@ -355,17 +321,20 @@ def main():
             or current_bbox_scaled is None
         ):
             return
-        combined = draw_combined_image(
-            original_drone, scaled_satellite, current_bbox_scaled, current_key
+
+        drone_img = draw_drone_window(original_drone, current_key)
+        cv2.imshow(DRONE_WINDOW, drone_img)
+
+        sat_img = draw_satellite_window(
+            scaled_satellite, current_bbox_scaled, current_key
         )
-        cv2.imshow(WINDOW_NAME, combined)
+        cv2.imshow(SAT_WINDOW, sat_img)
 
     def load_image(idx):
         nonlocal \
             current_idx, \
             current_key, \
             original_drone, \
-            original_satellite, \
             scaled_satellite, \
             image_loaded
         nonlocal current_bbox_scaled, original_bbox_scaled, scale_factor, pad_x, pad_y
@@ -399,8 +368,9 @@ def main():
         draw_and_show()
         return True
 
-    cv2.namedWindow(WINDOW_NAME)
-    cv2.setMouseCallback(WINDOW_NAME, mouse_callback)
+    cv2.namedWindow(DRONE_WINDOW)
+    cv2.namedWindow(SAT_WINDOW)
+    cv2.setMouseCallback(SAT_WINDOW, mouse_callback)
 
     logger.info(f"Starting bbox fine-tuning for {len(remaining_keys)} images")
     logger.info("Controls: Enter=Save&Next, n=Next, p=Prev, r=Reset, q=Quit")
