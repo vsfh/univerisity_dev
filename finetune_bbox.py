@@ -111,18 +111,15 @@ def draw_combined_image(drone_img, satellite_img_scaled, bbox_scaled, key):
     combined = np.zeros((combined_h, combined_w, 3), dtype=np.uint8)
 
     drone_y_offset = (combined_h - drone_h) // 2
-    sat_y_offset = (combined_h - sat_h) // 2
 
     combined[drone_y_offset : drone_y_offset + drone_h, :drone_w] = drone_bgr
-    combined[
-        sat_y_offset : sat_y_offset + sat_h, drone_w + 20 : drone_w + 20 + sat_w
-    ] = satellite_bgr
+    combined[0:sat_h, drone_w + 20 : drone_w + 20 + sat_w] = satellite_bgr
 
     x1, y1, x2, y2 = [int(c) for c in bbox_scaled]
     sat_x1 = drone_w + 20 + x1
-    sat_y1 = sat_y_offset + y1
+    sat_y1 = y1
     sat_x2 = drone_w + 20 + x2
-    sat_y2 = sat_y_offset + y2
+    sat_y2 = y2
 
     cv2.rectangle(combined, (sat_x1, sat_y1), (sat_x2, sat_y2), (0, 0, 255), 4)
 
@@ -226,8 +223,6 @@ def main():
             return
 
         drone_w = original_drone.size[0] if original_drone else 0
-        sat_x_offset = drone_w + 20
-        sat_y_offset = (DISPLAY_SIZE - scaled_satellite.size[1]) // 2
 
         x1, y1, x2, y2 = current_bbox_scaled
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
@@ -242,9 +237,7 @@ def main():
         if event == cv2.EVENT_LBUTTONDOWN:
             if (
                 sat_x1 - margin <= x <= sat_x1 + margin
-                and sat_y_offset + sat_y1 - margin
-                <= y
-                <= sat_y_offset + sat_y1 + margin
+                and sat_y1 - margin <= y <= sat_y1 + margin
             ):
                 dragging = True
                 drag_start = (x, y)
@@ -252,9 +245,7 @@ def main():
                 resize_edge = "tl"
             elif (
                 sat_x2 - margin <= x <= sat_x2 + margin
-                and sat_y_offset + sat_y2 - margin
-                <= y
-                <= sat_y_offset + sat_y2 + margin
+                and sat_y2 - margin <= y <= sat_y2 + margin
             ):
                 dragging = True
                 drag_start = (x, y)
@@ -262,9 +253,7 @@ def main():
                 resize_edge = "br"
             elif (
                 sat_x2 - margin <= x <= sat_x2 + margin
-                and sat_y_offset + sat_y1 - margin
-                <= y
-                <= sat_y_offset + sat_y1 + margin
+                and sat_y1 - margin <= y <= sat_y1 + margin
             ):
                 dragging = True
                 drag_start = (x, y)
@@ -272,9 +261,7 @@ def main():
                 resize_edge = "tr"
             elif (
                 sat_x1 - margin <= x <= sat_x1 + margin
-                and sat_y_offset + sat_y2 - margin
-                <= y
-                <= sat_y_offset + sat_y2 + margin
+                and sat_y2 - margin <= y <= sat_y2 + margin
             ):
                 dragging = True
                 drag_start = (x, y)
@@ -282,9 +269,7 @@ def main():
                 resize_edge = "bl"
             elif (
                 sat_x1 - margin <= x <= sat_x2 + margin
-                and sat_y_offset + sat_y1 - margin
-                <= y
-                <= sat_y_offset + sat_y1 + margin
+                and sat_y1 - margin <= y <= sat_y1 + margin
             ):
                 dragging = True
                 drag_start = (x, y)
@@ -292,9 +277,7 @@ def main():
                 resize_edge = "t"
             elif (
                 sat_x1 - margin <= x <= sat_x2 + margin
-                and sat_y_offset + sat_y2 - margin
-                <= y
-                <= sat_y_offset + sat_y2 + margin
+                and sat_y2 - margin <= y <= sat_y2 + margin
             ):
                 dragging = True
                 drag_start = (x, y)
@@ -302,9 +285,7 @@ def main():
                 resize_edge = "b"
             elif (
                 sat_x1 <= x <= sat_x1 + margin
-                and sat_y_offset + sat_y1 - margin
-                <= y
-                <= sat_y_offset + sat_y2 + margin
+                and sat_y1 - margin <= y <= sat_y2 + margin
             ):
                 dragging = True
                 drag_start = (x, y)
@@ -312,18 +293,13 @@ def main():
                 resize_edge = "l"
             elif (
                 sat_x2 - margin <= x <= sat_x2 + margin
-                and sat_y_offset + sat_y1 - margin
-                <= y
-                <= sat_y_offset + sat_y2 + margin
+                and sat_y1 - margin <= y <= sat_y2 + margin
             ):
                 dragging = True
                 drag_start = (x, y)
                 bbox_start = list(current_bbox_scaled)
                 resize_edge = "r"
-            elif (
-                sat_x1 <= x <= sat_x2
-                and sat_y_offset + sat_y1 <= y <= sat_y_offset + sat_y2
-            ):
+            elif sat_x1 <= x <= sat_x2 and sat_y1 <= y <= sat_y2:
                 dragging = True
                 drag_start = (x, y)
                 bbox_start = list(current_bbox_scaled)
