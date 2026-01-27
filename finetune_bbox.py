@@ -5,10 +5,10 @@ import numpy as np
 from PIL import Image, ImageDraw
 from loguru import logger
 
-INPUT_TXT = "/data/feihong/univerisity_dev/text.txt"
-OUTPUT_JSON = "/data/feihong/univerisity_dev/output.json"
-DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
-SATELLITE_FOLDER = "/data/feihong/image_1024"
+INPUT_TXT = "test.txt"
+OUTPUT_JSON = "output.json"
+DRONE_VIEW_FOLDER = r"E:\intern\drone_view"
+SATELLITE_FOLDER = r"E:\intern\image_1024"
 INITIAL_BBOX = [1536, 656, 2268, 1374]
 DISPLAY_SIZE = 1280
 HANDLE_SIZE = 10
@@ -49,7 +49,7 @@ def save_json(json_path, data):
 
 def get_image_paths(key):
     """Get drone and satellite image paths for a given key."""
-    drone_path = os.path.join(DRONE_VIEW_FOLDER, key, "01.jpeg")
+    drone_path = os.path.join(DRONE_VIEW_FOLDER, 'gallery_drone', key, "image-01.jpeg")
     satellite_path = os.path.join(SATELLITE_FOLDER, f"{key}.png")
     return drone_path, satellite_path
 
