@@ -133,7 +133,7 @@ def draw_combined_image(drone_img, satellite_img, bbox_scaled, key):
 
     cv2.putText(
         combined,
-        f"Key: {current_key}",
+        f"Key: {key}",
         (10, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.8,
@@ -354,7 +354,7 @@ def main():
         ):
             return
         combined = draw_combined_image(
-            original_drone, original_satellite, current_bbox_scaled
+            original_drone, original_satellite, current_bbox_scaled, current_key
         )
         cv2.imshow(WINDOW_NAME, combined)
 
