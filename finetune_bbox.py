@@ -120,9 +120,9 @@ def draw_combined_image(drone_img, satellite_img, bbox_scaled, key):
 
     x1, y1, x2, y2 = [int(c) for c in bbox_scaled]
     sat_x1 = drone_w + 20 + x1
-    sat_y1 = sat_y_offset + y1
+    sat_y1 = y1
     sat_x2 = drone_w + 20 + x2
-    sat_y2 = sat_y_offset + y2
+    sat_y2 = y2
 
     cv2.rectangle(combined, (sat_x1, sat_y1), (sat_x2, sat_y2), (0, 0, 255), 4)
 
@@ -209,18 +209,24 @@ def main():
     drag_start = None
     bbox_start = None
     resize_edge = None
+    image_loaded = False
 
     WINDOW_NAME = "BBox Fine-tuning"
 
     def mouse_callback(event, x, y, flags, param):
-        nonlocal dragging, drag_start, bbox_start, current_bbox_scaled, resize_edge
+        nonlocal \
+            dragging, \
+            drag_start, \
+            bbox_start, \
+            current_bbox_scaled, \
+            resize_edge, \
+            image_loaded
 
-        if current_bbox_scaled is None:
+        if not image_loaded or current_bbox_scaled is None or scaled_satellite is None:
             return
 
         drone_w = original_drone.size[0] if original_drone else 0
         sat_x_offset = drone_w + 20
-        sat_y_offset = (DISPLAY_SIZE - scaled_satellite.size[1]) // 2
 
         x1, y1, x2, y2 = current_bbox_scaled
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
@@ -267,7 +273,7 @@ def main():
                 resize_edge = "bl"
             elif (
                 sat_x1 - margin <= x <= sat_x2 + margin
-                and sat_y1 <= y <= sat_y1 + margin
+                and sat_y1 - margin <= y <= sat_y1 + margin
             ):
                 dragging = True
                 drag_start = (x, y)
@@ -364,7 +370,8 @@ def main():
             current_key, \
             original_drone, \
             original_satellite, \
-            scaled_satellite
+            scaled_satellite, \
+            image_loaded
         nonlocal current_bbox_scaled, original_bbox_scaled, scale_factor, pad_x, pad_y
 
         current_idx = idx
@@ -390,6 +397,8 @@ def main():
             INITIAL_BBOX, scale_factor, pad_x, pad_y
         )
         original_bbox_scaled = list(current_bbox_scaled)
+
+        image_loaded = True
 
         draw_and_show()
         return True
