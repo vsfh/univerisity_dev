@@ -389,6 +389,7 @@ def main():
                 current_bbox_scaled, scale_factor, pad_x, pad_y
             )
             results[current_key] = bbox_original
+            save_json(OUTPUT_JSON, results)
             logger.info(f"Saved bbox for {current_key}: {bbox_original}")
 
             if current_idx < len(remaining_keys) - 1:
