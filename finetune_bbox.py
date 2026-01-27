@@ -49,7 +49,7 @@ def save_json(json_path, data):
 
 def get_image_paths(key):
     """Get drone and satellite image paths for a given key."""
-    drone_path = os.path.join(DRONE_VIEW_FOLDER, 'gallery_drone', key, "image-01.jpeg")
+    drone_path = os.path.join(DRONE_VIEW_FOLDER, "gallery_drone", key, "image-01.jpeg")
     satellite_path = os.path.join(SATELLITE_FOLDER, f"{key}.png")
     return drone_path, satellite_path
 
@@ -94,10 +94,10 @@ def convert_bbox_to_original(bbox_scaled, scale, pad_x, pad_y):
     return [x1, y1, x2, y2]
 
 
-def draw_combined_image(drone_img, satellite_img, bbox_scaled, key):
+def draw_combined_image(drone_img, satellite_img_scaled, bbox_scaled, key):
     """Draw drone and satellite images side by side with bbox on satellite."""
     drone_array = np.array(drone_img)
-    satellite_array = np.array(satellite_img)
+    satellite_array = np.array(satellite_img_scaled)
 
     drone_bgr = cv2.cvtColor(drone_array, cv2.COLOR_RGB2BGR)
     satellite_bgr = cv2.cvtColor(satellite_array, cv2.COLOR_RGB2BGR)
@@ -120,9 +120,9 @@ def draw_combined_image(drone_img, satellite_img, bbox_scaled, key):
 
     x1, y1, x2, y2 = [int(c) for c in bbox_scaled]
     sat_x1 = drone_w + 20 + x1
-    sat_y1 = y1
+    sat_y1 = sat_y_offset + y1
     sat_x2 = drone_w + 20 + x2
-    sat_y2 = y2
+    sat_y2 = sat_y_offset + y2
 
     cv2.rectangle(combined, (sat_x1, sat_y1), (sat_x2, sat_y2), (0, 0, 255), 4)
 
@@ -227,6 +227,7 @@ def main():
 
         drone_w = original_drone.size[0] if original_drone else 0
         sat_x_offset = drone_w + 20
+        sat_y_offset = (DISPLAY_SIZE - scaled_satellite.size[1]) // 2
 
         x1, y1, x2, y2 = current_bbox_scaled
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
@@ -241,7 +242,9 @@ def main():
         if event == cv2.EVENT_LBUTTONDOWN:
             if (
                 sat_x1 - margin <= x <= sat_x1 + margin
-                and sat_y1 - margin <= y <= sat_y1 + margin
+                and sat_y_offset + sat_y1 - margin
+                <= y
+                <= sat_y_offset + sat_y1 + margin
             ):
                 dragging = True
                 drag_start = (x, y)
@@ -249,7 +252,9 @@ def main():
                 resize_edge = "tl"
             elif (
                 sat_x2 - margin <= x <= sat_x2 + margin
-                and sat_y2 - margin <= y <= sat_y2 + margin
+                and sat_y_offset + sat_y2 - margin
+                <= y
+                <= sat_y_offset + sat_y2 + margin
             ):
                 dragging = True
                 drag_start = (x, y)
@@ -257,7 +262,9 @@ def main():
                 resize_edge = "br"
             elif (
                 sat_x2 - margin <= x <= sat_x2 + margin
-                and sat_y1 - margin <= y <= sat_y1 + margin
+                and sat_y_offset + sat_y1 - margin
+                <= y
+                <= sat_y_offset + sat_y1 + margin
             ):
                 dragging = True
                 drag_start = (x, y)
@@ -265,7 +272,9 @@ def main():
                 resize_edge = "tr"
             elif (
                 sat_x1 - margin <= x <= sat_x1 + margin
-                and sat_y2 - margin <= y <= sat_y2 + margin
+                and sat_y_offset + sat_y2 - margin
+                <= y
+                <= sat_y_offset + sat_y2 + margin
             ):
                 dragging = True
                 drag_start = (x, y)
@@ -273,7 +282,9 @@ def main():
                 resize_edge = "bl"
             elif (
                 sat_x1 - margin <= x <= sat_x2 + margin
-                and sat_y1 - margin <= y <= sat_y1 + margin
+                and sat_y_offset + sat_y1 - margin
+                <= y
+                <= sat_y_offset + sat_y1 + margin
             ):
                 dragging = True
                 drag_start = (x, y)
@@ -281,7 +292,9 @@ def main():
                 resize_edge = "t"
             elif (
                 sat_x1 - margin <= x <= sat_x2 + margin
-                and sat_y2 - margin <= y <= sat_y2 + margin
+                and sat_y_offset + sat_y2 - margin
+                <= y
+                <= sat_y_offset + sat_y2 + margin
             ):
                 dragging = True
                 drag_start = (x, y)
@@ -289,7 +302,9 @@ def main():
                 resize_edge = "b"
             elif (
                 sat_x1 <= x <= sat_x1 + margin
-                and sat_y1 - margin <= y <= sat_y2 + margin
+                and sat_y_offset + sat_y1 - margin
+                <= y
+                <= sat_y_offset + sat_y2 + margin
             ):
                 dragging = True
                 drag_start = (x, y)
@@ -297,13 +312,18 @@ def main():
                 resize_edge = "l"
             elif (
                 sat_x2 - margin <= x <= sat_x2 + margin
-                and sat_y1 - margin <= y <= sat_y2 + margin
+                and sat_y_offset + sat_y1 - margin
+                <= y
+                <= sat_y_offset + sat_y2 + margin
             ):
                 dragging = True
                 drag_start = (x, y)
                 bbox_start = list(current_bbox_scaled)
                 resize_edge = "r"
-            elif sat_x1 <= x <= sat_x2 and sat_y1 <= y <= sat_y2:
+            elif (
+                sat_x1 <= x <= sat_x2
+                and sat_y_offset + sat_y1 <= y <= sat_y_offset + sat_y2
+            ):
                 dragging = True
                 drag_start = (x, y)
                 bbox_start = list(current_bbox_scaled)
@@ -355,12 +375,12 @@ def main():
     def draw_and_show():
         if (
             original_drone is None
-            or original_satellite is None
+            or scaled_satellite is None
             or current_bbox_scaled is None
         ):
             return
         combined = draw_combined_image(
-            original_drone, original_satellite, current_bbox_scaled, current_key
+            original_drone, scaled_satellite, current_bbox_scaled, current_key
         )
         cv2.imshow(WINDOW_NAME, combined)
 
