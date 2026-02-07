@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoImageProcessor, AutoModel, AutoTokenizer
+import open_clip
 from PIL import Image
 from tqdm import tqdm
 import os
@@ -37,7 +37,7 @@ class AverageMeter:
 
 
 # --- Configuration ---
-MODEL_NAME = "google/siglip-base-patch16-224"
+MODEL_NAME = "hf-hub:timm/eva02_base_patch16_clip_224.merged2b_s8b_b131k"
 CACHE_DIR = "/data/feihong/hf_cache"
 DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
 IMAGE_FOLDER = "/data/feihong/image_1024"
@@ -50,11 +50,10 @@ SAT_ORIG_SIZE = (3840, 2160)
 UNIV_SAT_SIZE = (640, 640)
 DRONE_SIZE = (256, 256)
 
-NUM_EPOCHS = 125
+NUM_EPOCHS = 40
 BATCH_SIZE = 20
 LEARNING_RATE = 1e-4
-BBOX_LOSS_WEIGHT = 0.1
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 PROJECTION_DIM = 768
 
 
@@ -70,8 +69,7 @@ def format_satellite_img_bbox(
 
     min_crop = max(y2 - y1, x2 - x1) * 2
     crop_size = random.uniform(min_crop, max(min_crop, height))
-    if mode == 'test':
-        crop_size = int(0.8*height)
+
     min_left = (width / 2) - crop_size
     max_left = width / 2
     min_top = (height / 2) - crop_size
@@ -94,9 +92,6 @@ def format_satellite_img_bbox(
 
     left = random.uniform(min_left, max_left)
     top = random.uniform(min_top, max_top)
-    if mode == 'test':
-        left = (min_left + max_left)/2
-        top = (min_top + max_top)/2
 
     right = left + crop_size
     bottom = top + crop_size
@@ -120,21 +115,19 @@ class TargetSearchDataset(Dataset):
     def __init__(
         self,
         image_pairs,
-        processor,
-        processor_sat,
+        preprocess,
         tokenizer,
         img_to_text_dict,
         bbox_dict=None,
         mode="train",
     ):
         self.image_paths = image_pairs
-        self.processor = processor
-        self.processor_sat = processor_sat
+        self.preprocess = preprocess
         self.tokenizer = tokenizer
         self.img_to_text_dict = img_to_text_dict
         self.bbox_dict = bbox_dict
 
-        self.crop_size = 2160 // 5 * 3  # 1296
+        self.crop_size = 2160 // 5 * 3
         self.mode = mode
         self.remove = [
             "**",
@@ -158,8 +151,8 @@ class TargetSearchDataset(Dataset):
 
         if self.mode == "train":
             choice = []
-            for number in ["01.", "21.", "31.",]:
-                new_query_path = query_path.replace("01.", number)
+            for number in ["01", "21", "31", "41", "51"]:
+                new_query_path = query_path.replace("01", number)
                 if not os.path.exists(new_query_path):
                     continue
                 choice.append(new_query_path)
@@ -194,7 +187,7 @@ class TargetSearchDataset(Dataset):
         augmented_crop_image, normalized_bbox = format_satellite_img_bbox(
             search_image, bbox, mode=self.mode, target_size=UNIV_SAT_SIZE
         )
-        # normalized_bbox = [i / UNIV_SAT_SIZE[0] for i in normalized_bbox]
+
         center_x = (normalized_bbox[0] + normalized_bbox[2]) / 2
         center_y = (normalized_bbox[1] + normalized_bbox[3]) / 2
 
@@ -202,22 +195,15 @@ class TargetSearchDataset(Dataset):
         row_idx = min(int(center_y * 3), 2)
         index = row_idx * 3 + col_idx
 
-        text_inputs = self.tokenizer(
-            [text_description],
-            padding="max_length",
-            truncation=True,
-            max_length=64,
-            return_tensors="pt",
-        )
-        query_inputs = self.processor(images=query_image, return_tensors="pt")
-        search_inputs = self.processor_sat(
-            images=augmented_crop_image, return_tensors="pt"
-        )
+        query_image_tensor = self.preprocess(query_image)
+        search_image_tensor = self.preprocess(augmented_crop_image)
+        text_tokens = self.tokenizer([text_description])
 
         return {
-            "target_pixel_values": query_inputs["pixel_values"][0],
-            "search_pixel_values": search_inputs["pixel_values"][0],
-            "input_ids": text_inputs["input_ids"][0],
+            "target_pixel_values": query_image_tensor,
+            "search_pixel_values": search_image_tensor,
+            "input_ids": text_tokens[0],
+            "attention_mask": (text_tokens[0] != 0).long(),
             "index": index,
             "bbox": torch.tensor(normalized_bbox, dtype=torch.float32),
         }
@@ -228,17 +214,18 @@ class Encoder(nn.Module):
         super().__init__()
 
         try:
-            self.model = AutoModel.from_pretrained(model_name, cache_dir=CACHE_DIR)
-            self.vision_model = self.model.vision_model
-            self.text_model = self.model.text_model
+            self.model, self.preprocess, _ = open_clip.create_model_and_transforms(
+                model_name, cache_dir=CACHE_DIR
+            )
+            self.tokenizer = open_clip.get_tokenizer(model_name)
+            self.vision_model = self.model.visual
 
-            self.feature_dim = self.vision_model.config.hidden_size
-            self.text_feature_dim = self.text_model.config.hidden_size
+            self.feature_dim = 768
+            self.text_feature_dim = 512
         except Exception as e:
-            print(f"Error loading SIGLIP model: {e}")
+            print(f"Error loading EVA-CLIP model: {e}")
             raise
 
-        pool_size = 20
         self.pool_sat = nn.AdaptiveAvgPool2d((20, 20))
         self.pool_dro = nn.AdaptiveAvgPool2d((8, 8))
         self.position_embedding = nn.Embedding(400, PROJECTION_DIM)
@@ -251,17 +238,6 @@ class Encoder(nn.Module):
             nn.ReLU(),
             nn.Linear(self.text_feature_dim * 2, proj_dim),
         )
-
-        self.cross_attn = nn.MultiheadAttention(
-            self.feature_dim, num_heads=8, dropout=0.1, batch_first=True
-        )
-        self.ffn = nn.Sequential(
-            nn.Linear(self.feature_dim, self.feature_dim * 4),
-            nn.GELU(),
-            nn.Linear(self.feature_dim * 4, self.feature_dim),
-        )
-        self.norm1 = nn.LayerNorm(self.feature_dim)
-        self.norm2 = nn.LayerNorm(self.feature_dim)
 
         self.bbox_transformer = SpatialTransformer(
             in_channels=self.feature_dim,
@@ -296,102 +272,60 @@ class Encoder(nn.Module):
         )
 
     def sat_forward(self, pixel_values):
-        """
-        Extract satellite image features from last hidden state without pooling.
+        """Extract satellite image features from last hidden state."""
+        x = self.vision_model.trunk.forward_features(pixel_values)
+        patch_tokens = x[:, 1:, :]
 
-        Args:
-            pixel_values: Satellite image tensor (B, 3, H, W)
+        B, N, D = patch_tokens.shape
+        H = W = int(N**0.5)
 
-        Returns:
-            sat_feat: (B, N, D) where N = num_patches, D = hidden_size
-        """
-        embedding = self.vision_model.embeddings.patch_embedding(pixel_values)
-        embedding = self.pool_sat(embedding).flatten(2).transpose(
-            1, 2
-        ) + self.position_embedding(self.position_ids)
-        sat_feat = self.vision_model.encoder(embedding).last_hidden_state
+        sat_feat = self.pool_sat(patch_tokens.permute(0, 2, 1).reshape(B, D, H, W))
         return sat_feat
 
     def query_forward(self, pixel_values):
-        pooled_features = self.vision_model(pixel_values).pooler_output
+        x = self.vision_model.trunk.forward_features(pixel_values)
+        pooled_features = x[:, 0, :]
         return pooled_features
 
     def text_forward(self, input_ids, attention_mask=None):
-        text_outputs = self.text_model(
-            input_ids=input_ids, attention_mask=attention_mask
-        )
-        pooler_output = text_outputs.pooler_output
-        proj_feature = self.text_projector(pooler_output)
+        text_features = self.model.encode_text(input_ids)
+        proj_feature = self.text_projector(text_features)
         return proj_feature
 
     def bbox_forward(self, anchor_pixel_values, search_pixel_values):
         """
         Combined forward for bbox prediction + retrieval.
 
-        Args:
-            anchor_pixel_values: Query image tensor (B, 3, H, W)
-            search_pixel_values: Search image tensor (B, 3, H, W)
-
         Returns:
-            bbox_pred: YOLO predictions (B, 45, H, W)
-            anchor_feats: B×768 (query features for InfoNCE)
-            grid_feats: B×N×768 (pooled grid features for InfoNCE)
+            pred_anchor: YOLO predictions (B, 45, H, W)
+            pred_coords: (B, 1, H, W)
+            anchor_feats: Query features [B, D]
+            anchor_feats_pooled: Pooled query features [B, D, 8, 8]
         """
         B = anchor_pixel_values.shape[0]
 
-        anchor_feats = self.vision_model(anchor_pixel_values).last_hidden_state
+        anchor_feats_full = self.vision_model.trunk.forward_features(
+            anchor_pixel_values
+        )[:,1:,:]
+        anchor_feats_pooled = self._pool_grid_features(anchor_feats_full)
+        anchor_feats = anchor_feats_full[:, 0, :]
+
         grid_features = self.sat_forward(search_pixel_values)
 
-        anchor_feats_pooled = self._pool_grid_features(anchor_feats)
 
-        N = grid_features.shape[1]
-        H = W = int(N**0.5)
-        grid_features_2d = grid_features.permute(0, 2, 1).reshape(
-            B, self.feature_dim, H, W
-        )
 
-        anchor_context = rearrange(anchor_feats_pooled, "b c h w -> b (h w) c").contiguous()
+        anchor_context = rearrange(
+            anchor_feats_pooled, "b c h w -> b (h w) c"
+        ).contiguous()
 
         fused_features = self.bbox_transformer(
-            x=grid_features_2d, context=anchor_context
+            x=grid_features, context=anchor_context
         )
 
         pred_anchor = self.bbox_fcn_out(fused_features)
         pred_coords = self.bbox_coords_out(fused_features)
 
         return pred_anchor, pred_coords, anchor_feats, anchor_feats_pooled
-
-    def bbox_forward_yolo(self, anchor_pixel_values, search_pixel_values):
-        """
-        TROGeoLite-style bbox prediction.
-
-        Returns:
-            pred_anchor: (B, 45, 20, 20) - 9 anchors × 5 values
-            pred_coords: (B, 1, 20, 20) - coordinate map
-        """
-        B = anchor_pixel_values.shape[0]
-
-        anchor_feats = self.query_forward(anchor_pixel_values)
-        grid_features = self.sat_forward(search_pixel_values)
-
-        N = grid_features.shape[1]
-        H = W = int(N**0.5)
-        grid_features_2d = grid_features.permute(0, 2, 1).reshape(
-            B, self.feature_dim, H, W
-        )
-
-        anchor_2d = anchor_feats.unsqueeze(-1).unsqueeze(-1)
-        anchor_context = anchor_2d.expand(-1, -1, H, W)
-        anchor_context = rearrange(anchor_context, "b c h w -> b (h w) c").contiguous()
-
-        fused_features = self.bbox_transformer(
-            x=grid_features_2d, context=anchor_context
-        )
-
-        pred_anchor = self.bbox_fcn_out(fused_features)
-        pred_coords = self.bbox_coords_out(fused_features)
-
-        return pred_anchor, pred_coords
 
     def _pool_grid_features(self, vision_features):
         B, N, D = vision_features.shape
@@ -402,16 +336,14 @@ class Encoder(nn.Module):
 
         return pooled_features
 
-    def preprocess(self, query_image, search_image):
-        if not isinstance(self.getattr('processor',None)):
-            self.processor = AutoImageProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
-            self.processor_sat = AutoImageProcessor.from_pretrained(
-                MODEL_NAME, cache_dir=CACHE_DIR, size={"height": 640, "width": 640}
-            )
-        query_inputs = self.processor(images=query_image, return_tensors="pt")
-        search_inputs = self.processor_sat(images=search_image, return_tensors="pt")
-        return query_inputs["pixel_values"][0], search_inputs["pixel_values"][0]
-# def info_nce_loss(query_feats, candidate_feats, positive_indices, temperature=0.07):
+
+def info_nce_loss(query_feats, candidate_feats, positive_indices, temperature=0.07):
+    query_feats = F.normalize(query_feats, p=2, dim=1)
+    candidate_feats = F.normalize(candidate_feats, p=2, dim=1)
+    sim_matrix = torch.matmul(query_feats, candidate_feats.T) / temperature
+    return F.cross_entropy(sim_matrix, positive_indices)
+
+
 def validation(loader, model, anchors_full, img_size):
     """Validate model."""
     model.eval()
@@ -426,7 +358,7 @@ def validation(loader, model, anchors_full, img_size):
         ori_gt_bbox = batch["bbox"].to(DEVICE)
 
         with torch.no_grad():
-            pred_anchor, _,_, _ = model.bbox_forward(query_imgs, rs_imgs)
+            pred_anchor, _, _, _ = model.bbox_forward(query_imgs, rs_imgs)
 
         pred_anchor = pred_anchor.view(
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
@@ -468,15 +400,15 @@ def main(save_path):
     print(f"Found {len(image_pairs)} valid pairs.")
 
     print("Loading models and processor...")
-    processor = AutoImageProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
-    processor_sat = AutoImageProcessor.from_pretrained(
-        MODEL_NAME, cache_dir=CACHE_DIR, size={"height": 640, "width": 640}
+    model, preprocess, _ = open_clip.create_model_and_transforms(
+        MODEL_NAME, cache_dir=CACHE_DIR
     )
+    tokenizer = open_clip.get_tokenizer(MODEL_NAME)
 
-    model = Encoder(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM).to(DEVICE)
-    model.train()
+    encoder = Encoder(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM).to(DEVICE)
+    encoder.train()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    optimizer = torch.optim.AdamW(encoder.parameters(), lr=LEARNING_RATE)
 
     img_to_text_dict = json.load(open(TEXT_FILE, "r"))
     train_bbox_dict = json.load(open(TRAIN_BBOX_FILE, "r"))
@@ -485,7 +417,6 @@ def main(save_path):
     anchors_full = get_tensor_anchors(DEVICE)
 
     print("Setting up dataset and dataloader...")
-    # Load training image pairs from /data/feihong/ckpt/train.txt
     train_image_pairs = []
     with open("/data/feihong/ckpt/train.txt", "r") as f:
         for line in f:
@@ -502,11 +433,10 @@ def main(save_path):
             search_path = f"{IMAGE_FOLDER}/{name}.png"
             if os.path.exists(search_path):
                 test_image_pairs.append((query_path, search_path))
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
     train_dataset = TargetSearchDataset(
         image_pairs=train_image_pairs,
-        processor=processor,
-        processor_sat=processor_sat,
+        preprocess=preprocess,
         tokenizer=tokenizer,
         img_to_text_dict=img_to_text_dict,
         bbox_dict=train_bbox_dict,
@@ -517,8 +447,7 @@ def main(save_path):
 
     test_dataset = TargetSearchDataset(
         image_pairs=test_image_pairs,
-        processor=processor,
-        processor_sat=processor_sat,
+        preprocess=preprocess,
         tokenizer=tokenizer,
         img_to_text_dict=img_to_text_dict,
         bbox_dict=test_bbox_dict,
@@ -530,10 +459,9 @@ def main(save_path):
 
     print(f"Starting training on {DEVICE} for {NUM_EPOCHS} epochs...")
     max_iou = 0
-    BBOX_LOSS_WEIGHT = 0.1
 
     for epoch in range(NUM_EPOCHS):
-        model.train()
+        encoder.train()
         total_loss = 0
         total_bbox_loss = 0
         progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}")
@@ -545,7 +473,7 @@ def main(save_path):
             local_indices = batch["index"].to(DEVICE)
             target_bbox = batch["bbox"].to(DEVICE)
 
-            pred_anchor, pred_coords, anchor_feats, grid_feats = model.bbox_forward(
+            pred_anchor, pred_coords, anchor_feats, grid_feats = encoder.bbox_forward(
                 target_pixel_values, search_pixel_values
             )
 
@@ -570,28 +498,6 @@ def main(save_path):
             )
             bbox_loss = loss_geo + loss_cls
 
-            # candidate_feats = grid_feats.reshape(-1, PROJECTION_DIM)
-            # text_feats = model.text_forward(input_ids)
-
-            # positive_indices = torch.zeros(
-            #     local_indices.shape[0], local_indices.shape[0] * 9, device=DEVICE
-            # )
-            # batch_offsets = torch.arange(local_indices.shape[0], device=DEVICE) * 9
-            # row_indices_broad = torch.arange(
-            #     local_indices.shape[0], device=DEVICE
-            # ).unsqueeze(1)
-            # col_offsets = torch.arange(9, device=DEVICE).unsqueeze(0)
-            # same_image_cols = batch_offsets.unsqueeze(1) + col_offsets
-
-            # positive_indices[row_indices_broad, same_image_cols] = 0.5
-            # global_positive_indices = local_indices + batch_offsets
-            # row_indices_flat = torch.arange(local_indices.shape[0], device=DEVICE)
-            # positive_indices[row_indices_flat, global_positive_indices] = 0.95
-
-            # img_text_loss = 0.7 * info_nce_loss(
-            #     anchor_feats, candidate_feats, positive_indices
-            # ) + 0.3 * info_nce_loss(text_feats, candidate_feats, positive_indices)
-
             loss = bbox_loss
 
             optimizer.zero_grad()
@@ -613,9 +519,9 @@ def main(save_path):
         avg_loss = total_loss / len(train_dataloader)
         avg_bbox_loss = total_bbox_loss / len(train_dataloader)
 
-        model.eval()
+        encoder.eval()
         accu50, accu25, val_iou = validation(
-            test_dataloader, model, anchors_full, UNIV_SAT_SIZE[0]
+            test_dataloader, encoder, anchors_full, UNIV_SAT_SIZE[0]
         )
         writer.add_scalar("Loss/train_epoch", avg_loss, epoch)
         writer.add_scalar("Metrics/val_iou", val_iou, epoch)
@@ -629,21 +535,20 @@ def main(save_path):
 
         if val_iou > max_iou:
             os.makedirs(save_path, exist_ok=True)
-            torch.save(model.state_dict(), f"{save_path}/best.pth")
+            torch.save(encoder.state_dict(), f"{save_path}/best.pth")
             max_iou = val_iou
             not_update = 0
         else:
             not_update += 1
         if not_update > 5:
             print(f"Validation loss not improving {not_update} epoch.")
-        #     break
 
     print("Training complete.")
     writer.close()
 
 
 if __name__ == "__main__":
-    exp_name = "ground_siglip_base"
+    exp_name = "ground_evaclip"
     save_dir = f"../ckpt/{exp_name}"
 
     if os.path.exists(save_dir):
@@ -653,12 +558,4 @@ if __name__ == "__main__":
         os.makedirs(save_dir)
         print(f"Created experiment directory: {save_dir}")
 
-    # Run training
     main(save_dir)
-
-    # Run evaluation
-    # eval(True)  # Extract features
-    # eval(False) # Calculate metrics
-
-    # eval_denseuav(True)  # Extract features
-    # eval_denseuav(False)  # Extract features

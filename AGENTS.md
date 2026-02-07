@@ -1,43 +1,47 @@
 # AGENTS.md - Guide for Coding Agents
 
+## Repository Overview
+
+This codebase implements image retrieval and localization models (CLIP, SigLIP, EVA-CLIP, OpenCLIP) for drone-to-satellite image matching. Key components:
+- **Vision encoders**: CLIP/SigLIP vision models for query (drone) and search (satellite) images
+- **Text encoder**: CLIP text model for textual descriptions
+- **Retrieval loss**: InfoNCE contrastive loss for cross-modal retrieval
+- **Bbox prediction**: MLP-based bbox head for localization
+- **Detection heads**: DETR, YOLO, RPN implementations in `bbox/` module
+
 ## Build/Test Commands
 
 ### Training Scripts
-Run training directly with Python:
 ```bash
-python train_clip.py      # CLIP model training
-python train_siglip.py    # SigLIP model training  
-python train_evaclip.py   # EVA-CLIP model training
-python train_openclip.py  # OpenCLIP model training
-python finetune.py        # DINOv2 fine-tuning
+python train_clip.py           # CLIP model training
+python train_siglip.py         # SigLIP model training
+python train_evaclip.py        # EVA-CLIP model training
+python train_openclip.py       # OpenCLIP model training
+python unified_siglip.py       # Combined retrieval + bbox prediction
 ```
 
-### Feature Extraction
+### Feature Extraction & Evaluation
 ```bash
-python feature_extraction.py
-python download_model.py
+python feature_extraction.py   # Extract features for evaluation
+python download_model.py       # Download pretrained models
 ```
 
-### Inference/Testing
-Scripts are standalone and run directly. No standard test framework (pytest) is used.
-Monitor training with TensorBoard:
+### Monitoring
 ```bash
-tensorboard --logdir runs/
+tensorboard --logdir runs/     # Monitor training with TensorBoard
 ```
 
 ## Code Style Guidelines
 
-### Imports
-- Standard library imports first (os, json, random, glob)
-- Third-party imports second (torch, PIL, numpy, tqdm)
-- Relative/local imports last
-- Group imports logically with blank lines between groups
+### Imports Order
+1. Standard library (os, json, random, glob, typing)
+2. Third-party (torch, PIL, numpy, tqdm, transformers)
+3. Local/relative imports
 
-Example:
 ```python
 import os
 import json
-import random
+from typing import List, Tuple
 from glob import glob
 
 import torch
@@ -47,22 +51,23 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from transformers import CLIPModel, CLIPProcessor
+from transformers import AutoModel, AutoTokenizer
 ```
 
-### Formatting & Naming
-- Use 4-space indentation
-- Variable names: snake_case (e.g., `image_paths`, `crop_size`)
-- Class names: PascalCase (e.g., `TargetSearchDataset`, `Encoder`)
-- Constants: UPPER_SNAKE_CASE at top of file (e.g., `MODEL_NAME`, `BATCH_SIZE`, `DEVICE`)
-- Function names: snake_case (e.g., `get_data_loaders`, `train_one_epoch`)
-- Private methods: single underscore prefix (e.g., `_process_batch`)
+### Naming Conventions
+| Type | Convention | Example |
+|------|------------|---------|
+| Variables | snake_case | `image_paths`, `crop_size` |
+| Classes | PascalCase | `TargetSearchDataset`, `Encoder` |
+| Constants | UPPER_SNAKE_CASE | `MODEL_NAME`, `BATCH_SIZE` |
+| Functions | snake_case | `compute_bbox_loss` |
+| Private methods | `_single_underscore` | `_pool_grid_features` |
 
-### Configuration
-Place all configuration constants at the top of files, separated with comments:
+### Configuration Block
+Place at file top with `--- Configuration ---` separator:
 ```python
 # --- Configuration ---
-MODEL_NAME = "openai/clip-vit-base-patch32"
+MODEL_NAME = "google/siglip-base-patch16-224"
 CACHE_DIR = "/data/feihong/hf_cache"
 NUM_EPOCHS = 40
 BATCH_SIZE = 20
@@ -72,72 +77,110 @@ PROJECTION_DIM = 768
 ```
 
 ### PyTorch Patterns
-- Use `with torch.no_grad():` for inference/evaluation
-- Use `.to(DEVICE)` after moving tensors to device
-- Load models with `torch.load(model_path, map_location='cpu')` for safety
-- Save with `torch.save(model.state_dict(), path)`
-- Set model to train/eval mode explicitly: `model.train()` / `model.eval()`
+```python
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+model.load_state_dict(torch.load(path, map_location="cpu"), strict=False)
+torch.save(model.state_dict(), path)
+model.eval()
+with torch.no_grad():
+    outputs = model(inputs)
+tensor = tensor.to(DEVICE)
+```
 
-### Datasets & DataLoaders
-- Inherit from `torch.utils.data.Dataset`
-- Implement `__len__` and `__getitem__`
-- Use `num_workers=4` for DataLoader
-- Handle FileNotFoundError in `__getitem__` gracefully
+### Dataset Structure
+```python
+class TargetSearchDataset(Dataset):
+    def __init__(self, image_pairs, processor, tokenizer, img_to_text_dict, bbox_dict=None, mode="train"):
+        pass
 
-### Model Architecture
-- Inherit from `nn.Module`
-- Call `super().__init__()` in __init__
-- Use `nn.Sequential` for simple layer stacks
-- Projection heads typically: Linear -> ReLU -> Linear
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        return {"target_pixel_values": ..., "bbox": ...}
+```
+
+### Model Architecture Patterns
+```python
+class Encoder(nn.Module):
+    def __init__(self, model_name, proj_dim=768):
+        super().__init__()
+        self.model = AutoModel.from_pretrained(model_name)
+        self.pool = nn.AdaptiveAvgPool2d((3, 3))
+        self.text_projector = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.ReLU(),
+            nn.Linear(dim * 2, proj_dim),
+        )
+
+    def ref_forward(self, pixel_values):
+        pass
+
+    def bbox_forward(self, anchor, search):
+        pass
+```
 
 ### Loss Functions
-- Define custom loss functions with clear docstrings
-- Use InfoNCE/contrastive loss for retrieval tasks
-- Normalize features before computing similarity: `F.normalize(feats, p=2, dim=1)`
+```python
+def compute_bbox_loss(pred_bbox: torch.Tensor, target_bbox: torch.Tensor) -> torch.Tensor:
+    l1_loss = F.l1_loss(pred_bbox, target_bbox)
+    # IoU calculation ...
+    return 0.5 * l1_loss + 0.5 * iou_loss.mean()
 
-### Logging & Progress
-- Use `tqdm` for progress bars
-- Use `torch.utils.tensorboard.SummaryWriter` for logging
-- Log both batch-level and epoch-level metrics
-- Print key metrics to console
+def info_nce_loss(query_feats, candidate_feats, positive_indices, temperature=0.07):
+    query_feats = F.normalize(query_feats, p=2, dim=1)
+    candidate_feats = F.normalize(candidate_feats, p=2, dim=1)
+    sim_matrix = torch.matmul(query_feats, candidate_feats.T) / temperature
+    return F.cross_entropy(sim_matrix, positive_indices)
+```
 
 ### Error Handling
-- Wrap model loading in try/except with descriptive error messages
-- Handle missing files gracefully with FileNotFoundError
-- Use assertions for shape validation in critical paths
+```python
+try:
+    query_image = Image.open(query_path).convert("RGB")
+except FileNotFoundError as e:
+    print(f"Error loading image: {e}. Skipping this item.")
+    return self.__getitem__((idx + 1) % len(self))
+```
 
 ### File I/O
-- Use absolute paths (data paths are configured as constants)
-- Load JSON with `json.load(open(path, 'r'))`
-- Save NPZ files: `np.savez(path, **dict)`
-- Use `os.path.exists()` before file operations
-
-### Environment Variables
-Set cache directories via environment variables before imports:
 ```python
-os.environ['HF_HOME'] = '/path/to/cache'
-os.environ['HF_CACHE'] = '/path/to/cache'
+img_to_text_dict = json.load(open(TEXT_FILE, "r"))
+np.savez("eval_search_siglip.npz", **res_search)
+if os.path.exists(search_path):
+    pass
 ```
 
-### Comments
-- Keep comments minimal and concise
-- Comment disabled code blocks with context
-- Use inline comments for complex calculations
+### Logging
+```python
+writer = SummaryWriter(f"runs/{exp_name}")
+writer.add_scalar("Loss/train_epoch", avg_loss, epoch)
+progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+```
 
-### Device Management
-- Check CUDA availability: `torch.cuda.is_available()`
-- Select specific GPU: `DEVICE = "cuda:0"` or `"cuda:2"`
-- Use conditional: `DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"`
+### Bbox Module Structure
+```
+bbox/
+├── __init__.py           # Exports DETRHead, YOLOHead, RPNHead
+├── detr_head.py          # DETR-style transformer decoder
+├── yolo_head.py          # YOLO anchor-based detection
+└── rpn_head.py           # RPN + Fast R-CNN heads
+```
+
+### Training Loop Pattern
+```python
+for epoch in range(NUM_EPOCHS):
+    model.train()
+    for batch in dataloader:
+        bbox_pred, anchor_feats, grid_feats = model.bbox_forward(...)
+        retrieval_loss = info_nce_loss(...)
+        bbox_loss = compute_bbox_loss(bbox_pred, batch["bbox"])
+        loss = retrieval_loss + BBOX_LOSS_WEIGHT * bbox_loss
+        loss.backward()
+        optimizer.step()
+```
 
 ### Data Augmentation
-- Random cropping during training, fixed crops during test
-- Center crop for evaluation: `image.crop((left, top, right, bottom))`
-- Resize to standard dimensions: `.resize((640, 640))`
-
-### Early Stopping
-Track validation loss and stop after N epochs without improvement:
-```python
-if not_update > 5:
-    print("Validation loss not improving. Stopping early.")
-    break
-```
+- Training: Random crop within bbox constraints
+- Test: Fixed center crop `(840, 0, 3000, 2160)`
+- Resize: Standard sizes (640x640, 512x512)
