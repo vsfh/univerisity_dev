@@ -12,6 +12,14 @@ import random
 from torch.utils.tensorboard import SummaryWriter
 import json
 
+SEED = 43
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.benchmark = True
+
 # --- Configuration ---
 MODEL_NAME = "openai/clip-vit-base-patch32"
 # MODEL_NAME = "openai/clip-vit-large-patch14"
@@ -683,7 +691,7 @@ if __name__ == "__main__":
     # main(save_dir)
 
     # Run evaluation
-    # eval(True)  # Extract features
-    # eval(False)  # Calculate metrics
-    eval_denseuav(True)  # Extract features
-    eval_denseuav(False)  # Extract features
+    eval(True)  # Extract features
+    eval(False)  # Calculate metrics
+    # eval_denseuav(True)  # Extract features
+    # eval_denseuav(False)  # Extract features

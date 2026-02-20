@@ -12,6 +12,14 @@ import random
 from torch.utils.tensorboard import SummaryWriter
 import json
 
+SEED = 43
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.benchmark = True
+
 # --- Configuration ---
 MODEL_NAME = "hf-hub:timm/eva02_base_patch16_clip_224.merged2b_s8b_b131k"
 CACHE_DIR = "/data/feihong/hf_cache"
@@ -684,4 +692,3 @@ if __name__ == "__main__":
 
     eval_denseuav(True)  # Extract features
     eval_denseuav(False)  # Extract features
-

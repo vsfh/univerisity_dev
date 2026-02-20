@@ -12,6 +12,14 @@ import random
 from torch.utils.tensorboard import SummaryWriter
 import json
 
+SEED = 43
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.benchmark = True
+
 # --- Configuration ---
 MODEL_NAME = "google/siglip-base-patch16-224"
 CACHE_DIR = "/data/feihong/hf_cache"
@@ -58,8 +66,8 @@ class TargetSearchDataset(Dataset):
 
         if self.mode == "train":
             choice = []
-            for number in ["01", "21", "31", "41", "51"]:
-                new_query_path = query_path.replace("01", number)
+            for number in ["01.", "21.", "31.", "41.", "51."]:
+                new_query_path = query_path.replace("01.", number)
                 if not os.path.exists(new_query_path):
                     continue
                 choice.append(new_query_path)
@@ -638,7 +646,7 @@ def eval_denseuav(run=False):
             if key in ex_img_list:
                 ex_img_list.remove(key)
             ex_img_list.append(key)
-            right_num = len(ex_img_list)-1
+            right_num = len(ex_img_list) - 1
             res[key] = []
             for img_name in ex_img_list:
                 cos_sim_grid = calcu_cos(fused_query_feature, search_res[img_name])
@@ -675,8 +683,8 @@ if __name__ == "__main__":
     # main(save_dir)
 
     # Run evaluation
-    # eval(True)  # Extract features
-    # eval(False) # Calculate metrics
+    eval(True)  # Extract features
+    eval(False) # Calculate metrics
 
-    eval_denseuav(True)  # Extract features
-    eval_denseuav(False)  # Extract features
+    # eval_denseuav(True)  # Extract features
+    # eval_denseuav(False)  # Extract features

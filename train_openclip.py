@@ -12,6 +12,14 @@ import random
 from torch.utils.tensorboard import SummaryWriter
 import json
 
+SEED = 43
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.benchmark = True
+
 # --- Configuration ---
 MODEL_NAME = "ViT-B-32"
 PRETRAINED = "openai"

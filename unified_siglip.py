@@ -11,7 +11,8 @@ import numpy as np
 import random
 from torch.utils.tensorboard import SummaryWriter
 import json
-from einops import rearrange
+from einops import rearrange, einsum
+import muon
 
 from bbox.yolo_utils import (
     get_tensor_anchors,
@@ -21,13 +22,14 @@ from bbox.yolo_utils import (
     SpatialTransformer,
 )
 
+torch.backends.cudnn.benchmark = True
+
 SEED = 43
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.benchmark = True
 
 
 class AverageMeter:
@@ -58,11 +60,11 @@ SAT_ORIG_SIZE = (3840, 2160)
 UNIV_SAT_SIZE = (640, 640)
 DRONE_SIZE = (256, 256)
 
-NUM_EPOCHS = 125
+NUM_EPOCHS = 360
 BATCH_SIZE = 20
 LEARNING_RATE = 1e-4
 BBOX_LOSS_WEIGHT = 0.1
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
 PROJECTION_DIM = 768
 
 
@@ -253,6 +255,7 @@ class Encoder(nn.Module):
         pool_size = 20
         self.pool_sat = nn.AdaptiveAvgPool2d((20, 20))
         self.pool_dro = nn.AdaptiveAvgPool2d((8, 8))
+        self.pool_info = nn.AdaptiveAvgPool2d((3, 3))
         self.position_embedding = nn.Embedding(400, PROJECTION_DIM)
         self.register_buffer(
             "position_ids", torch.arange(400).expand((1, -1)), persistent=False
@@ -263,17 +266,7 @@ class Encoder(nn.Module):
             nn.ReLU(),
             nn.Linear(self.text_feature_dim * 2, proj_dim),
         )
-
-        self.cross_attn = nn.MultiheadAttention(
-            self.feature_dim, num_heads=8, dropout=0.1, batch_first=True
-        )
-        self.ffn = nn.Sequential(
-            nn.Linear(self.feature_dim, self.feature_dim * 4),
-            nn.GELU(),
-            nn.Linear(self.feature_dim * 4, self.feature_dim),
-        )
-        self.norm1 = nn.LayerNorm(self.feature_dim)
-        self.norm2 = nn.LayerNorm(self.feature_dim)
+        self.anchor_projector = nn.Conv1d(196, 196, kernel_size=1)
 
         self.bbox_transformer = SpatialTransformer(
             in_channels=self.feature_dim,
@@ -325,8 +318,10 @@ class Encoder(nn.Module):
         return sat_feat
 
     def query_forward(self, pixel_values):
-        pooled_features = self.vision_model(pixel_values).pooler_output
-        return pooled_features
+        anchor_feats = self.vision_model(pixel_values).last_hidden_state
+        anchor_feats_pooled = anchor_feats.mean(1)
+
+        return anchor_feats_pooled
 
     def text_forward(self, input_ids, attention_mask=None):
         text_outputs = self.text_model(
@@ -362,6 +357,11 @@ class Encoder(nn.Module):
             B, self.feature_dim, H, W
         )
 
+        grid_features_info = (
+            self.pool_info(grid_features_2d)
+            .reshape(B, self.feature_dim, 9)
+            .permute(0, 2, 1)
+        )
         anchor_context = rearrange(
             anchor_feats_pooled, "b c h w -> b (h w) c"
         ).contiguous()
@@ -373,7 +373,12 @@ class Encoder(nn.Module):
         pred_anchor = self.bbox_fcn_out(fused_features)
         pred_coords = self.bbox_coords_out(fused_features)
 
-        return pred_anchor, pred_coords, anchor_feats, anchor_feats_pooled
+        return (
+            pred_anchor,
+            pred_coords,
+            self.anchor_projector(anchor_feats).mean(1),
+            grid_features_info,
+        )
 
     def bbox_forward_yolo(self, anchor_pixel_values, search_pixel_values):
         """
@@ -429,7 +434,13 @@ class Encoder(nn.Module):
         return query_inputs["pixel_values"][0], search_inputs["pixel_values"][0]
 
 
-# def info_nce_loss(query_feats, candidate_feats, positive_indices, temperature=0.07):
+def info_nce_loss(query_feats, candidate_feats, positive_indices, temperature=0.07):
+    query_feats = F.normalize(query_feats, p=2, dim=1)
+    candidate_feats = F.normalize(candidate_feats, p=2, dim=1)
+    sim_matrix = torch.matmul(query_feats, candidate_feats.T) / temperature
+    return F.cross_entropy(sim_matrix, positive_indices)
+
+
 def validation(loader, model, anchors_full, img_size):
     """Validate model."""
     model.eval()
@@ -437,14 +448,20 @@ def validation(loader, model, anchors_full, img_size):
     accu50_meter = AverageMeter()
     accu25_meter = AverageMeter()
     iou_meter = AverageMeter()
+    info_nce_meter = AverageMeter()
 
     for batch in tqdm(loader, desc="Validating"):
         query_imgs = batch["target_pixel_values"].to(DEVICE)
         rs_imgs = batch["search_pixel_values"].to(DEVICE)
         ori_gt_bbox = batch["bbox"].to(DEVICE)
+        input_ids = batch["input_ids"].to(DEVICE)
+        local_indices = batch["index"].to(DEVICE)
 
         with torch.no_grad():
-            pred_anchor, _, _, _ = model.bbox_forward(query_imgs, rs_imgs)
+            pred_anchor, pred_coords, anchor_feats, grid_feats = model.bbox_forward(
+                query_imgs, rs_imgs
+            )
+            text_feats = model.text_forward(input_ids)
 
         pred_anchor = pred_anchor.view(
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
@@ -464,11 +481,33 @@ def validation(loader, model, anchors_full, img_size):
             iou_threshold_list=[0.5, 0.25],
         )
 
+        candidate_feats = grid_feats.reshape(-1, PROJECTION_DIM)
+
+        positive_indices = torch.zeros(
+            local_indices.shape[0], local_indices.shape[0] * 9, device=DEVICE
+        )
+        batch_offsets = torch.arange(local_indices.shape[0], device=DEVICE) * 9
+        row_indices_broad = torch.arange(
+            local_indices.shape[0], device=DEVICE
+        ).unsqueeze(1)
+        col_offsets = torch.arange(9, device=DEVICE).unsqueeze(0)
+        same_image_cols = batch_offsets.unsqueeze(1) + col_offsets
+
+        positive_indices[row_indices_broad, same_image_cols] = 0.5
+        global_positive_indices = local_indices + batch_offsets
+        row_indices_flat = torch.arange(local_indices.shape[0], device=DEVICE)
+        positive_indices[row_indices_flat, global_positive_indices] = 0.95
+
+        img_text_loss = 0.7 * info_nce_loss(
+            anchor_feats, candidate_feats, positive_indices
+        ) + 0.3 * info_nce_loss(text_feats, candidate_feats, positive_indices)
+
         accu50_meter.update(accu_list[0].item(), query_imgs.shape[0])
         accu25_meter.update(accu_list[1].item(), query_imgs.shape[0])
         iou_meter.update(iou.item(), query_imgs.shape[0])
+        info_nce_meter.update(img_text_loss.item(), query_imgs.shape[0])
 
-    return accu50_meter.avg, accu25_meter.avg, iou_meter.avg
+    return accu50_meter.avg, accu25_meter.avg, iou_meter.avg, info_nce_meter.avg
 
 
 def main(save_path):
@@ -492,6 +531,7 @@ def main(save_path):
     )
 
     model = Encoder(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM).to(DEVICE)
+    model = torch.compile(model)
     model.train()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
@@ -530,7 +570,7 @@ def main(save_path):
         bbox_dict=train_bbox_dict,
     )
     train_dataloader = DataLoader(
-        train_dataset, shuffle=True, batch_size=BATCH_SIZE, num_workers=4
+        train_dataset, shuffle=True, batch_size=BATCH_SIZE, num_workers=8
     )
 
     test_dataset = TargetSearchDataset(
@@ -548,6 +588,7 @@ def main(save_path):
 
     print(f"Starting training on {DEVICE} for {NUM_EPOCHS} epochs...")
     max_iou = 0
+    min_info = 1000
     BBOX_LOSS_WEIGHT = 0.1
 
     for epoch in range(NUM_EPOCHS):
@@ -588,29 +629,29 @@ def main(save_path):
             )
             bbox_loss = loss_geo + loss_cls
 
-            # candidate_feats = grid_feats.reshape(-1, PROJECTION_DIM)
-            # text_feats = model.text_forward(input_ids)
+            candidate_feats = grid_feats.reshape(-1, PROJECTION_DIM)
+            text_feats = model.text_forward(input_ids)
 
-            # positive_indices = torch.zeros(
-            #     local_indices.shape[0], local_indices.shape[0] * 9, device=DEVICE
-            # )
-            # batch_offsets = torch.arange(local_indices.shape[0], device=DEVICE) * 9
-            # row_indices_broad = torch.arange(
-            #     local_indices.shape[0], device=DEVICE
-            # ).unsqueeze(1)
-            # col_offsets = torch.arange(9, device=DEVICE).unsqueeze(0)
-            # same_image_cols = batch_offsets.unsqueeze(1) + col_offsets
+            positive_indices = torch.zeros(
+                local_indices.shape[0], local_indices.shape[0] * 9, device=DEVICE
+            )
+            batch_offsets = torch.arange(local_indices.shape[0], device=DEVICE) * 9
+            row_indices_broad = torch.arange(
+                local_indices.shape[0], device=DEVICE
+            ).unsqueeze(1)
+            col_offsets = torch.arange(9, device=DEVICE).unsqueeze(0)
+            same_image_cols = batch_offsets.unsqueeze(1) + col_offsets
 
-            # positive_indices[row_indices_broad, same_image_cols] = 0.5
-            # global_positive_indices = local_indices + batch_offsets
-            # row_indices_flat = torch.arange(local_indices.shape[0], device=DEVICE)
-            # positive_indices[row_indices_flat, global_positive_indices] = 0.95
+            positive_indices[row_indices_broad, same_image_cols] = 0.5
+            global_positive_indices = local_indices + batch_offsets
+            row_indices_flat = torch.arange(local_indices.shape[0], device=DEVICE)
+            positive_indices[row_indices_flat, global_positive_indices] = 0.95
 
-            # img_text_loss = 0.7 * info_nce_loss(
-            #     anchor_feats, candidate_feats, positive_indices
-            # ) + 0.3 * info_nce_loss(text_feats, candidate_feats, positive_indices)
+            img_text_loss = 0.7 * info_nce_loss(
+                anchor_feats, candidate_feats, positive_indices
+            ) + 0.3 * info_nce_loss(text_feats, candidate_feats, positive_indices)
 
-            loss = bbox_loss
+            loss = bbox_loss + img_text_loss * 0.05
 
             optimizer.zero_grad()
             loss.backward()
@@ -622,6 +663,7 @@ def main(save_path):
                 {
                     "loss": f"{loss.item():.4f}",
                     "bbox_loss": f"{bbox_loss.item():.4f}",
+                    "img_text_loss": f"{img_text_loss.item():.4f}",
                 }
             )
             writer.add_scalar(
@@ -632,8 +674,11 @@ def main(save_path):
         avg_bbox_loss = total_bbox_loss / len(train_dataloader)
 
         model.eval()
-        accu50, accu25, val_iou = validation(
-            test_dataloader, model, anchors_full, UNIV_SAT_SIZE[0]
+        accu50, accu25, val_iou, val_info_nce = validation(
+            test_dataloader,
+            model,
+            anchors_full,
+            UNIV_SAT_SIZE[0],
         )
         writer.add_scalar("Loss/train_epoch", avg_loss, epoch)
         writer.add_scalar("Metrics/val_iou", val_iou, epoch)
@@ -642,26 +687,177 @@ def main(save_path):
         print(
             f"Epoch {epoch + 1} finished. "
             f"Avg train Loss: {avg_loss:.4f} (bbox: {avg_bbox_loss:.4f}). "
-            f"IoU: {val_iou:.4f}, Accu50: {accu50:.4f}, Accu25: {accu25:.4f}"
+            f"IoU: {val_iou:.4f}, Accu50: {accu50:.4f}, Accu25: {accu25:.4f}, InfoNCE: {val_info_nce:.4f}"
         )
 
         if val_iou > max_iou:
             os.makedirs(save_path, exist_ok=True)
-            torch.save(model.state_dict(), f"{save_path}/best.pth")
+            torch.save(model.state_dict(), f"{save_path}/best_iou_{not_update}.pth")
             max_iou = val_iou
-            not_update = 0
-        else:
             not_update += 1
-        if not_update > 5:
-            print(f"Validation loss not improving {not_update} epoch.")
-        #     break
+        if val_info_nce < min_info:
+            os.makedirs(save_path, exist_ok=True)
+            torch.save(model.state_dict(), f"{save_path}/best_info_{not_update}.pth")
+            min_info = val_info_nce
+            not_update += 1
 
     print("Training complete.")
     writer.close()
 
 
+def eval(run=False):
+    def calcu_cos(a, b):
+        a_norm = a / np.linalg.norm(a)
+        b_norm = b / np.linalg.norm(b, axis=1, keepdims=True)
+        return np.dot(b_norm, a_norm[..., None]).flatten()
+
+    if run:
+        img_to_text_dict = json.load(
+            open("/data/feihong/drone_text_single_long.json", "r")
+        )
+        processor = AutoImageProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
+        processor_sat = AutoImageProcessor.from_pretrained(
+            MODEL_NAME, cache_dir=CACHE_DIR, size={"height": 640, "width": 640}
+        )
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+        encoder = Encoder(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM).to(DEVICE)
+        encoder = torch.compile(encoder)
+        model_path = f"../ckpt/unified_siglip/best_info_56.pth"
+        if os.path.exists(model_path):
+            encoder.load_state_dict(torch.load(model_path, map_location="cpu"))
+        encoder.eval()
+
+        res_search = {}
+        res_fused_query = {}
+
+        print("Setting up dataset and dataloader for eval...")
+        eval_list = []
+        with open("/data/feihong/ckpt/test.txt", "r") as f:
+            for line in f:
+                query_path = line.strip()
+                eval_list.append(query_path)
+
+        for img_path in tqdm(eval_list):
+            name = img_path.split("/")[-2]
+            search_path = f"{IMAGE_FOLDER}/{name}.png"
+            if os.path.exists(search_path):
+                query_image = Image.open(img_path).convert("RGB")
+                search_image = Image.open(search_path).convert("RGB")
+
+                bbox = [0, 0, 0, 0]
+                query_image = resize_drone_image(query_image, DRONE_SIZE)
+                search_image, normalized_bbox = format_satellite_img_bbox(
+                    search_image, bbox, mode="test", target_size=UNIV_SAT_SIZE
+                )
+
+                text_name = name + "_01"
+                text_description = img_to_text_dict.get(text_name, "")
+                for noun in [
+                    "**",
+                    "\n",
+                    "noun",
+                    "phrases",
+                    "Phrase",
+                    "Noun",
+                    "Summary",
+                    "Environment",
+                    "32 tokens",
+                    "Description",
+                    "()",
+                ]:
+                    text_description = text_description.replace(noun, "")
+
+                query_inputs = processor(images=query_image, return_tensors="pt")[
+                    "pixel_values"
+                ].to(DEVICE)
+                search_inputs = processor_sat(images=search_image, return_tensors="pt")[
+                    "pixel_values"
+                ].to(DEVICE)
+                text_inputs = tokenizer(
+                    text=[text_description],
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=64,
+                )
+                input_ids = text_inputs["input_ids"].to(DEVICE)
+
+                with torch.no_grad():
+                    _, _, anchor_feats, grid_feats = encoder.bbox_forward(
+                        query_inputs, search_inputs
+                    )
+                    text_feats = encoder.text_forward(input_ids)
+                    fused_query_feats = 0.3 * F.normalize(
+                        text_feats, p=2, dim=1
+                    ) + 0.7 * F.normalize(anchor_feats, p=2, dim=1)
+
+                res_search[name] = grid_feats.cpu().numpy()
+                res_fused_query[name] = fused_query_feats.cpu().numpy()
+
+        np.savez("eval_search_clip.npz", **res_search)
+        np.savez("eval_fused_query_clip.npz", **res_fused_query)
+        print("Evaluation feature extraction complete.")
+    else:
+        search_res = np.load("eval_search_clip.npz")
+        fused_query_res = np.load("eval_fused_query_clip.npz")
+
+        distances = json.load(open("/data/feihong/ckpt/distances.json", "r"))
+        test_num = 100
+        test_list = [k for k in search_res.keys()]
+        res = {}
+        top1 = 0
+        top5 = 0
+        top10 = 0
+
+        if not test_list:
+            print("No evaluation data found in npz files.")
+            return
+
+        for key in tqdm(test_list):
+            fused_query_feature = fused_query_res[key]
+
+            ex_img_list = random.sample(
+                test_list, min(test_num - 1, len(test_list) - 1)
+            )
+            if key in ex_img_list:
+                ex_img_list.remove(key)
+            ex_img_list.append(key)
+
+            candidate_indices = [len(ex_img_list) - 1]
+            for i, name in enumerate(ex_img_list[:-1]):
+                if (
+                    f"{name}.kml" not in distances
+                    or f"{key}.kml" not in distances[f"{name}.kml"]
+                ):
+                    continue
+                if distances[f"{name}.kml"][f"{key}.kml"] < 380:
+                    candidate_indices.append(i)
+
+            res[key] = []
+            for img_name in ex_img_list:
+                cos_sim_grid = calcu_cos(fused_query_feature, search_res[img_name])
+                res[key].append(cos_sim_grid)
+
+            img_res = np.array(res[key]).mean(1).argsort()[-15:][::-1]
+
+            if any(cand in candidate_indices for cand in img_res[:1]):
+                top1 += 1
+            if any(cand in candidate_indices for cand in img_res[:5]):
+                top5 += 1
+            if any(cand in candidate_indices for cand in img_res[:10]):
+                top10 += 1
+
+        print(f"Top 1: {top1} / {len(test_list)} ({top1 / len(test_list) * 100:.2f}%)")
+        print(f"Top 5: {top5} / {len(test_list)} ({top5 / len(test_list) * 100:.2f}%)")
+        print(
+            f"Top 10: {top10} / {len(test_list)} ({top10 / len(test_list) * 100:.2f}%)"
+        )
+
+
 if __name__ == "__main__":
-    exp_name = "ground_siglip_base"
+    exp_name = "unified_siglip_base"
+    exp_name = "unified_siglip"
     save_dir = f"../ckpt/{exp_name}"
 
     if os.path.exists(save_dir):
@@ -672,11 +868,11 @@ if __name__ == "__main__":
         print(f"Created experiment directory: {save_dir}")
 
     # Run training
-    main(save_dir)
+    # main(save_dir)
 
     # Run evaluation
     # eval(True)  # Extract features
-    # eval(False) # Calculate metrics
+    eval(False)  # Calculate metrics
 
     # eval_denseuav(True)  # Extract features
     # eval_denseuav(False)  # Extract features

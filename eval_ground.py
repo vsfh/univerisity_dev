@@ -28,7 +28,8 @@ from transformers import AutoImageProcessor, AutoModel, AutoTokenizer
 import open_clip
 from bbox.yolo_utils import get_tensor_anchors, build_target, eval_iou_acc, bbox_iou
 from ground_siglip import Encoder as SigLIPModel
-from grounding_cvos.ground_cvos import LPNGeoLite,DetGeoLite,SampleGeoLite,TROGeoLite 
+# from unified_siglip import Encoder as UniSigLIPModel
+from model import Encoder_gem as UniSigLIPModel
 # UNIV_SAT_SIZE = (640, 640)
 # UNIV_DRONE_SIZE = (256, 256)
 
@@ -129,6 +130,10 @@ MODEL_REGISTRY = {
         "module": "__main__",
         "class": "TROGeoLite",
     },
+    "siglip_uni": {
+        "module": "__main__",
+        "class": "UniSigLIPModel",
+    },
 }
 
 
@@ -151,12 +156,17 @@ def load_model_by_string(model_type: str, checkpoint_path: str, device: str):
         module = importlib.import_module(module_name)
         model_class = getattr(module, class_name)
     model = model_class()
+    # if 'uni' in class_name.lower() and not 'move' in class_name.lower():
+    #     print('ok')
+    #     model = torch.compile(model)
     if 'tro' in class_name.lower():
         new_dict = {k.replace('module.',''):v for k,v in torch.load(checkpoint_path, map_location="cpu").items()}
         model.load_state_dict(new_dict)
     else:
         model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
     model = model.to(device)
+
+
     return model
 
 
@@ -479,8 +489,12 @@ def evaluate_model(
         gt_bbox_tensor = torch.tensor(
             [pre_bbox], dtype=torch.float32, device=config.device
         )
+        
         with torch.no_grad():
-            output = model.bbox_forward(query_tensor, search_tensor)
+            if config.preprocess_mode == "siglip":
+                output = model(query_tensor, search_tensor)
+            else:
+                output = model.bbox_forward(query_tensor, search_tensor)
 
         if isinstance(output, torch.Tensor):
             pred_bbox = search_tensor.shape[-1] * output
@@ -610,20 +624,20 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="trogeolite",
-        choices=["siglip", "det", "lpn", "smgeo", "trogeolite", "all"],
+        default="siglip_uni",
+        choices=["siglip", "det", "lpn", "smgeo", "trogeolite", "all", "siglip_uni"],
         help="Model to evaluate",
     )
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/data/feihong/ckpt/ground_cvos/best.pth",
+        default="/data/feihong/ckpt/unified_siglip_attn_move/best_iou_53.pth",
         help="Path to model checkpoint",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./eval_results",
+        default="/data/feihong/univerisity_dev/eval_results",
         help="Output directory for results",
     )
     parser.add_argument(
@@ -636,7 +650,7 @@ def main():
     parser.add_argument(
         "--preprocess_mode",
         type=str,
-        default="cvos",
+        default="siglip",
         choices=["siglip", "cvos"],
         help="Preprocessing mode: siglip (use AutoImageProcessor) or cvos (resize+crop to tensor)",
     )
@@ -658,7 +672,7 @@ def main():
     )
 
     default_checkpoints = {
-        "siglip": "/data/feihong/ckpt/ground_siglip/best.pth",
+        "siglip": "/data/feihong/ckpt/ground_siglip_base/best.pth",
         "det": "/data/feihong/ckpt/ground_det/best.pth",
         "lpn": "/data/feihong/ckpt/ground_lpn/best.pth",
         "smgeo": "/data/feihong/ckpt/ground_sample/best.pth",

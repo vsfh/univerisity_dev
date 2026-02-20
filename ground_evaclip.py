@@ -21,6 +21,14 @@ from bbox.yolo_utils import (
     SpatialTransformer,
 )
 
+SEED = 43
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.benchmark = True
+
 
 class AverageMeter:
     def __init__(self):
@@ -306,21 +314,17 @@ class Encoder(nn.Module):
 
         anchor_feats_full = self.vision_model.trunk.forward_features(
             anchor_pixel_values
-        )[:,1:,:]
+        )[:, 1:, :]
         anchor_feats_pooled = self._pool_grid_features(anchor_feats_full)
         anchor_feats = anchor_feats_full[:, 0, :]
 
         grid_features = self.sat_forward(search_pixel_values)
 
-
-
         anchor_context = rearrange(
             anchor_feats_pooled, "b c h w -> b (h w) c"
         ).contiguous()
 
-        fused_features = self.bbox_transformer(
-            x=grid_features, context=anchor_context
-        )
+        fused_features = self.bbox_transformer(x=grid_features, context=anchor_context)
 
         pred_anchor = self.bbox_fcn_out(fused_features)
         pred_coords = self.bbox_coords_out(fused_features)
