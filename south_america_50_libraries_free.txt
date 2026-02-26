@@ -1,0 +1,26 @@
+University, Matched Location, Latitude, Longitude, Search Used
+Universidade de São Paulo Library, -23.5636161, -46.7133919
+Biblioteca Biomédica, -33.4416133, -70.6405623
+Biblioteca do Instituto de Química, -22.8193729, -47.0674924
+Biblioteca PPGG - Programa de Pós Graduação em Geografia, -22.8569045, -43.2332721
+Archivo Central Andrés Bello, -33.4446344, -70.650561
+Universidad La Gran Colombia, 4.6007601, -74.071188
+Biblioteca Unesp, -22.3958712, -47.5471292
+Biblioteca Central Luis David Cruz Ocampo, -36.8321367, -73.0351246
+Biblioteca Central Luis Jaime Cisneros, -12.0690747, -77.080143
+Biblioteca do Colégio Politécnico, -29.7230161, -53.717988
+Biblioteca Facultad de Humanidades, -33.448617, -70.6822408
+Biblioteca Infantil Parque Nacional, 4.6222109, -74.0635401
+Bloque 8 - Biblioteca Carlos Gaviria Díaz, 6.2669019, -75.5689756
+Biblioteca Setorial do CFM, -27.6012141, -48.5222203
+Biblioteca Florentino Ameghino, -34.9161676, -57.9546166
+Café Aire Libro Plaza las Lilas, -33.4262831, -70.5948385
+Biblioteca del Congreso Nacional de Chile, -33.0482312, -71.6053108
+Biblioteca Central Rosario - UCA, -32.9512334, -60.6710628
+Biblioteca Doctor Laureano Rivas Míguez, -34.5945874, -58.4111581
+Scientific Electronic Library Online, -23.5956847, -46.6473168
+Biblioteca Juan Alfonso Carrizo, -34.5663342, -58.4462389
+Universidad Nacional de Córdoba Library, -31.4385889, -64.1892694
+Biblioteca de Defensa Generala Juana Azurduy, -34.6096891, -58.3680369
+Lader, -32.9472606, -60.639974
+Edificio U - Biblioteca, -33.0349512, -71.5950399

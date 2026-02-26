@@ -68,9 +68,10 @@ class Encoder_gem(nn.Module):
         super().__init__()
 
         try:
-            self.model = AutoModel.from_pretrained(model_name, cache_dir=CACHE_DIR)
-            self.vision_model = self.model.vision_model
-            self.text_model = self.model.text_model
+            model = AutoModel.from_pretrained(model_name, cache_dir=CACHE_DIR)
+            self.vision_model = model.vision_model
+            # self.ground_drone_vision_model = self.model.vision_model
+            self.text_model = model.text_model
 
             self.feature_dim = self.vision_model.config.hidden_size
             self.text_feature_dim = self.text_model.config.hidden_size
@@ -78,12 +79,10 @@ class Encoder_gem(nn.Module):
             print(f"Error loading SIGLIP model: {e}")
             raise
 
-        self.pool_sat = GeM(dim=self.feature_dim, p=3.0)
-        self.pool_dro = GeM(dim=self.feature_dim, p=3.0)
-        self.pool_info_sat = GeM(dim=self.feature_dim, p=2.0)
+        self.pool_info_sat = nn.AdaptiveAvgPool2d((3, 3))
 
         self.gate_fc = nn.Linear(proj_dim * 2, 1)
-        self.fuse_fc = nn.Linear(proj_dim, proj_dim)
+        # self.fuse_fc = nn.Linear(proj_dim, proj_dim)
 
         self.text_projector = nn.Sequential(
             nn.Linear(self.text_feature_dim, self.text_feature_dim * 2),
@@ -112,18 +111,23 @@ class Encoder_gem(nn.Module):
             nn.Conv2d(self.feature_dim // 2, 9 * 5, kernel_size=1),
         )
 
-        self.bbox_coords_out = nn.Sequential(
-            nn.ConvTranspose2d(
-                in_channels=self.feature_dim,
-                out_channels=self.feature_dim // 2,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.ReLU(inplace=True),
-            ResidualBlock(self.feature_dim // 2),
-            nn.Conv2d(self.feature_dim // 2, 1, kernel_size=1),
+        self.bbox_adapter = nn.Sequential(
+            nn.Linear(self.feature_dim, self.feature_dim),
+            nn.GELU(),
+            nn.Linear(self.feature_dim, self.feature_dim),
         )
+        # self.bbox_coords_out = nn.Sequential(
+        #     nn.ConvTranspose2d(
+        #         in_channels=self.feature_dim,
+        #         out_channels=self.feature_dim // 2,
+        #         kernel_size=4,
+        #         stride=2,
+        #         padding=1,
+        #     ),
+        #     nn.ReLU(inplace=True),
+        #     ResidualBlock(self.feature_dim // 2),
+        #     nn.Conv2d(self.feature_dim // 2, 1, kernel_size=1),
+        # )
 
     def text_forward(self, input_ids, attention_mask=None):
         text_outputs = self.text_model(
@@ -135,8 +139,8 @@ class Encoder_gem(nn.Module):
 
     def gated_fusion(self, text_feats, anchor_feats):
         combined = torch.cat([text_feats, anchor_feats], dim=-1)
-        gate = torch.sigmoid(self.gate_fc(combined))
-        fused = self.fuse_fc(gate * text_feats + (1 - gate) * anchor_feats)
+        gate = 0.2 * torch.sigmoid(self.gate_fc(combined))
+        fused = gate * text_feats + (1 - gate) * anchor_feats
         return fused
 
     def forward(self, anchor_pixel_values, search_pixel_values, input_ids=None):
@@ -146,6 +150,9 @@ class Encoder_gem(nn.Module):
         anchor_feats = anchor_output.last_hidden_state
         anchor_pooler = anchor_output.pooler_output
 
+        # ground_drone_output = self.ground_drone_vision_model(anchor_pixel_values)
+        # anchor_feats = ground_drone_output.last_hidden_state
+
         sat_output = self.vision_model(
             search_pixel_values, interpolate_pos_encoding=True
         )
@@ -154,10 +161,11 @@ class Encoder_gem(nn.Module):
         H = W = int(N**0.5)
         sat_features_2d = sat_feats.permute(0, 2, 1).reshape(B, self.feature_dim, H, W)
 
-        fused_features = self.bbox_transformer(x=sat_features_2d, context=anchor_feats)
+        anchor_context = self.bbox_adapter(anchor_feats.detach()) + anchor_feats.detach()
+        fused_features = self.bbox_transformer(x=sat_features_2d, context=anchor_context)
 
         pred_anchor = self.bbox_fcn_out(fused_features)
-        pred_coords = self.bbox_coords_out(fused_features)
+        # pred_coords = self.bbox_coords_out(fused_features)
 
         sat_feature_2d_pool = (
             self.pool_info_sat(sat_features_2d)
@@ -174,7 +182,7 @@ class Encoder_gem(nn.Module):
 
         return (
             pred_anchor,
-            pred_coords,
+            text_feats,
             anchor_pooler,
             sat_feature_2d_pool,
             fused_feats if input_ids is not None else None,

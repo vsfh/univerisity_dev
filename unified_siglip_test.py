@@ -59,7 +59,7 @@ BATCH_SIZE = 15
 GRAD_ACCUMULATION_STEPS = 3
 LEARNING_RATE = 1e-5
 LR_MIN = 1e-10
-COSINE_EPOCHS = 200
+COSINE_EPOCHS = 100
 BBOX_LOSS_WEIGHT = 0.1
 PROJECTION_DIM = 768
 
@@ -72,7 +72,7 @@ def get_loss_weights(epoch, num_epochs):
         retrieval_weight: increases from 0.01 to 0.99
     """
     progress = epoch / num_epochs
-    bbox_weight = 0.5 * (1 + np.cos(2 * np.pi * progress)) / 2
+    bbox_weight = 0.5 * (1 + np.cos(np.pi * progress)) / 2
     retrieval_weight = 1.0 - bbox_weight
     return bbox_weight, retrieval_weight
 
@@ -481,9 +481,29 @@ def validation(loader, model, accelerator, anchors_full, img_size):
 
     return accu50_meter.avg, accu25_meter.avg, iou_meter.avg, info_nce_meter.avg
 
+class UncertaintyLoss(nn.Module):
+    """Learns per-task uncertainty to automatically balance losses.
+    Based on Kendall et al. 'What Uncertainties Do We Need?'
+    """
+    def __init__(self):
+        super().__init__()
+        # Log variances (initialized near 0, representing uncertainty)
+        self.log_var_retrieval = nn.Parameter(torch.zeros(1))
+        self.log_var_bbox = nn.Parameter(torch.zeros(1))
+    
+    def forward(self, retrieval_loss, bbox_loss):
+        # Precision-weighted losses: L = (1/2σ²) * loss + log(σ)
+        retrieval_weighted = retrieval_loss / (2 * torch.exp(self.log_var_retrieval))
+        bbox_weighted = bbox_loss / (2 * torch.exp(self.log_var_bbox))
+        
+        # Regularization term encourages uncertainty parameters to converge
+        reg = self.log_var_retrieval + self.log_var_bbox
+        
+        return retrieval_weighted + bbox_weighted + reg
+
 
 def main(save_path):
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(
         mixed_precision="fp16",
         gradient_accumulation_steps=GRAD_ACCUMULATION_STEPS,
@@ -491,6 +511,7 @@ def main(save_path):
     )
 
     not_update = 0
+    soft_label = 0.5
     exp_name = save_path.split("/")[-1] if save_path else "default_exp"
     writer = SummaryWriter(f"runs/{exp_name}")
 
@@ -516,6 +537,7 @@ def main(save_path):
     #     for k, v in torch.load(checkpoint_path, map_location="cpu").items()
     # }
     # model.load_state_dict(new_dict)
+    uncertainty_loss = UncertaintyLoss()
 
     img_to_text_dict = json.load(open(TEXT_FILE, "r"))
     train_bbox_dict = json.load(open(TRAIN_BBOX_FILE, "r"))
@@ -574,14 +596,28 @@ def main(save_path):
         pin_memory=True,
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    bbox_params = []
+    retrieval_params = []
+    for name, param in model.named_parameters():
+        if any(x in name for x in ['bbox_transformer', 'bbox_fcn_out', 'bbox_adapter']):
+            bbox_params.append(param)
+        else:
+            retrieval_params.append(param)
+    # Use higher LR for bbox, lower for retrieval
+    BBOX_LR = 5e-5   # 5x the base LR
+    RETRIEVAL_LR = 1e-5
+    optimizer = torch.optim.AdamW([
+        {'params': bbox_params, 'lr': BBOX_LR},
+        {'params': retrieval_params, 'lr': RETRIEVAL_LR},
+    ])
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=COSINE_EPOCHS, eta_min=LR_MIN
+        optimizer, T_0=COSINE_EPOCHS
     )
 
-    model, optimizer, scheduler, train_dataloader, test_dataloader = (
+    model, optimizer, scheduler, train_dataloader, test_dataloader, uncertainty_loss = (
         accelerator.prepare(
-            model, optimizer, scheduler, train_dataloader, test_dataloader
+            model, optimizer, scheduler, train_dataloader, test_dataloader, uncertainty_loss
         )
     )
 
@@ -640,22 +676,22 @@ def main(save_path):
                 # Logic: Neighbors get 0.5 (or 0.0), Exact match gets 0.95 (or 1.0)
                 same_image_cols = batch_offsets.unsqueeze(1) + col_offsets
                 positive_indices[row_indices_broad, same_image_cols] = (
-                    0.5  # or 0.1 for sharpness
+                    soft_label  # or 0.1 for sharpness
                 )
 
                 global_positive_indices = local_indices + batch_offsets
                 row_indices_flat = torch.arange(B, device=accelerator.device)
                 positive_indices[row_indices_flat, global_positive_indices] = 0.95
-                img_text_loss = 0.6 * info_nce_loss(
+                img_text_loss = 0.7 * info_nce_loss(
                     fused_feats, candidate_feats, positive_indices
                 )
-                img_text_loss += 0.4 * info_nce_loss(
+                img_text_loss += 0.3 * info_nce_loss(
                     anchor_feats, candidate_feats, positive_indices
                 )
 
-                bbox_weight, retrieval_weight = get_loss_weights(epoch, NUM_EPOCHS)
+                bbox_weight, retrieval_weight = get_loss_weights(epoch, COSINE_EPOCHS)
                 loss = retrieval_weight * img_text_loss + bbox_weight * bbox_loss
-
+                # loss = uncertainty_loss(img_text_loss, bbox_loss)
                 accelerator.backward(loss)
                 optimizer.step()
                 optimizer.zero_grad()
@@ -672,12 +708,12 @@ def main(save_path):
             writer.add_scalar(
                 "Loss/train_batch", loss.item(), epoch * len(train_dataloader) + i
             )
-            writer.add_scalar(
-                "Weights/bbox", bbox_weight, epoch * len(train_dataloader) + i
-            )
-            writer.add_scalar(
-                "Weights/retrieval", retrieval_weight, epoch * len(train_dataloader) + i
-            )
+            # writer.add_scalar(
+            #     "Weights/bbox", bbox_weight, epoch * len(train_dataloader) + i
+            # )
+            # writer.add_scalar(
+            #     "Weights/retrieval", retrieval_weight, epoch * len(train_dataloader) + i
+            # )
 
         avg_loss = total_loss / len(train_dataloader)
         avg_bbox_loss = total_bbox_loss / len(train_dataloader)
@@ -690,6 +726,8 @@ def main(save_path):
             anchors_full,
             UNIV_SAT_SIZE[0],
         )
+        # if val_info_nce < 13.5:
+        #     soft_label = max(0, (val_info_nce-12)/3)
         writer.add_scalar("Loss/train_epoch", avg_loss, epoch)
         writer.add_scalar("Metrics/val_iou", val_iou, epoch)
         writer.add_scalar("Metrics/val_accu50", accu50, epoch)
@@ -844,7 +882,7 @@ def eval(run=False):
         # Using compile for speedup
         # encoder = torch.compile(encoder)
 
-        model_path = f"../ckpt/unified_siglip_attn_move/best_info_58.pth"
+        model_path = f"../ckpt/unified_siglip_attn_move/best_info_57.pth"
         if os.path.exists(model_path):
             encoder.load_state_dict(torch.load(model_path, map_location="cpu"))
             print(f"Loaded checkpoint: {model_path}")

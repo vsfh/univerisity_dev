@@ -631,7 +631,7 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/data/feihong/ckpt/unified_siglip_attn_move/best_iou_53.pth",
+        default="/data/feihong/ckpt/unified_siglip_attn_move/best_info_57.pth",
         help="Path to model checkpoint",
     )
     parser.add_argument(
