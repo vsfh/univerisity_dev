@@ -166,7 +166,6 @@ def main():
     KML_TEMPLATE_PATH = "/data/feihong/kml_1024/0008.kml"
     OUTPUT_DIR = '/data/feihong/new_univ_kml'
     UNIV_DATA_PATH= '/data/feihong/univerisity_dev/asian_200_libraries_free.txt'
-    UNIV_DATA_PATH_amera= '/data/feihong/univerisity_dev/south_america_50_libraries_free.txt'
     # Read template KML
     tree, root = parse_kml(KML_TEMPLATE_PATH)
     # Extract original LookAt values to preserve
@@ -181,8 +180,7 @@ def main():
     # Read university data (skip header)
     with open(UNIV_DATA_PATH, "r", encoding="utf-8") as f:
         lines = f.readlines()[1:]  # Skip header
-    with open(UNIV_DATA_PATH_amera, "r", encoding="utf-8") as f:
-        lines += f.readlines()[1:]  # Skip header
+
     # Create output directory
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     # Process each row
@@ -198,12 +196,12 @@ def main():
         # Update coordinates
         update_lookat(
             root_copy, lon, lat, "0", 
-            original_heading, original_tilt, "1024"
+            original_heading, "0", "1024"
         )
         update_coordinates(root_copy, lon, lat, "0")
         update_name(root_copy, str(idx))
         # Save to output directory
-        output_path = os.path.join(OUTPUT_DIR, f"{idx}.kml")
+        output_path = os.path.join(OUTPUT_DIR, f"new_{idx}.kml")
         tree_copy.write(output_path, encoding="utf-8", xml_declaration=True)
         print(f"Created {output_path}: lat={lat}, lon={lon}")
     print(f"\nDone! Created {len(lines)} KML files in {OUTPUT_DIR}")

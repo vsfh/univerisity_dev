@@ -49,6 +49,8 @@ BBOX_FILE = "/data/feihong/univerisity_dev/runs/bbox_isaac.json"
 TRAIN_BBOX_FILE = "/data/feihong/univerisity_dev/runs/train.json"
 TEST_BBOX_FILE = "/data/feihong/univerisity_dev/runs/test.json"
 TEXT_FILE = "/data/feihong/drone_text_single_long.json"
+HEADING_FOLDER = "/data/feihong/range_250"
+
 
 SAT_ORIG_SIZE = (3840, 2160)
 UNIV_SAT_SIZE = (640, 640)
@@ -72,7 +74,7 @@ def get_loss_weights(epoch, num_epochs):
         retrieval_weight: increases from 0.01 to 0.99
     """
     progress = epoch / num_epochs
-    bbox_weight = 0.5 * (1 + np.cos(np.pi * progress)) / 2
+    bbox_weight = 0.9 * (1 + np.cos(np.pi * progress)) / 2
     retrieval_weight = 1.0 - bbox_weight
     return bbox_weight, retrieval_weight
 
@@ -179,14 +181,17 @@ class TargetSearchDataset(Dataset):
             for number in [
                 "01.",
                 "21.",
-                "31.",
                 "41.",
-                "51.",
             ]:
                 new_query_path = query_path.replace("01.", number)
                 if not os.path.exists(new_query_path):
                     continue
                 choice.append(new_query_path)
+
+            img_id = query_path.split("/")[-2]
+            heading0_path = f"{HEADING_FOLDER}/{img_id}_range250_heading0.png"
+            if os.path.exists(heading0_path):
+                choice.append(heading0_path)
 
             if choice:
                 query_path = random.sample(choice, 1)[0]
@@ -393,9 +398,6 @@ class Encoder(nn.Module):
         return query_inputs["pixel_values"][0], search_inputs["pixel_values"][0]
 
 
-
-
-
 def info_nce_loss(query_feats, candidate_feats, positive_indices, temperature=0.07):
     query_feats = F.normalize(query_feats, p=2, dim=1)
     candidate_feats = F.normalize(candidate_feats, p=2, dim=1)
@@ -428,23 +430,6 @@ def validation(loader, model, accelerator, anchors_full, img_size):
         pred_anchor = pred_anchor.view(
             B, 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
         )
-
-        new_gt_bbox, best_anchor_gi_gj = build_target(
-            ori_gt_bbox,
-            anchors_full,
-            UNIV_SAT_SIZE[0],
-            pred_anchor.shape[3],
-        )
-        accu_list, accu_center, iou, _, _, _ = eval_iou_acc(
-            pred_anchor,
-            ori_gt_bbox,
-            anchors_full,
-            best_anchor_gi_gj[:, 1],
-            best_anchor_gi_gj[:, 2],
-            img_size,
-            iou_threshold_list=[0.5, 0.25],
-        )
-
         candidate_feats = grid_feats.reshape(-1, PROJECTION_DIM)
 
         positive_indices = torch.zeros(
@@ -468,37 +453,55 @@ def validation(loader, model, accelerator, anchors_full, img_size):
         )
         positive_indices[row_indices_flat, global_positive_indices] = 0.95
 
-        img_text_loss = info_nce_loss(
-            fused_feats, candidate_feats, positive_indices
-        )
-        # img_text_loss += 0.7 * info_nce_loss(
-        #     anchor_feats, candidate_feats, positive_indices
-        # )
-        accu50_meter.update(accu_list[0].item(), query_imgs.shape[0])
-        accu25_meter.update(accu_list[1].item(), query_imgs.shape[0])
-        iou_meter.update(iou.item(), query_imgs.shape[0])
+        img_text_loss = info_nce_loss(fused_feats, candidate_feats, positive_indices)
+        for i in range(B):
+            new_gt_bbox, best_anchor_gi_gj = build_target(
+                ori_gt_bbox[i:i+1],
+                anchors_full,
+                UNIV_SAT_SIZE[0],
+                pred_anchor.shape[3],
+            )
+            accu_list, accu_center, iou, _, _, _ = eval_iou_acc(
+                pred_anchor[i:i+1],
+                ori_gt_bbox[i:i+1],
+                anchors_full,
+                best_anchor_gi_gj[:, 1],
+                best_anchor_gi_gj[:, 2],
+                img_size,
+                iou_threshold_list=[0.5, 0.25],
+            )
+
+
+            # img_text_loss += 0.7 * info_nce_loss(
+            #     anchor_feats, candidate_feats, positive_indices
+            # )
+            accu50_meter.update(accu_list[0].item(), 1)
+            accu25_meter.update(accu_list[1].item(), 1)
+            iou_meter.update(iou.item(), 1)
         info_nce_meter.update(img_text_loss.item(), query_imgs.shape[0])
 
     return accu50_meter.avg, accu25_meter.avg, iou_meter.avg, info_nce_meter.avg
+
 
 class UncertaintyLoss(nn.Module):
     """Learns per-task uncertainty to automatically balance losses.
     Based on Kendall et al. 'What Uncertainties Do We Need?'
     """
+
     def __init__(self):
         super().__init__()
         # Log variances (initialized near 0, representing uncertainty)
         self.log_var_retrieval = nn.Parameter(torch.zeros(1))
         self.log_var_bbox = nn.Parameter(torch.zeros(1))
-    
+
     def forward(self, retrieval_loss, bbox_loss):
         # Precision-weighted losses: L = (1/2σ²) * loss + log(σ)
         retrieval_weighted = retrieval_loss / (2 * torch.exp(self.log_var_retrieval))
         bbox_weighted = bbox_loss / (2 * torch.exp(self.log_var_bbox))
-        
+
         # Regularization term encourages uncertainty parameters to converge
         reg = self.log_var_retrieval + self.log_var_bbox
-        
+
         return retrieval_weighted + bbox_weighted + reg
 
 
@@ -599,17 +602,19 @@ def main(save_path):
     bbox_params = []
     retrieval_params = []
     for name, param in model.named_parameters():
-        if any(x in name for x in ['bbox_transformer', 'bbox_fcn_out', 'bbox_adapter']):
+        if any(x in name for x in ["bbox_transformer", "bbox_fcn_out", "bbox_adapter"]):
             bbox_params.append(param)
         else:
             retrieval_params.append(param)
     # Use higher LR for bbox, lower for retrieval
-    BBOX_LR = 5e-5   # 5x the base LR
+    BBOX_LR = 5e-5  # 5x the base LR
     RETRIEVAL_LR = 1e-5
-    optimizer = torch.optim.AdamW([
-        {'params': bbox_params, 'lr': BBOX_LR},
-        {'params': retrieval_params, 'lr': RETRIEVAL_LR},
-    ])
+    optimizer = torch.optim.AdamW(
+        [
+            # {'params': bbox_params, 'lr': BBOX_LR},
+            {"params": retrieval_params, "lr": RETRIEVAL_LR},
+        ]
+    )
     # optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=COSINE_EPOCHS
@@ -617,7 +622,12 @@ def main(save_path):
 
     model, optimizer, scheduler, train_dataloader, test_dataloader, uncertainty_loss = (
         accelerator.prepare(
-            model, optimizer, scheduler, train_dataloader, test_dataloader, uncertainty_loss
+            model,
+            optimizer,
+            scheduler,
+            train_dataloader,
+            test_dataloader,
+            uncertainty_loss,
         )
     )
 
@@ -690,8 +700,8 @@ def main(save_path):
                 )
 
                 bbox_weight, retrieval_weight = get_loss_weights(epoch, COSINE_EPOCHS)
-                loss = retrieval_weight * img_text_loss + bbox_weight * bbox_loss
-                # loss = uncertainty_loss(img_text_loss, bbox_loss)
+                loss = bbox_weight * img_text_loss + retrieval_weight * bbox_loss
+                # loss = img_text_loss
                 accelerator.backward(loss)
                 optimizer.step()
                 optimizer.zero_grad()
@@ -803,6 +813,8 @@ def eval(run=False):
         def __getitem__(self, idx):
             query_path = self.eval_list[idx]
             name = query_path.split("/")[-2]
+            if 'heading' in query_path:
+                name = query_path.split("/")[-1].split("_")[0]
             search_path = f"{IMAGE_FOLDER}/{name}.png"
 
             # 1. Load Text
@@ -823,6 +835,10 @@ def eval(run=False):
                 return None
 
             # 3. Preprocess
+            # Apply crop for heading0 images before resize
+            if "_range250_heading0" in query_path:
+                query_image = query_image.crop((420, 0, 1500, 1080))
+
             # Resize drone image
             query_image = resize_drone_image(query_image, DRONE_SIZE)
 
@@ -882,7 +898,7 @@ def eval(run=False):
         # Using compile for speedup
         # encoder = torch.compile(encoder)
 
-        model_path = f"../ckpt/unified_siglip_attn_move/best_info_57.pth"
+        model_path = f"../ckpt/retrieval_unified/best_info_58.pth"
         if os.path.exists(model_path):
             encoder.load_state_dict(torch.load(model_path, map_location="cpu"))
             print(f"Loaded checkpoint: {model_path}")
@@ -894,7 +910,10 @@ def eval(run=False):
         eval_list = []
         with open("/data/feihong/ckpt/test.txt", "r") as f:
             for line in f:
-                eval_list.append(line.strip())
+                img_path = line.strip().replace('01.', '41.')
+                # index = line.strip().split('/')[-2]
+                # img_path = f'/data/feihong/range_250/{index}_range250_heading0.png'
+                eval_list.append(img_path)
 
         # Create Dataset & Loader
         dataset = EvalDataset(
@@ -936,13 +955,9 @@ def eval(run=False):
                 input_ids = batch["input_ids"].to(DEVICE, non_blocking=True)
 
                 # Forward Pass - unpack 5 values including text_feats
-                _, _, anchor_feats, grid_feats, text_feats = encoder.forward(
+                _, _, anchor_feats, grid_feats, fused_query_feats = encoder.forward(
                     query_inputs, search_inputs, input_ids
                 )
-
-                # Feature Fusion (Vectorized)
-                # Ensure dimensions match: (B, D)
-                fused_query_feats = text_feats + anchor_feats
 
                 # Move to CPU and store
                 grid_feats_np = grid_feats.float().cpu().numpy()
@@ -951,6 +966,42 @@ def eval(run=False):
                 for i, name in enumerate(names):
                     res_search[name] = grid_feats_np[i]
                     res_fused_query[name] = fused_feats_np[i]
+
+        SATELLITE_FOLDER = "/data/feihong/asian_univ"
+        satellite_files = sorted(
+            [f for f in os.listdir(SATELLITE_FOLDER) if f.endswith(".png")]
+        )
+        print(
+            f"Processing {len(satellite_files)} satellite images from {SATELLITE_FOLDER}..."
+        )
+
+        satellite_batch = []
+        satellite_names = []
+        for sat_file in tqdm(satellite_files):
+            sat_name = sat_file.replace(".png", "")
+            sat_path = os.path.join(SATELLITE_FOLDER, sat_file)
+            try:
+                sat_image = Image.open(sat_path).convert("RGB")
+                sat_image = sat_image.crop((840, 0, 3000, 2160)).resize((640, 640))
+                sat_pixels = processor_sat(images=sat_image, return_tensors="pt")[
+                    "pixel_values"
+                ][0]
+                satellite_batch.append(sat_pixels)
+                satellite_names.append(sat_name)
+            except Exception as e:
+                print(f"Error processing {sat_file}: {e}")
+                continue
+
+        for i in range(0, len(satellite_batch), BATCH_SIZE):
+            batch_pixels = torch.stack(satellite_batch[i : i + BATCH_SIZE]).to(DEVICE)
+            batch_names = satellite_names[i : i + BATCH_SIZE]
+
+            with torch.inference_mode(), torch.amp.autocast("cuda"):
+                grid_feats = encoder.ref_forward(batch_pixels)
+
+            grid_feats_np = grid_feats.float().cpu().numpy()
+            for j, name in enumerate(batch_names):
+                res_search[name] = grid_feats_np[j]
 
         np.savez("eval_search_clip.npz", **res_search)
         np.savez("eval_fused_query_clip.npz", **res_fused_query)
@@ -961,7 +1012,8 @@ def eval(run=False):
 
         distances = json.load(open("/data/feihong/ckpt/distances.json", "r"))
         test_num = 100
-        test_list = [k for k in search_res.keys()]
+        test_list = [k for k in search_res.keys() if not 'new' in k]
+        # test_list = [k for k in search_res.keys()]
         res = {}
         top1 = 0
         top5 = 0
@@ -971,39 +1023,41 @@ def eval(run=False):
             print("No evaluation data found in npz files.")
             return
 
-        for key in tqdm(test_list):
-            fused_query_feature = fused_query_res[key]
+        with open("eval_success_single.txt", "w") as f:
+            for key in tqdm(test_list):
+                fused_query_feature = fused_query_res[key]
 
-            ex_img_list = random.sample(
-                test_list, min(test_num - 1, len(test_list) - 1)
-            )
-            if key in ex_img_list:
-                ex_img_list.remove(key)
-            ex_img_list.append(key)
+                ex_img_list = random.sample(
+                    test_list, min(test_num - 1, len(test_list) - 1)
+                )
+                if key in ex_img_list:
+                    ex_img_list.remove(key)
+                ex_img_list.append(key)
 
-            candidate_indices = [len(ex_img_list) - 1]
-            for i, name in enumerate(ex_img_list[:-1]):
-                if (
-                    f"{name}.kml" not in distances
-                    or f"{key}.kml" not in distances[f"{name}.kml"]
-                ):
-                    continue
-                if distances[f"{name}.kml"][f"{key}.kml"] < 380:
-                    candidate_indices.append(i)
+                candidate_indices = [len(ex_img_list) - 1]
+                for i, name in enumerate(ex_img_list[:-1]):
+                    if (
+                        f"{name}.kml" not in distances
+                        or f"{key}.kml" not in distances[f"{name}.kml"]
+                    ):
+                        continue
+                    if distances[f"{name}.kml"][f"{key}.kml"] < 380:
+                        candidate_indices.append(i)
 
-            res[key] = []
-            for img_name in ex_img_list:
-                cos_sim_grid = calcu_cos(fused_query_feature, search_res[img_name])
-                res[key].append(cos_sim_grid)
+                res[key] = []
+                for img_name in ex_img_list:
+                    cos_sim_grid = calcu_cos(fused_query_feature, search_res[img_name])
+                    res[key].append(cos_sim_grid)
 
-            img_res = np.array(res[key]).max(1).argsort()[-15:][::-1]
+                img_res = np.array(res[key]).max(1).argsort()[-15:][::-1]
 
-            if any(cand in candidate_indices for cand in img_res[:1]):
-                top1 += 1
-            if any(cand in candidate_indices for cand in img_res[:5]):
-                top5 += 1
-            if any(cand in candidate_indices for cand in img_res[:10]):
-                top10 += 1
+                if any(cand in candidate_indices for cand in img_res[:1]):
+                    top1 += 1
+                    f.write(f"{key}\n")
+                if any(cand in candidate_indices for cand in img_res[:5]):
+                    top5 += 1
+                if any(cand in candidate_indices for cand in img_res[:10]):
+                    top10 += 1
 
         print(f"Top 1: {top1} / {len(test_list)} ({top1 / len(test_list) * 100:.2f}%)")
         print(f"Top 5: {top5} / {len(test_list)} ({top5 / len(test_list) * 100:.2f}%)")
@@ -1015,7 +1069,7 @@ def eval(run=False):
 if __name__ == "__main__":
     exp_name = "unified_siglip_base"
     exp_name = "unified_siglip_attn"
-    exp_name = "unified_siglip_attn_move"
+    exp_name = "retrieval_unified"
     save_dir = f"../ckpt/{exp_name}"
 
     if os.path.exists(save_dir):
@@ -1026,7 +1080,7 @@ if __name__ == "__main__":
         print(f"Created experiment directory: {save_dir}")
 
     # Run training
-    # main(save_dir)
+    main(save_dir)
 
     # Run evaluation
     eval(True)  # Extract features

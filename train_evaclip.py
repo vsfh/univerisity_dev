@@ -25,9 +25,10 @@ MODEL_NAME = "hf-hub:timm/eva02_base_patch16_clip_224.merged2b_s8b_b131k"
 CACHE_DIR = "/data/feihong/hf_cache"
 DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
 IMAGE_FOLDER = "/data/feihong/image_1024"
+HEADING_FOLDER = "/data/feihong/range_250"
 
-NUM_EPOCHS = 40
-BATCH_SIZE = 20
+NUM_EPOCHS = 30
+BATCH_SIZE = 15
 LEARNING_RATE = 1e-5
 DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 PROJECTION_DIM = 768
@@ -62,22 +63,30 @@ class TargetSearchDataset(Dataset):
     def __getitem__(self, idx):
         query_path, search_path = self.image_paths[idx]
 
-        if self.mode == "train":
-            choice = []
-            for number in ["01", "21", "31", "41", "51"]:
-                new_query_path = query_path.replace("01", number)
-                if not os.path.exists(new_query_path):
-                    continue
-                choice.append(new_query_path)
+        img_id = query_path.split("/")[-2]
 
-            if choice:
-                query_path = random.sample(choice, 1)[0]
+        choice = []
+        for number in ["01", "21", "31", "41", "51"]:
+            new_query_path = query_path.replace("01", number)
+            if not os.path.exists(new_query_path):
+                continue
+            choice.append(new_query_path)
 
-        name = (
-            query_path.split("/")[-2]
-            + "_"
-            + query_path.split("/")[-1].split(".")[0][-2:]
-        )
+        heading0_path = f"{HEADING_FOLDER}/{img_id}_range250_heading0.png"
+        if os.path.exists(heading0_path):
+            choice.append(heading0_path)
+
+        if choice:
+            query_path = random.sample(choice, 1)[0]
+
+        if "_range250_heading0" in query_path:
+            name = query_path.split("/")[-1].split("_")[0]
+        else:
+            name = (
+                query_path.split("/")[-2]
+                + "_"
+                + query_path.split("/")[-1].split(".")[0][-2:]
+            )
         text_description = self.img_to_text_dict.get(name, "")
 
         for noun in self.remove:
@@ -89,6 +98,9 @@ class TargetSearchDataset(Dataset):
         except FileNotFoundError as e:
             print(f"Error loading image: {e}. Skipping this item.")
             return self.__getitem__((idx + 1) % len(self))
+
+        if "_range250_heading0" in query_path:
+            query_image = query_image.crop((420, 0, 1500, 1080))
 
         if self.mode == "train":
             width, height = search_image.size
@@ -412,6 +424,63 @@ def eval(run=False):
         b_norm = b / np.linalg.norm(b, axis=1, keepdims=True)
         return np.dot(b_norm, a_norm[..., None]).flatten()
 
+    class EvalDataset(Dataset):
+        def __init__(self, eval_list, preprocess, tokenizer, img_to_text_dict):
+            self.eval_list = eval_list
+            self.preprocess = preprocess
+            self.tokenizer = tokenizer
+            self.img_to_text_dict = img_to_text_dict
+            self.remove = [
+                "**",
+                "\n",
+                "noun",
+                "phrases",
+                "Phrase",
+                "Noun",
+                "Summary",
+                "Environment",
+                "32 tokens",
+            ]
+
+        def __len__(self):
+            return len(self.eval_list)
+
+        def __getitem__(self, idx):
+            query_path = self.eval_list[idx]
+            name = query_path.split("/")[-2]
+            if 'heading' in query_path:
+                name = query_path.split("/")[-1].split("_")[0]
+            search_path = f"{IMAGE_FOLDER}/{name}.png"
+
+            text_name = name + "_01"
+            text_description = self.img_to_text_dict.get(text_name, "")
+            for noun in self.remove:
+                text_description = text_description.replace(noun, "")
+
+            if not os.path.exists(search_path):
+                return None
+
+            try:
+                query_image = Image.open(query_path).convert("RGB")
+                search_image = Image.open(search_path).convert("RGB")
+            except Exception:
+                return None
+            if 'heading' in query_path:
+                query_image = query_image.crop((420, 0, 1500, 1080))
+            query_image = query_image.resize((224, 224))
+            search_image = search_image.crop((840, 0, 3000, 2160)).resize((640, 640))
+
+            query_pixels = self.preprocess(query_image)
+            search_pixels = self.preprocess(search_image)
+            text_tokens = self.tokenizer([text_description])[0]
+
+            return {
+                "name": name,
+                "query_pixels": query_pixels,
+                "search_pixels": search_pixels,
+                "input_ids": text_tokens,
+            }
+
     if run:
         img_to_text_dict = json.load(
             open("/data/feihong/drone_text_single_long.json", "r")
@@ -422,65 +491,96 @@ def eval(run=False):
         tokenizer = open_clip.get_tokenizer(MODEL_NAME)
 
         encoder = Encoder(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM).to(DEVICE)
-        model_path = f"../ckpt/train_evaclip_proj/best.pth"
+        model_path = f"../ckpt/retrieval_evaclip/best.pth"
         if os.path.exists(model_path):
             encoder.load_state_dict(torch.load(model_path, map_location="cpu"))
         encoder.eval()
-
-        res_search = {}
-        res_fused_query = {}
 
         print("Setting up dataset and dataloader for eval...")
         eval_list = []
         with open("/data/feihong/ckpt/test.txt", "r") as f:
             for line in f:
-                query_path = line.strip()
-                eval_list.append(query_path)
+                index = line.strip().split('/')[-2]
+                img_path = f'/data/feihong/range_250/{index}_range250_heading0.png'
+                eval_list.append(img_path)
 
-        for img_path in tqdm(eval_list):
-            name = img_path.split("/")[-2]
-            search_path = f"{IMAGE_FOLDER}/{name}.png"
-            if os.path.exists(search_path):
-                try:
-                    query_image = Image.open(img_path).convert("RGB")
-                    search_image = Image.open(search_path).convert("RGB")
-                    search_image = search_image.crop((840, 0, 3000, 2160)).resize(
-                        (640, 640)
-                    )
+        dataset = EvalDataset(eval_list, preprocess, tokenizer, img_to_text_dict)
 
-                    text_name = name + "_01"
-                    text_description = img_to_text_dict.get(text_name, "")
-                    for noun in [
-                        "**",
-                        "\n",
-                        "noun",
-                        "phrases",
-                        "Phrase",
-                        "Noun",
-                        "Summary",
-                        "Environment",
-                        "32 tokens",
-                    ]:
-                        text_description = text_description.replace(noun, "")
+        def collate_fn(batch):
+            batch = [b for b in batch if b is not None]
+            if len(batch) == 0:
+                return None
+            return torch.utils.data.dataloader.default_collate(batch)
 
-                    query_image_tensor = preprocess(query_image).unsqueeze(0).to(DEVICE)
-                    search_image_tensor = (
-                        preprocess(search_image).unsqueeze(0).to(DEVICE)
-                    )
-                    text_tokens = tokenizer([text_description]).to(DEVICE)
+        loader = DataLoader(
+            dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            num_workers=8,
+            pin_memory=True,
+            collate_fn=collate_fn,
+        )
 
-                    with torch.no_grad():
-                        anchor_feats = encoder.query_forward(query_image_tensor)
-                        grid_feats = encoder.ref_forward(search_image_tensor)
-                        text_feats = encoder.text_forward(
-                            text_tokens, torch.ones_like(text_tokens)
-                        )
-                        fused_query_feats = anchor_feats + text_feats
+        res_search = {}
+        res_fused_query = {}
 
-                    res_search[name] = grid_feats.cpu().numpy()
-                    res_fused_query[name] = fused_query_feats.cpu().numpy()
-                except Exception as e:
-                    print(f"Error processing {name}: {e}")
+        print(f"Starting batched inference on {len(dataset)} items...")
+        with torch.inference_mode(), torch.amp.autocast("cuda"):
+            for batch in tqdm(loader):
+                if batch is None:
+                    continue
+                names = batch["name"]
+                query_inputs = batch["query_pixels"].to(DEVICE, non_blocking=True)
+                search_inputs = batch["search_pixels"].to(DEVICE, non_blocking=True)
+                input_ids = batch["input_ids"].to(DEVICE, non_blocking=True)
+                attention_mask = torch.ones_like(input_ids)
+
+                with torch.no_grad():
+                    anchor_feats = encoder.query_forward(query_inputs)
+                    grid_feats = encoder.ref_forward(search_inputs)
+                    text_feats = encoder.text_forward(input_ids, attention_mask)
+                    fused_query_feats = anchor_feats + text_feats
+
+                grid_feats_np = grid_feats.float().cpu().numpy()
+                fused_feats_np = fused_query_feats.float().cpu().numpy()
+
+                for i, name in enumerate(names):
+                    res_search[name] = grid_feats_np[i]
+                    res_fused_query[name] = fused_feats_np[i]
+
+        SATELLITE_FOLDER = "/data/feihong/asian_univ"
+        satellite_files = sorted(
+            [f for f in os.listdir(SATELLITE_FOLDER) if f.endswith(".png")]
+        )
+        print(
+            f"Processing {len(satellite_files)} satellite images from {SATELLITE_FOLDER}..."
+        )
+
+        satellite_batch = []
+        satellite_names = []
+        for sat_file in tqdm(satellite_files):
+            sat_name = sat_file.replace(".png", "")
+            sat_path = os.path.join(SATELLITE_FOLDER, sat_file)
+            try:
+                sat_image = Image.open(sat_path).convert("RGB")
+                sat_image = sat_image.crop((840, 0, 3000, 2160)).resize((640, 640))
+                sat_pixels = preprocess(sat_image)
+                satellite_batch.append(sat_pixels)
+                satellite_names.append(sat_name)
+            except Exception as e:
+                print(f"Error processing {sat_file}: {e}")
+                continue
+
+        for i in range(0, len(satellite_batch), BATCH_SIZE):
+            batch_pixels = torch.stack(satellite_batch[i : i + BATCH_SIZE]).to(DEVICE)
+            batch_names = satellite_names[i : i + BATCH_SIZE]
+
+            with torch.inference_mode(), torch.amp.autocast("cuda"):
+                grid_feats = encoder.ref_forward(batch_pixels)
+
+            grid_feats_np = grid_feats.float().cpu().numpy()
+            for j, name in enumerate(batch_names):
+                res_search[name] = grid_feats_np[j]
 
         np.savez("eval_search_evaclip.npz", **res_search)
         np.savez("eval_fused_query_evaclip.npz", **res_fused_query)
@@ -491,7 +591,9 @@ def eval(run=False):
 
         distances = json.load(open("/data/feihong/ckpt/distances.json", "r"))
         test_num = 100
-        test_list = [k for k in search_res.keys()]
+        # test_list = [k for k in search_res.keys()]
+        test_list = [k for k in search_res.keys() if not 'new' in k]
+
         res = {}
         top1 = 0
         top5 = 0
@@ -673,7 +775,7 @@ def eval_denseuav(run=False):
 
 
 if __name__ == "__main__":
-    exp_name = "train_evaclip_proj"
+    exp_name = "retrieval_evaclip"
     save_dir = f"../ckpt/{exp_name}"
 
     if os.path.exists(save_dir):
@@ -687,8 +789,8 @@ if __name__ == "__main__":
     # main(save_dir)
 
     # Run evaluation
-    # eval(True)  # Extract features
-    # eval(False)  # Calculate metrics
+    eval(True)  # Extract features
+    eval(False)  # Calculate metrics
 
-    eval_denseuav(True)  # Extract features
-    eval_denseuav(False)  # Extract features
+    # eval_denseuav(True)  # Extract features
+    # eval_denseuav(False)  # Extract features

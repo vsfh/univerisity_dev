@@ -60,13 +60,13 @@ SAT_ORIG_SIZE = (3840, 2160)
 UNIV_SAT_SIZE = (640, 640)
 DRONE_SIZE = (256, 256)
 
-NUM_EPOCHS = 360
+NUM_EPOCHS = 200
 BATCH_SIZE = 20
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 1e-5
 BBOX_LOSS_WEIGHT = 0.1
 DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
 PROJECTION_DIM = 768
-
+HEADING_FOLDER = "/data/feihong/range_250"
 
 def format_satellite_img_bbox(
     image,
@@ -171,12 +171,17 @@ class TargetSearchDataset(Dataset):
             for number in [
                 "01.",
                 "21.",
-                "31.",
+                "41.",
             ]:
                 new_query_path = query_path.replace("01.", number)
                 if not os.path.exists(new_query_path):
                     continue
                 choice.append(new_query_path)
+
+            img_id = query_path.split("/")[-2]
+            heading0_path = f"{HEADING_FOLDER}/{img_id}_range250_heading0.png"
+            if os.path.exists(heading0_path):
+                choice.append(heading0_path)
 
             if choice:
                 query_path = random.sample(choice, 1)[0]
@@ -651,7 +656,8 @@ def main(save_path):
                 anchor_feats, candidate_feats, positive_indices
             ) + 0.3 * info_nce_loss(text_feats, candidate_feats, positive_indices)
 
-            loss = bbox_loss + img_text_loss * 0.05
+            # loss = bbox_loss + img_text_loss * 0.05
+            loss = img_text_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -857,7 +863,7 @@ def eval(run=False):
 
 if __name__ == "__main__":
     exp_name = "unified_siglip_base"
-    exp_name = "unified_siglip"
+    exp_name = "retrieval_wildmatch"
     save_dir = f"../ckpt/{exp_name}"
 
     if os.path.exists(save_dir):
@@ -868,7 +874,7 @@ if __name__ == "__main__":
         print(f"Created experiment directory: {save_dir}")
 
     # Run training
-    # main(save_dir)
+    main(save_dir)
 
     # Run evaluation
     # eval(True)  # Extract features

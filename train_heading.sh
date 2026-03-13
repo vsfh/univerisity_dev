@@ -1,5 +1,5 @@
 #!/bin/bash
-# Train unified_siglip_test.py with accelerate on 3 GPUs
+# Train unified_siglip_heading.py with accelerate on 3 GPUs
 
 cd /data/feihong/univerisity_dev
 
@@ -9,5 +9,5 @@ accelerate launch \
     --multi_gpu \
     --num_processes 2 \
     --mixed_precision fp16 \
-    --gradient_accumulation_steps 4 \
-    unified_siglip_supp.py
+    --gradient_accumulation_steps 3 \
+    unified_siglip_heading.py
