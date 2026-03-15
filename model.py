@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoImageProcessor, AutoTokenizer
 
 from bbox.yolo_utils import SpatialTransformer
-
+from transformers.models.siglip.modeling_siglip import SiglipVisionConfig, SiglipMLP
 MODEL_NAME = "google/siglip-base-patch16-224"
 CACHE_DIR = "/data/feihong/hf_cache"
 PROJECTION_DIM = 768
@@ -54,6 +54,29 @@ class ResidualBlock(nn.Module):
     def forward(self, x):
         return x + self.conv(x)
 
+class SiglipMultiheadAttentionPoolingHead(nn.Module):
+    """Multihead Attention Pooling."""
+
+    def __init__(self, config: SiglipVisionConfig):
+        super().__init__()
+
+        self.probe = nn.Parameter(torch.randn(1, 9, config.hidden_size))
+        self.attention = torch.nn.MultiheadAttention(config.hidden_size, config.num_attention_heads, batch_first=True)
+        self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.mlp = SiglipMLP(config)
+
+    def forward(self, hidden_state):
+        batch_size = hidden_state.shape[0]
+        probe = self.probe.repeat(batch_size, 1, 1)
+
+        hidden_state = self.attention(probe, hidden_state, hidden_state)[0]
+
+        residual = hidden_state
+        hidden_state = self.layernorm(hidden_state)
+        hidden_state = residual + self.mlp(hidden_state)
+
+        return hidden_state
+    
 
 class Encoder_gem(nn.Module):
     """Enhanced encoder with GeM pooling, gated fusion, and residual connections.
@@ -378,7 +401,6 @@ class Encoder_heading(nn.Module):
             raise
 
         self.pool_info_sat = nn.AdaptiveAvgPool2d((3, 3))
-
         self.gate_fc = nn.Linear(proj_dim * 2, 1)
         # self.fuse_fc = nn.Linear(proj_dim, proj_dim)
 
@@ -512,6 +534,69 @@ class Encoder_heading(nn.Module):
 
         return sat_feature_2d_pool
         
+
+class ScoreHead(nn.Module):
+    def __init__(self, embed_dim=768, num_heads=8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        # 1. Projections (Only Query and Key needed for scoring)
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        
+        # 2. Score Fusion Network
+        # Fuses the 8 different head scores into 1 final similarity score
+        self.score_fusion = nn.Sequential(
+            nn.Linear(num_heads, num_heads // 2),
+            nn.GELU(),
+            nn.Linear(num_heads // 2, 1)
+        )
+
+    def forward(self, query: torch.Tensor, search: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            query: Tensor of shape (B, 768)
+            search: Tensor of shape (B * n, 768)
+        Returns:
+            scores: Tensor of shape (B, B * n)
+        """
+        B = query.size(0)
+        N_total = search.size(0) # This is B * n
+        
+        # --- STEP 1: Linear Projection & Head Splitting ---
+        # (B, 768) -> (B, num_heads, head_dim)
+        q = self.q_proj(query).view(B, self.num_heads, self.head_dim)
+        
+        # (B*n, 768) -> (B*n, num_heads, head_dim)
+        k = self.k_proj(search).view(N_total, self.num_heads, self.head_dim)
+        
+        # --- STEP 2: Prepare for Global Matrix Multiplication ---
+        # We want num_heads as the batch dimension for torch.bmm
+        # q becomes: (num_heads, B, head_dim)
+        q = q.transpose(0, 1) 
+        
+        # k becomes: (num_heads, head_dim, B*n)
+        k = k.permute(1, 2, 0) 
+        
+        
+        
+        # --- STEP 3: Compute All-to-All Attention Logits ---
+        # (num_heads, B, head_dim) @ (num_heads, head_dim, B*n) -> (num_heads, B, B*n)
+        attn_logits = torch.bmm(q, k) * self.scale
+        
+        # --- STEP 4: Fuse Multi-Head Scores ---
+        # Rearrange to put num_heads last: (B, B*n, num_heads)
+        attn_logits = attn_logits.permute(1, 2, 0)
+        
+        # Pass through MLP to get 1 score per query-document pair -> (B, B*n, 1)
+        scores = self.score_fusion(attn_logits)
+        
+        # --- STEP 5: Final Output Shape ---
+        # Remove the last dimension: (B, B*n, 1) -> (B, B*n)
+        return scores.squeeze(-1)
+    
 class Encoder_abla(nn.Module):
     """Enhanced encoder with GeM pooling, gated fusion, and residual connections.
 
@@ -539,7 +624,10 @@ class Encoder_abla(nn.Module):
         self.usesg = usesg
         self.useap = useap
 
-        self.pool_info_sat = nn.AdaptiveAvgPool2d((3, 3))
+        if self.useap:
+            self.pool_info_sat = nn.AdaptiveAvgPool2d((3, 3))
+        else:
+            self.attnPooling = SiglipMultiheadAttentionPoolingHead(SiglipVisionConfig(hidden_size=self.feature_dim, num_attention_heads=12, layer_norm_eps=1e-6))
 
         self.gate_fc = nn.Linear(proj_dim * 2, 1)
         # self.fuse_fc = nn.Linear(proj_dim, proj_dim)
@@ -590,6 +678,7 @@ class Encoder_abla(nn.Module):
             nn.Flatten(),
             nn.Linear(self.feature_dim // 2, 2),
         )
+        self.scorer = ScoreHead(embed_dim=self.feature_dim, num_heads=12)
 
     def text_forward(self, input_ids, attention_mask=None):
         text_outputs = self.text_model(
@@ -608,17 +697,16 @@ class Encoder_abla(nn.Module):
     def forward(self, anchor_pixel_values, search_pixel_values, input_ids=None):
         B = anchor_pixel_values.shape[0]
 
-        anchor_output = self.vision_model(anchor_pixel_values)
-        anchor_feats = anchor_output.last_hidden_state
-        anchor_pooler = anchor_output.pooler_output
+        with torch.no_grad():
+            anchor_output = self.vision_model(anchor_pixel_values)
+            anchor_feats = anchor_output.last_hidden_state
+            anchor_pooler = anchor_output.pooler_output
 
-        # ground_drone_output = self.ground_drone_vision_model(anchor_pixel_values)
-        # anchor_feats = ground_drone_output.last_hidden_state
-
-        sat_output = self.vision_model(
-            search_pixel_values, interpolate_pos_encoding=True
-        )
-        sat_feats = sat_output.last_hidden_state
+            sat_output = self.vision_model(
+                search_pixel_values, interpolate_pos_encoding=True
+            )
+            sat_feats = sat_output.last_hidden_state
+            
         N = sat_feats.shape[1]
         H = W = int(N**0.5)
         sat_features_2d = sat_feats.permute(0, 2, 1).reshape(B, self.feature_dim, H, W)
@@ -644,7 +732,7 @@ class Encoder_abla(nn.Module):
                 .permute(0, 2, 1)
             )
         else:
-            sat_feature_2d_pool = sat_output.pooler_output
+            sat_feature_2d_pool = self.attnPooling(sat_feats)
 
         text_feats = None
         if input_ids is not None:
