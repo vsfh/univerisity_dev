@@ -1,14 +1,18 @@
 import matplotlib.pyplot as plt
-import geopandas as gpd
 import os
-import xml.etree.ElementTree as ET
 import requests
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
 import numpy as np
-
+import time
+import math
+import tempfile
+import shutil
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
+from typing import List, Dict, Tuple
 
 def get_world_map_two():
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
     input_folder = "/data/feihong/kml_1024"
     kml_files = [
         os.path.join(input_folder, f)
@@ -325,9 +329,6 @@ ASIAN_TOP_200 = [
 
 def get_lib_coord():
     import time
-    from geopy.geocoders import Nominatim
-    from geopy.exc import GeocoderTimedOut
-
     geolocator = Nominatim(user_agent="asian_university_locator")
 
     output_file = "runs/school_name.txt"
@@ -459,6 +460,8 @@ def get_lib_coord():
 
 
 def process_kml_file(input_path):
+    import xml.etree.ElementTree as ET
+
     """处理单个KML文件"""
     # 获取文件名（不带扩展名）
     filename = os.path.splitext(os.path.basename(input_path))[0]
@@ -489,6 +492,8 @@ def process_kml_file(input_path):
 
 
 def get_world_map():
+    import geopandas as gpd
+
     input_folder = "/data/feihong/kml_1024"
     kml_files = [
         os.path.join(input_folder, f)
@@ -643,7 +648,269 @@ def match_libraries():
 
     print(f"\nDone! Results saved to {output_file}")
 
+from geopy.distance import distance as geo_distance
 
+def collect_spread_university_targets(
+    input_file: str = "/data/feihong/ckpt/matched_university_libraries.txt",
+    output_file: str = "runs/university_targets.txt",
+    per_university: int = 6,
+    search_radius_m: int = 2000,
+    min_name_len: int = 3,
+    min_sep_m: int = 300,
+    sleep_between: int = 30,
+) -> None:
+    """
+    Build a POI list where each university contributes up to `per_university`
+    well-spaced buildings (>= `min_sep_m`). Results saved as CSV:
+        Location,University,Latitude,Longitude
+    """
+    geolocator = Nominatim(user_agent="spread_university_locator", timeout=15)
+    overpass_endpoints = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass.openrailwaymap.de/api/interpreter",
+    ]
+
+    def load_universities() -> List[str]:
+        seen, universities = set(), []
+        with open(input_file, "r", encoding="utf-8") as f:
+            for idx, line in enumerate(f):
+                if idx == 0:
+                    continue
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 2:
+                    continue
+                name = parts[1]
+                if name and name not in seen:
+                    universities.append(name)
+                    seen.add(name)
+        return universities
+
+    def geocode(name: str) -> Tuple[float, float]:
+        for attempt in range(3):
+            try:
+                loc = geolocator.geocode(name)
+                if loc:
+                    return loc.latitude, loc.longitude
+            except (GeocoderTimedOut, GeocoderUnavailable):
+                time.sleep(2 + attempt)
+        raise RuntimeError(f"Geocoding failed: {name}")
+
+    def query_overpass(lat: float, lon: float, keyword: str, endpoint_idx: int) -> List[Dict]:
+        query = f"""
+        [out:json][timeout:50];
+        (
+            nwr["building"](around:{search_radius_m},{lat},{lon});
+            nwr["amenity"](around:{search_radius_m},{lat},{lon});
+        );
+        out center tags;
+        """
+        url = overpass_endpoints[endpoint_idx % len(overpass_endpoints)]
+        response = requests.post(url, data={"data": query})
+        response.raise_for_status()
+        items, keyword_lower = [], keyword.lower()
+        for el in response.json().get("elements", []):
+            tags = el.get("tags", {})
+            name = tags.get("name") or tags.get("name:en")
+            if not name or len(name.strip()) < min_name_len:
+                continue
+            center = el.get("center") or el
+            el_lat, el_lon = center.get("lat"), center.get("lon")
+            if el_lat is None or el_lon is None:
+                continue
+            dist = math.hypot(el_lat - lat, el_lon - lon)
+            bias = -1.0 if keyword_lower in name.lower() else 0.0
+            items.append((dist + bias, {"name": name.strip(), "lat": el_lat, "lon": el_lon}))
+        items.sort(key=lambda x: x[0])
+        return [item for _, item in items]
+
+    def pick_spread_points(candidates: List[Dict]) -> List[Dict]:
+        picked = []
+        for candidate in candidates:
+            point = (candidate["lat"], candidate["lon"])
+            if all(geo_distance(point, (p["lat"], p["lon"])).meters >= min_sep_m for p in picked):
+                picked.append(candidate)
+                if len(picked) == per_university:
+                    break
+        return picked
+
+    universities = load_universities()
+    rows = []
+    endpoint_idx = 0
+
+    print(f"Processing {len(universities)} universities...")
+    for idx, university in enumerate(universities, start=1):
+        print(f"[{idx}/{len(universities)}] {university}")
+        try:
+            campus_lat, campus_lon = geocode(university)
+        except RuntimeError as err:
+            print(f"  ! {err}")
+            continue
+
+        try:
+            candidates = query_overpass(campus_lat, campus_lon, university.split()[0], endpoint_idx)
+        except Exception as err:
+            print(f"  ! Overpass error ({err}); rotating endpoint and retrying later.")
+            endpoint_idx += 1
+            time.sleep(sleep_between)
+            candidates = [{
+                "name": f"{university} Center",
+                "lat": campus_lat,
+                "lon": campus_lon,
+            }]
+
+        spread = pick_spread_points(candidates)
+        if not spread:
+            print(f"  - No sufficiently spaced POIs within {search_radius_m} m.")
+            continue
+
+        for item in spread:
+            rows.append(f"{item['name']},{university},{item['lat']},{item['lon']}")
+
+        endpoint_idx += 1
+        time.sleep(sleep_between)
+
+    with open(output_file, "w", encoding="utf-8") as out_f:
+        out_f.write("Location,University,Latitude,Longitude\n")
+        out_f.write("\n".join(rows))
+    print(f"\nDone! Stored {len(rows)} entries in {output_file}")
+
+
+def rewrite_targets_without_centers(
+    input_file: str = "runs/university_targets.txt",
+    output_file: str = "runs/university_targets_refined.txt",
+    per_university: int = 6,
+    search_radius_m: int = 2000,
+    min_name_len: int = 3,
+    min_sep_m: int = 300,
+    sleep_between: int = 0,
+) -> None:
+    """Rewrite the targets file, refreshing rows whose location names still contain 'Center'."""
+
+    def parse_target_line(raw_line: str) -> Tuple[str, str, str, str]:
+        parts = [p.strip() for p in raw_line.split(",")]
+        if len(parts) < 4:
+            raise ValueError(f"Malformed line: {raw_line}")
+        lon = parts[-1]
+        lat = parts[-2]
+        university = parts[-3]
+        location = ",".join(parts[:-3]).strip()
+        return location, university, lat, lon
+
+    def load_target_file(path: str) -> Dict[str, List[str]]:
+        replacements: Dict[str, List[str]] = {}
+        with open(path, "r", encoding="utf-8") as src:
+            for idx, line in enumerate(src):
+                if idx == 0:
+                    continue
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    _, university, _, _ = parse_target_line(stripped)
+                except ValueError as err:
+                    print(f"[WARN] {err}")
+                    continue
+                replacements.setdefault(university, []).append(stripped)
+        return replacements
+
+    header_line = "Location,University,Latitude,Longitude"
+    records: List[Dict[str, str]] = []
+    fallback_lines: Dict[str, List[str]] = {}
+    centers_to_fix: List[str] = []
+
+    with open(input_file, "r", encoding="utf-8") as src:
+        for idx, raw_line in enumerate(src):
+            stripped = raw_line.strip()
+            if idx == 0:
+                if stripped:
+                    header_line = stripped
+                continue
+            if not stripped:
+                continue
+
+            try:
+                location, university, _, _ = parse_target_line(stripped)
+            except ValueError as err:
+                print(f"[WARN] {err}")
+                continue
+
+            if "center" in location.lower():
+                records.append({"type": "center", "university": university})
+                fallback_lines.setdefault(university, []).append(stripped)
+                if university not in centers_to_fix:
+                    centers_to_fix.append(university)
+            else:
+                records.append({"type": "line", "line": stripped})
+
+    if not centers_to_fix:
+        shutil.copyfile(input_file, output_file)
+        print("No 'Center' rows detected; copied file unchanged.")
+        return
+
+    tmp_input = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt")
+    tmp_output = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt")
+    tmp_input_path, tmp_output_path = tmp_input.name, tmp_output.name
+    tmp_input.close()
+    tmp_output.close()
+    replacements: Dict[str, List[str]] = {}
+
+    try:
+        with open(tmp_input_path, "w", encoding="utf-8") as temp_in:
+            temp_in.write("Building,University\n")
+            for university in centers_to_fix:
+                temp_in.write(f"{university} Refresh,{university}\n")
+
+        collect_spread_university_targets(
+            input_file=tmp_input_path,
+            output_file=tmp_output_path,
+            per_university=per_university,
+            search_radius_m=search_radius_m,
+            min_name_len=min_name_len,
+            min_sep_m=min_sep_m,
+            sleep_between=sleep_between,
+        )
+
+        replacements = load_target_file(tmp_output_path)
+    finally:
+        try:
+            os.remove(tmp_input_path)
+        except OSError:
+            pass
+        try:
+            os.remove(tmp_output_path)
+        except OSError:
+            pass
+
+    output_rows: List[str] = []
+    replacement_consumed: Dict[str, bool] = {}
+    for record in records:
+        if record["type"] == "line":
+            output_rows.append(record["line"])
+            continue
+
+        university = record["university"]
+        if university in replacements and not replacement_consumed.get(university):
+            output_rows.extend(replacements[university])
+            replacement_consumed[university] = True
+        else:
+            fallback = fallback_lines.get(university)
+            if fallback:
+                output_rows.append(fallback.pop(0))
+
+    with open(output_file, "w", encoding="utf-8") as dst:
+        dst.write(header_line + "\n")
+        if output_rows:
+            dst.write("\n".join(output_rows))
+
+    refreshed = sum(len(lines) for lines in replacements.values()) if centers_to_fix else 0
+    print(f"Rewrote {len(output_rows)} rows to {output_file} (refreshed {refreshed} entries).")
 # get_lib_coord()
 # get_world_map_two()
-match_libraries()
+# match_libraries()
+# collect_spread_university_targets()
+rewrite_targets_without_centers(
+    input_file="runs/university_targets_clean_twice.txt",
+    output_file="runs/university_targets_clean_third.txt",
+    sleep_between=10  # optional: reduce delay for small batches
+)

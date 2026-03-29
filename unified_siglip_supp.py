@@ -43,7 +43,7 @@ class Config:
     DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
     IMAGE_FOLDER = "/data/feihong/image_1024"
     HEADING_FOLDER = "/data/feihong/range_250"
-    TEXT_FILE = "/data/feihong/drone_text_single_long.json"
+    TEXT_FILE = "/data/feihong/ckpt/drone_text_single_long.json"
     TRAIN_BBOX_FILE = "/data/feihong/univerisity_dev/runs/train.json"
     TEST_BBOX_FILE = "/data/feihong/univerisity_dev/runs/test.json"
     SATELLITE_FOLDER = "/data/feihong/asian_univ"
@@ -52,12 +52,12 @@ class Config:
     UNIV_SAT_SIZE = (640, 640)
     DRONE_SIZE = (256, 256)
 
-    NUM_EPOCHS = 30
-    BATCH_SIZE = 20
+    NUM_EPOCHS = 60
+    BATCH_SIZE = 10
     GRAD_ACCUMULATION_STEPS = 2
     LEARNING_RATE = 5e-5
     LR_MIN = 1e-10
-    COSINE_EPOCHS = 30
+    COSINE_EPOCHS = 60
     BBOX_LOSS_WEIGHT = 0.1
     HEADING_LOSS_WEIGHT = 0.01
     PROJECTION_DIM = 768
@@ -371,38 +371,30 @@ def validate(
             iou_threshold_list=[0.5, 0.25],
         )
 
+        candidate_feats = grid_feats.reshape(-1, Config.PROJECTION_DIM)
+        positive_indices = torch.zeros(B, B * 9, device=accelerator.device)
+        
+        batch_offsets = torch.arange(B, device=accelerator.device) * 9
+        row_indices_broad = torch.arange(B, device=accelerator.device).unsqueeze(1)
+        col_offsets = torch.arange(9, device=accelerator.device).unsqueeze(0)
+
+        same_image_cols = batch_offsets.unsqueeze(1) + col_offsets
+        positive_indices[row_indices_broad, same_image_cols] = 0.5
+
+        global_positive_indices = local_indices + batch_offsets
+        row_indices_flat = torch.arange(B, device=accelerator.device)
+        positive_indices[row_indices_flat, global_positive_indices] = 0.95
+
         if useap:
-            candidate_feats = grid_feats.reshape(-1, Config.PROJECTION_DIM)
-            positive_indices = torch.zeros(
-                local_indices.shape[0],
-                local_indices.shape[0] * 9,
-                device=accelerator.device,
-            )
-            batch_offsets = (
-                torch.arange(local_indices.shape[0], device=accelerator.device) * 9
-            )
-            row_indices_broad = torch.arange(
-                local_indices.shape[0], device=accelerator.device
-            ).unsqueeze(1)
-            col_offsets = torch.arange(9, device=accelerator.device).unsqueeze(0)
-            same_image_cols = batch_offsets.unsqueeze(1) + col_offsets
-            positive_indices[row_indices_broad, same_image_cols] = 0.5
-
-            global_positive_indices = local_indices + batch_offsets
-            row_indices_flat = torch.arange(
-                local_indices.shape[0], device=accelerator.device
-            )
-            positive_indices[row_indices_flat, global_positive_indices] = 0.95
-
-            img_text_loss = info_nce_loss(
+            img_text_loss = 0.7 * info_nce_loss(
                 fused_feats, candidate_feats, positive_indices
             )
+            img_text_loss += 0.3 * info_nce_loss(
+                anchor_feats, candidate_feats, positive_indices
+            )
         else:
-            query_feats = F.normalize(fused_feats, p=2, dim=1)
-            candidate_feats = F.normalize(grid_feats, p=2, dim=1)
-            sim_matrix = torch.matmul(query_feats, candidate_feats.T)
-            positive_indices = torch.arange(B, device=query_feats.device)
-            img_text_loss = F.cross_entropy(sim_matrix, positive_indices)
+            scores = model.scorer(fused_feats, candidate_feats)
+            img_text_loss = F.cross_entropy(scores, positive_indices)
 
         heading_loss = F.mse_loss(pred_heading, heading_target)
 
@@ -487,9 +479,9 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     )
     tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
 
-    model = Encoder_heading(
-        model_name=Config.MODEL_NAME, proj_dim=Config.PROJECTION_DIM
-    )
+    # model = Encoder_heading(
+    #     model_name=Config.MODEL_NAME, proj_dim=Config.PROJECTION_DIM
+    # )
     model = Encoder_abla(
         model_name=Config.MODEL_NAME,
         proj_dim=Config.PROJECTION_DIM,
@@ -635,7 +627,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 loss = (
                     retrieval_weight * img_text_loss
                     + bbox_weight * bbox_loss
-                    + heading_loss * Config.HEADING_LOSS_WEIGHT
+                    # + heading_loss * Config.HEADING_LOSS_WEIGHT
                 )
 
                 accelerator.backward(loss)
@@ -664,20 +656,37 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     "train", "img_text_loss", img_text_loss.item(), global_step
                 )
 
-        avg_loss = total_loss / len(train_dataloader)
-        avg_bbox_loss = total_bbox_loss / len(train_dataloader)
-        avg_heading_loss = total_heading_loss / len(train_dataloader)
-
-        if clearml_logger is not None:
-            clearml_logger.report_scalar("validation", "avg_loss", avg_loss, epoch)
-            clearml_logger.report_scalar(
-                "validation", "avg_bbox_loss", avg_bbox_loss, epoch
-            )
-            clearml_logger.report_scalar(
-                "validation", "avg_heading_loss", avg_heading_loss, epoch
-            )
-
         scheduler.step()
+
+        if (epoch + 1) % 10 == 0 and accelerator.is_main_process:
+            accelerator.print(f"Running validation at epoch {epoch + 1}...")
+            accu50, accu25, iou, info_nce, heading = validate(
+                test_dataloader,
+                model,
+                accelerator,
+                anchors_full,
+                Config.UNIV_SAT_SIZE[0],
+                useap=use_ap,
+            )
+            accelerator.print(
+                f"Val Epoch {epoch + 1}: Accu@50={accu50:.4f}, Accu@25={accu25:.4f}, IoU={iou:.4f}, "
+                f"InfoNCE={info_nce:.4f}, Heading={heading:.4f}"
+            )
+            
+            if clearml_logger is not None:
+                clearml_logger.report_scalar("validation", "accu50", accu50, epoch)
+                clearml_logger.report_scalar("validation", "accu25", accu25, epoch)
+                clearml_logger.report_scalar("validation", "iou", iou, epoch)
+                clearml_logger.report_scalar("validation", "info_nce", info_nce, epoch)
+                clearml_logger.report_scalar("validation", "heading", heading, epoch)
+
+            if iou > max_iou:
+                max_iou = iou
+                os.makedirs(save_path, exist_ok=True)
+                unwrapped_model = accelerator.unwrap_model(model)
+                save_filename = f"{save_path}/best_iou.pth"
+                accelerator.save(unwrapped_model.state_dict(), save_filename)
+                accelerator.print(f"Saved best IoU checkpoint: {save_filename}")
 
         if clearml_logger is not None:
             current_lr = optimizer.param_groups[0]["lr"]
@@ -711,6 +720,35 @@ def compute_cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     a_norm = a / np.linalg.norm(a)
     b_norm = b / np.linalg.norm(b, axis=1, keepdims=True)
     return np.dot(b_norm, a_norm[..., None]).flatten()
+
+
+def compute_scorer_similarity(
+    query_feat: np.ndarray,
+    candidate_feats: np.ndarray,
+    scorer: nn.Module,
+    device: str = "cuda",
+) -> np.ndarray:
+    """
+    Compute similarity scores using the scorer model.
+    
+    Args:
+        query_feat: Query feature array of shape (768,)
+        candidate_feats: Candidate feature array of shape (N, 768) or (9, 768)
+        scorer: ScoreHead model
+        device: Device to run computation on
+    
+    Returns:
+        scores: Array of shape (N,) with similarity scores
+    """
+    scorer.eval()
+    
+    query_tensor = torch.from_numpy(query_feat).float().unsqueeze(0).to(device)
+    candidate_tensor = torch.from_numpy(candidate_feats).float().to(device)
+    
+    with torch.no_grad():
+        scores = scorer(query_tensor, candidate_tensor)
+    
+    return scores.cpu().numpy().flatten()
 
 
 def extract_features(
@@ -797,7 +835,11 @@ def extract_features(
 
 
 def evaluate_retrieval(
-    search_res: np.ndarray, fused_query_res: np.ndarray, test_num: int = 100
+    search_res: np.ndarray, 
+    fused_query_res: np.ndarray, 
+    test_num: int = 100,
+    scorer: nn.Module = None,
+    device: str = "cuda",
 ) -> Tuple[int, int, int]:
     distances = json.load(open("/data/feihong/ckpt/distances.json", "r"))
 
@@ -832,8 +874,15 @@ def evaluate_retrieval(
                 grid_fea = search_res[img_name][None]
             else:
                 grid_fea = search_res[img_name]
-            cos_sim_grid = compute_cosine_similarity(fused_query_feature, grid_fea)
-            res.append(cos_sim_grid)
+            
+            if scorer is not None:
+                sim_scores = compute_scorer_similarity(
+                    fused_query_feature, grid_fea, scorer, device
+                )
+            else:
+                sim_scores = compute_cosine_similarity(fused_query_feature, grid_fea)
+            
+            res.append(sim_scores)
 
         img_res = np.array(res).max(1).argsort()[-15:][::-1]
 
@@ -882,10 +931,15 @@ def run_evaluation(end_num: float, run: bool = True, use_extra: bool = False) ->
         tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
         test_bbox_dict = json.load(open(Config.TEST_BBOX_FILE, "r"))
 
-        model = Encoder_heading(
-            model_name=Config.MODEL_NAME, proj_dim=Config.PROJECTION_DIM
+        # model = Encoder_heading(
+        #     model_name=Config.MODEL_NAME, proj_dim=Config.PROJECTION_DIM
+        # ).to(DEVICE)
+        model = Encoder_abla(
+            model_name=Config.MODEL_NAME,
+            proj_dim=Config.PROJECTION_DIM,
+            usesg=True,
+            useap=True,
         ).to(DEVICE)
-
         model_path = f"/data/feihong/ckpt/supp_{end_num}/last.pth"
         if os.path.exists(model_path):
             model.load_state_dict(torch.load(model_path, map_location="cpu"))
@@ -936,10 +990,26 @@ def run_evaluation(end_num: float, run: bool = True, use_extra: bool = False) ->
         np.savez("eval_search_heading.npz", **res_search)
         np.savez("eval_fused_query_heading.npz", **res_fused_query)
         print("Evaluation feature extraction complete.")
+        
+        # evaluate_retrieval(res_search, res_fused_query, scorer=model.scorer, device=DEVICE)
     else:
-        search_res = np.load("eval_search_heading.npz")
-        fused_query_res = np.load("eval_fused_query_heading.npz")
-        evaluate_retrieval(search_res, fused_query_res)
+        # model = Encoder_abla(
+        #     model_name=Config.MODEL_NAME,
+        #     proj_dim=Config.PROJECTION_DIM,
+        #     usesg=True,
+        #     useap=False,
+        # ).to(DEVICE)
+        # model_path = f"/data/feihong/ckpt/supp_{end_num}/last.pth"
+        # if os.path.exists(model_path):
+        #     model.load_state_dict(torch.load(model_path, map_location="cpu"))
+        #     print(f"Loaded checkpoint: {model_path}")
+        # else:
+        #     print(f"Checkpoint not found: {model_path}")
+        #     return
+        # model.eval()
+        search_res = np.load("eval_search_heading.npz", allow_pickle=True)
+        fused_query_res = np.load("eval_fused_query_heading.npz", allow_pickle=True)
+        evaluate_retrieval(search_res, fused_query_res, device=DEVICE)
 
 
 # --- Main ---
@@ -955,6 +1025,6 @@ if __name__ == "__main__":
         os.makedirs(save_dir, exist_ok=True)
         print(f"Created experiment directory: {save_dir}")
 
-    train(save_dir, end_num, use_ap=False)
+    # train(save_dir, end_num, use_ap=True)
     run_evaluation(end_num, run=True, use_extra=False)
     run_evaluation(end_num, run=False, use_extra=False)

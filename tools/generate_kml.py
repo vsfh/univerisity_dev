@@ -102,7 +102,7 @@ def update_coordinates(root, lon, lat, alt):
         coords_elem.text = f"{lon},{lat},{alt}"
 
 
-def generate_kml_files(input_folder, output_folder=None):
+def generate_drone(input_folder, output_folder=None):
     input_path = Path(input_folder)
     if output_folder is None:
         output_folder = input_path / "generated"
@@ -110,7 +110,7 @@ def generate_kml_files(input_folder, output_folder=None):
     output_path.mkdir(parents=True, exist_ok=True)
 
     range_values = [150, 200, 250, 300]
-    heading_values = [0, 90, 180, 270]
+    heading_values = [0, 45, 90, 135, 180, 225, 270, 315]
     tilt_value = 45
 
     kml_files = list(input_path.glob("*.kml"))
@@ -162,10 +162,13 @@ def update_name(root, new_name):
     if name_elem is not None:
         name_elem.text = new_name
 
-def main():
+def generate_satellite(input_folder):
     KML_TEMPLATE_PATH = "/data/feihong/kml_1024/0008.kml"
+    KML_TEMPLATE_PATH = "/data/feihong/ckpt/0008.kml"
     OUTPUT_DIR = '/data/feihong/new_univ_kml'
+    OUTPUT_DIR = input_folder
     UNIV_DATA_PATH= '/data/feihong/univerisity_dev/asian_200_libraries_free.txt'
+    UNIV_DATA_PATH= '/data/feihong/univerisity_dev/runs/university_targets_clean_third.txt'
     # Read template KML
     tree, root = parse_kml(KML_TEMPLATE_PATH)
     # Extract original LookAt values to preserve
@@ -199,16 +202,20 @@ def main():
             original_heading, "0", "1024"
         )
         update_coordinates(root_copy, lon, lat, "0")
-        update_name(root_copy, str(idx))
+        update_name(root_copy, str(1652+idx))
         # Save to output directory
-        output_path = os.path.join(OUTPUT_DIR, f"new_{idx}.kml")
+        output_path = os.path.join(OUTPUT_DIR, f"{1652+idx}.kml")
         tree_copy.write(output_path, encoding="utf-8", xml_declaration=True)
         print(f"Created {output_path}: lat={lat}, lon={lon}")
     print(f"\nDone! Created {len(lines)} KML files in {OUTPUT_DIR}")
 
 if __name__ == "__main__":
     import sys
-    main()
-    # input_folder = '/data/feihong/kml_1024'
-    # output_folder = '/data/feihong/kml_drone_3_range_4_heading'
-    # generate_kml_files(input_folder, output_folder)
+    input_folder = '/data/feihong/kml_1024'
+    # input_folder = '/data/feihong/new_kml'
+    output_folder = '/data/feihong/kml_drone_3_range_4_heading'
+    output_folder = '/data/feihong/new_kml_drone'
+    output_folder = '/data/feihong/kml_drone_1024'
+    # generate_satellite(input_folder)
+
+    generate_drone(input_folder, output_folder)
