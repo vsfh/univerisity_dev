@@ -14,13 +14,12 @@ import json
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
-from model import Encoder_abla, Encoder_heading
+from model import Encoder_abla
 from bbox.yolo_utils import (
     get_tensor_anchors,
     build_target,
     yolo_loss,
     eval_iou_acc,
-    SpatialTransformer,
 )
 
 torch.backends.cudnn.benchmark = True
@@ -62,21 +61,6 @@ COSINE_EPOCHS = 25
 BBOX_LOSS_WEIGHT = 0.1
 HEADING_LOSS_WEIGHT = .1
 PROJECTION_DIM = 768
-
-HEADING_TO_TARGET = {
-    0: [0.0, 0.0],
-    90: [0.0, 1.0],
-    180: [1.0, 0.0],
-    270: [1.0, 1.0],
-}
-
-TARGET_TO_HEADING = {
-    (0.0, 0.0): 0,
-    (0.0, 1.0): 90,
-    (1.0, 0.0): 180,
-    (1.0, 1.0): 270,
-}
-
 
 def get_loss_weights(epoch, num_epochs):
     progress = epoch / num_epochs

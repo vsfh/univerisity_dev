@@ -12,6 +12,8 @@ import random
 from torch.utils.tensorboard import SummaryWriter
 import json
 
+from dataset import ShiftedSatelliteDroneDataset
+
 SEED = 43
 random.seed(SEED)
 np.random.seed(SEED)
@@ -28,11 +30,41 @@ DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
 IMAGE_FOLDER = "/data/feihong/image_1024"
 HEADING_FOLDER = "/data/feihong/range_250"
 
-NUM_EPOCHS = 30
-BATCH_SIZE = 15
+NUM_EPOCHS = 8
+BATCH_SIZE = 16
 LEARNING_RATE = 1e-5
-DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 PROJECTION_DIM = 768
+NUM_WORKERS = 8
+PREFETCH_FACTOR = 4
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
+class OpenClipImageProcessorWrapper:
+    def __init__(self, preprocess):
+        self.preprocess = preprocess
+        self.size = {"height": 640, "width": 640}
+
+    def __call__(self, images, return_tensors="pt"):
+        pixel_values = self.preprocess(images)
+        return {"pixel_values": pixel_values.unsqueeze(0)}
+
+
+class OpenClipTokenizerWrapper:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(
+        self,
+        text,
+        padding="max_length",
+        truncation=True,
+        max_length=64,
+        return_tensors="pt",
+    ):
+        input_ids = self.tokenizer([text])
+        return {"input_ids": input_ids}
 
 
 class TargetSearchDataset(Dataset):
@@ -253,29 +285,13 @@ def main(save_path):
     exp_name = save_path.split("/")[-1] if save_path else "default_exp"
     writer = SummaryWriter(f"runs/{exp_name}")
 
-    print("Gathering image pairs...")
-    train_image_pairs = []
-    with open("/data/feihong/ckpt/train.txt", "r") as f:
-        for line in f:
-            query_path = line.strip()
-            name = query_path.split("/")[-2]
-            search_path = f"{IMAGE_FOLDER}/{name}.png"
-            if os.path.exists(search_path):
-                train_image_pairs.append((query_path, search_path))
-    test_image_pairs = []
-    with open("/data/feihong/ckpt/test.txt", "r") as f:
-        for line in f:
-            query_path = line.strip()
-            name = query_path.split("/")[-2]
-            search_path = f"{IMAGE_FOLDER}/{name}.png"
-            if os.path.exists(search_path):
-                test_image_pairs.append((query_path, search_path))
-
     print("Loading models and processor...")
     model, _, preprocess = open_clip.create_model_and_transforms(
         MODEL_NAME, pretrained=PRETRAINED, cache_dir=CACHE_DIR
     )
     tokenizer = open_clip.get_tokenizer(MODEL_NAME)
+    processor_wrapper = OpenClipImageProcessorWrapper(preprocess)
+    tokenizer_wrapper = OpenClipTokenizerWrapper(tokenizer)
 
     encoder = Encoder(
         model_name=MODEL_NAME, pretrained=PRETRAINED, proj_dim=PROJECTION_DIM
@@ -283,42 +299,57 @@ def main(save_path):
     encoder.train()
     optimizer = torch.optim.AdamW(encoder.parameters(), lr=LEARNING_RATE)
 
-    img_to_text_dict = json.load(open("/data/feihong/drone_text_single_long.json", "r"))
-
     print("Setting up dataset and dataloader...")
-    train_dataset = TargetSearchDataset(
-        image_pairs=train_image_pairs,
-        preprocess=preprocess,
-        tokenizer=tokenizer,
-        img_to_text_dict=img_to_text_dict,
+    train_dataset = ShiftedSatelliteDroneDataset(
+        processor=processor_wrapper,
+        processor_sat=processor_wrapper,
+        tokenizer=tokenizer_wrapper,
+        split="train",
     )
     train_dataloader = DataLoader(
-        train_dataset, shuffle=True, batch_size=BATCH_SIZE, num_workers=4
+        train_dataset,
+        shuffle=True,
+        batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=PREFETCH_FACTOR,
     )
 
-    test_dataset = TargetSearchDataset(
-        image_pairs=test_image_pairs,
-        preprocess=preprocess,
-        tokenizer=tokenizer,
-        img_to_text_dict=img_to_text_dict,
-        mode="test",
+    test_dataset = ShiftedSatelliteDroneDataset(
+        processor=processor_wrapper,
+        processor_sat=processor_wrapper,
+        tokenizer=tokenizer_wrapper,
+        split="val",
     )
     test_dataloader = DataLoader(
-        test_dataset, shuffle=False, batch_size=BATCH_SIZE, num_workers=4
+        test_dataset,
+        shuffle=False,
+        batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=PREFETCH_FACTOR,
     )
 
     print(f"Starting training on {DEVICE} for {NUM_EPOCHS} epochs...")
     min_loss = 100
     for epoch in range(NUM_EPOCHS):
+
+
         encoder.train()
         total_loss = 0
         progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}")
 
         for i, batch in enumerate(progress_bar):
-            target_pixel_values = batch["target_pixel_values"].to(DEVICE)
-            search_pixel_values = batch["search_pixel_values"].to(DEVICE)
-            input_ids = batch["input_ids"].to(DEVICE)
-            attention_mask = batch["attention_mask"].to(DEVICE)
+            target_pixel_values = batch["target_pixel_values"].to(
+                DEVICE, non_blocking=True
+            )
+            search_pixel_values = batch["search_pixel_values"].to(
+                DEVICE, non_blocking=True
+            )
+            input_ids = batch["input_ids"].to(DEVICE, non_blocking=True)
+            attention_mask = (input_ids != 0).long()
             local_indices = batch["index"].to(DEVICE)
 
             anchor_feats = encoder.query_forward(target_pixel_values)
@@ -357,18 +388,10 @@ def main(save_path):
             writer.add_scalar(
                 "Loss/train_batch", loss.item(), epoch * len(train_dataloader) + i
             )
-
         avg_loss = total_loss / len(train_dataloader)
 
         encoder.eval()
         val_loss, txt_val_loss = validation(encoder, test_dataloader, epoch)
-        writer.add_scalar("Loss/train_epoch", avg_loss, epoch)
-        writer.add_scalar("Loss/val_img_epoch", val_loss, epoch)
-        writer.add_scalar("Loss/val_txt_epoch", txt_val_loss, epoch)
-        print(
-            f"Epoch {epoch + 1} finished. Average train Loss: {avg_loss:.4f}. Average test Loss: {txt_val_loss:.4f}"
-        )
-
         if txt_val_loss < min_loss:
             os.makedirs(save_path, exist_ok=True)
             torch.save(encoder.state_dict(), f"{save_path}/best.pth")
@@ -379,6 +402,17 @@ def main(save_path):
         if not_update > 5:
             print("Validation loss not improving. Stopping early.")
             break
+        
+        writer.add_scalar("Loss/train_epoch", avg_loss, epoch)
+        writer.add_scalar("Loss/val_img_epoch", val_loss, epoch)
+        writer.add_scalar("Loss/val_txt_epoch", txt_val_loss, epoch)
+        print(
+            f"Epoch {epoch + 1} finished. Average train Loss: {avg_loss:.4f}. Average test Loss: {txt_val_loss:.4f}"
+        )
+
+
+
+
 
     print("Training complete.")
     writer.close()
@@ -389,10 +423,10 @@ def validation(model, loader, epoch):
     total_loss = 0
     txt_total = 0
     for batch in progress_bar:
-        target_pixel_values = batch["target_pixel_values"].to(DEVICE)
-        search_pixel_values = batch["search_pixel_values"].to(DEVICE)
-        input_ids = batch["input_ids"].to(DEVICE)
-        attention_mask = batch["attention_mask"].to(DEVICE)
+        target_pixel_values = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
+        search_pixel_values = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
+        input_ids = batch["input_ids"].to(DEVICE, non_blocking=True)
+        attention_mask = (input_ids != 0).long()
         local_indices = batch["index"].to(DEVICE)
 
         batch_offsets = torch.arange(local_indices.shape[0], device=DEVICE) * 9
@@ -787,10 +821,10 @@ if __name__ == "__main__":
         print(f"Created experiment directory: {save_dir}")
 
     # Run training
-    # main(save_dir)
+    main(save_dir)
 
     # Run evaluation
-    eval(True)  # Extract features
-    eval(False)  # Calculate metrics
+    # eval(True)  # Extract features
+    # eval(False)  # Calculate metrics
     # eval_denseuav(True)  # Extract features
     # eval_denseuav(False)  # Extract features

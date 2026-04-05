@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from transformers import AutoImageProcessor, AutoModel, AutoTokenizer
 from PIL import Image
 from tqdm import tqdm
@@ -11,6 +11,8 @@ import numpy as np
 import random
 from torch.utils.tensorboard import SummaryWriter
 import json
+
+from dataset import ShiftedSatelliteDroneDataset
 
 SEED = 43
 random.seed(SEED)
@@ -27,10 +29,10 @@ DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
 IMAGE_FOLDER = "/data/feihong/image_1024"
 HEADING_FOLDER = "/data/feihong/range_250"
 
-NUM_EPOCHS = 30
-BATCH_SIZE = 15
+NUM_EPOCHS = 8
+BATCH_SIZE = 16
 LEARNING_RATE = 1e-5
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 PROJECTION_DIM = 768
 DRONE_SIZE = (256, 256)
 
@@ -229,15 +231,6 @@ def main(save_path):
     exp_name = save_path.split("/")[-1] if save_path else "default_exp"
     writer = SummaryWriter(f"runs/{exp_name}")
 
-    print("Gathering image pairs...")
-    image_pairs = []
-    for query_path in tqdm(glob(f"{DRONE_VIEW_FOLDER}/*/*/image-01.jpeg")):
-        name = query_path.split("/")[-2]
-        search_path = f"{IMAGE_FOLDER}/{name}.png"
-        if os.path.exists(search_path):
-            image_pairs.append((query_path, search_path))
-    print(f"Found {len(image_pairs)} valid pairs.")
-
     print("Loading models and processor...")
     processor = AutoImageProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
 
@@ -246,43 +239,23 @@ def main(save_path):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
-    img_to_text_dict = json.load(open("/data/feihong/drone_text_single_long.json", "r"))
-
     print("Setting up dataset and dataloader...")
-    # Load training image pairs from /data/feihong/ckpt/train.txt
-    train_image_pairs = []
-    with open("/data/feihong/ckpt/train.txt", "r") as f:
-        for line in f:
-            query_path = line.strip()
-            name = query_path.split("/")[-2]
-            search_path = f"{IMAGE_FOLDER}/{name}.png"
-            if os.path.exists(search_path):
-                train_image_pairs.append((query_path, search_path))
-    test_image_pairs = []
-    with open("/data/feihong/ckpt/test.txt", "r") as f:
-        for line in f:
-            query_path = line.strip()
-            name = query_path.split("/")[-2]
-            search_path = f"{IMAGE_FOLDER}/{name}.png"
-            if os.path.exists(search_path):
-                test_image_pairs.append((query_path, search_path))
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    train_dataset = TargetSearchDataset(
-        image_pairs=train_image_pairs,
+    train_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
+        processor_sat=processor,
         tokenizer=tokenizer,
-        img_to_text_dict=img_to_text_dict,
+        split="train",
     )
     train_dataloader = DataLoader(
         train_dataset, shuffle=True, batch_size=BATCH_SIZE, num_workers=4
     )
 
-    test_dataset = TargetSearchDataset(
-        image_pairs=test_image_pairs,
+    test_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
+        processor_sat=processor,
         tokenizer=tokenizer,
-        img_to_text_dict=img_to_text_dict,
-        mode="test",
+        split="val",
     )
     test_dataloader = DataLoader(
         test_dataset, shuffle=False, batch_size=BATCH_SIZE, num_workers=4
@@ -397,244 +370,134 @@ def validation(model, loader, epoch):
     return avg_loss, txt_avg_loss
 
 
-def eval(run=False):
-    def calcu_cos(a, b):
-        a_norm = a / np.linalg.norm(a)
-        b_norm = b / np.linalg.norm(b, axis=1, keepdims=True)
-        return np.dot(b_norm, a_norm[..., None]).flatten()
+def eval(checkpoint_path=None, subset_height=None, subset_angle=None):
+    print("Evaluating retrieval accuracy on test split...")
+    processor = AutoImageProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-    class EvalDataset(Dataset):
-        def __init__(self, eval_list, processor, tokenizer, img_to_text_dict):
-            self.eval_list = eval_list
-            self.processor = processor
-            self.tokenizer = tokenizer
-            self.img_to_text_dict = img_to_text_dict
-            self.remove = [
-                "**",
-                "\n",
-                "noun",
-                "phrases",
-                "Phrase",
-                "Noun",
-                "Summary",
-                "Environment",
-                "32 tokens",
-                "Description",
-                "()",
-            ]
+    base_test_dataset = ShiftedSatelliteDroneDataset(
+        processor=processor,
+        processor_sat=processor,
+        tokenizer=tokenizer,
+        split="test",
+    )
 
-        def __len__(self):
-            return len(self.eval_list)
+    selected_indices = []
+    for idx, sample in enumerate(base_test_dataset.samples):
+        if subset_height is not None and int(sample["height"]) != int(subset_height):
+            continue
+        if subset_angle is not None and int(sample["angle"]) != int(subset_angle):
+            continue
+        selected_indices.append(idx)
 
-        def __getitem__(self, idx):
-            query_path = self.eval_list[idx]
-            name = query_path.split("/")[-2]
-            if 'heading' in query_path:
-                name = query_path.split("/")[-1].split("_")[0]
-            search_path = f"{IMAGE_FOLDER}/{name}.png"
-
-            text_name = name + "_01"
-            text_description = self.img_to_text_dict.get(text_name, "")
-            for noun in self.remove:
-                text_description = text_description.replace(noun, "")
-
-            if not os.path.exists(search_path):
-                return None
-
-            try:
-                query_image = Image.open(query_path).convert("RGB")
-                search_image = Image.open(search_path).convert("RGB")
-            except Exception:
-                return None
-            if 'heading' in query_path:
-                query_image = query_image.crop((420, 0, 1500, 1080))
-            query_image = query_image.resize(DRONE_SIZE, Image.Resampling.BILINEAR)
-            search_image = search_image.crop((840, 0, 3000, 2160)).resize((640, 640))
-
-            query_pixels = self.processor(images=query_image, return_tensors="pt")[
-                "pixel_values"
-            ][0]
-            search_pixels = self.processor(images=search_image, return_tensors="pt")[
-                "pixel_values"
-            ][0]
-            input_ids = self.tokenizer(
-                text_description,
-                padding="max_length",
-                truncation=True,
-                max_length=64,
-                return_tensors="pt",
-            )["input_ids"][0]
-
-            return {
-                "name": name,
-                "query_pixels": query_pixels,
-                "search_pixels": search_pixels,
-                "input_ids": input_ids,
-            }
-
-    if run:
-        img_to_text_dict = json.load(
-            open("/data/feihong/drone_text_single_long.json", "r")
+    if not selected_indices:
+        print(
+            f"No samples found for filters: height={subset_height}, angle={subset_angle}."
         )
-        processor = AutoImageProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        return
 
-        encoder = Encoder(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM).to(DEVICE)
-        model_path = f"../ckpt/retrieval_siglip/best.pth"
+    test_dataset = Subset(base_test_dataset, selected_indices)
+    selected_samples = [base_test_dataset.samples[idx] for idx in selected_indices]
+    print(
+        f"Using {len(selected_indices)} / {len(base_test_dataset)} test samples "
+        f"(height={subset_height}, angle={subset_angle})."
+    )
 
-        if os.path.exists(model_path):
-            encoder.load_state_dict(
-                torch.load(model_path, map_location="cpu"), strict=False
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    encoder = Encoder(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM).to(DEVICE)
+    model_path = checkpoint_path or "../ckpt/retrieval_siglip/best.pth"
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Checkpoint not found: {model_path}")
+    encoder.load_state_dict(torch.load(model_path, map_location="cpu"), strict=False)
+    encoder.eval()
+
+    query_feats_list = []
+    query_labels = []
+
+    with torch.inference_mode(), torch.amp.autocast("cuda"):
+        for batch in tqdm(test_loader, desc="Extracting query features"):
+            query_inputs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
+            input_ids = batch["input_ids"].to(DEVICE, non_blocking=True)
+
+            anchor_feats = encoder.query_forward(query_inputs)
+            text_feats = encoder.text_forward(input_ids)
+            fused_query_feats = F.normalize(anchor_feats + text_feats, p=2, dim=1)
+
+            query_feats_list.append(fused_query_feats)
+            query_labels.extend(
+                [os.path.splitext(os.path.basename(path))[0] for path in batch["satellite_path"]]
             )
-        encoder.eval()
 
-        print("Setting up dataset and dataloader for eval...")
-        eval_list = []
-        with open("/data/feihong/ckpt/test.txt", "r") as f:
-            for line in f:
-                # img_path = line.strip()
-                index = line.strip().split('/')[-2]
-                img_path = f'/data/feihong/range_250/{index}_range250_heading0.png'
-                eval_list.append(img_path)
+    unique_satellite_paths = sorted({sample["satellite_path"] for sample in selected_samples})
+    gallery_labels = [os.path.splitext(os.path.basename(path))[0] for path in unique_satellite_paths]
 
-        dataset = EvalDataset(eval_list, processor, tokenizer, img_to_text_dict)
+    gallery_pixels = []
+    valid_gallery_labels = []
+    for sat_path, sat_label in tqdm(
+        zip(unique_satellite_paths, gallery_labels),
+        total=len(unique_satellite_paths),
+        desc="Preparing gallery images",
+    ):
+        try:
+            sat_image = Image.open(sat_path).convert("RGB")
+            sat_pixels = processor(images=sat_image, return_tensors="pt")["pixel_values"][0]
+            gallery_pixels.append(sat_pixels)
+            valid_gallery_labels.append(sat_label)
+        except Exception as e:
+            print(f"Skip gallery image {sat_path}: {e}")
 
-        def collate_fn(batch):
-            batch = [b for b in batch if b is not None]
-            if len(batch) == 0:
-                return None
-            return torch.utils.data.dataloader.default_collate(batch)
-
-        loader = DataLoader(
-            dataset,
-            batch_size=BATCH_SIZE,
-            shuffle=False,
-            num_workers=8,
-            pin_memory=True,
-            collate_fn=collate_fn,
-        )
-
-        res_search = {}
-        res_fused_query = {}
-
-        print(f"Starting batched inference on {len(dataset)} items...")
+    gallery_grid_feats = []
+    for i in tqdm(range(0, len(gallery_pixels), BATCH_SIZE), desc="Extracting gallery features"):
+        batch_pixels = torch.stack(gallery_pixels[i : i + BATCH_SIZE]).to(DEVICE, non_blocking=True)
         with torch.inference_mode(), torch.amp.autocast("cuda"):
-            for batch in tqdm(loader):
-                if batch is None:
-                    continue
-                names = batch["name"]
-                query_inputs = batch["query_pixels"].to(DEVICE, non_blocking=True)
-                search_inputs = batch["search_pixels"].to(DEVICE, non_blocking=True)
-                input_ids = batch["input_ids"].to(DEVICE, non_blocking=True)
+            batch_grid = encoder.ref_forward(batch_pixels)
+            batch_grid = F.normalize(batch_grid, p=2, dim=2)
+        gallery_grid_feats.append(batch_grid)
 
-                with torch.no_grad():
-                    anchor_feats = encoder.query_forward(query_inputs)
-                    grid_feats = encoder.ref_forward(search_inputs)
-                    text_feats = encoder.text_forward(input_ids)
-                    fused_query_feats = anchor_feats + text_feats
+    if not query_feats_list or not gallery_grid_feats:
+        print("No valid query/gallery features found.")
+        return
 
-                grid_feats_np = grid_feats.float().cpu().numpy()
-                fused_feats_np = fused_query_feats.float().cpu().numpy()
+    query_feats = torch.cat(query_feats_list, dim=0)
+    gallery_feats = torch.cat(gallery_grid_feats, dim=0)
+    scores = torch.einsum("qd,gkd->qgk", query_feats, gallery_feats).mean(dim=2)
 
-                for i, name in enumerate(names):
-                    res_search[name] = grid_feats_np[i]
-                    res_fused_query[name] = fused_feats_np[i]
+    k_max = min(10, scores.shape[1])
+    topk_indices = torch.topk(scores, k=k_max, dim=1).indices
+    label_to_gallery_index = {label: idx for idx, label in enumerate(valid_gallery_labels)}
 
-        SATELLITE_FOLDER = "/data/feihong/asian_univ"
-        satellite_files = sorted(
-            [f for f in os.listdir(SATELLITE_FOLDER) if f.endswith(".png")]
-        )
-        print(
-            f"Processing {len(satellite_files)} satellite images from {SATELLITE_FOLDER}..."
-        )
+    valid_queries = 0
+    top1 = 0
+    top5 = 0
+    top10 = 0
 
-        satellite_batch = []
-        satellite_names = []
-        for sat_file in tqdm(satellite_files):
-            sat_name = sat_file.replace(".png", "")
-            sat_path = os.path.join(SATELLITE_FOLDER, sat_file)
-            try:
-                sat_image = Image.open(sat_path).convert("RGB")
-                sat_image = sat_image.crop((840, 0, 3000, 2160)).resize((640, 640))
-                sat_pixels = processor(images=sat_image, return_tensors="pt")[
-                    "pixel_values"
-                ][0]
-                satellite_batch.append(sat_pixels)
-                satellite_names.append(sat_name)
-            except Exception as e:
-                print(f"Error processing {sat_file}: {e}")
-                continue
+    for q_idx, gt_label in enumerate(query_labels):
+        gt_gallery_index = label_to_gallery_index.get(gt_label)
+        if gt_gallery_index is None:
+            continue
+        valid_queries += 1
+        pred_indices = topk_indices[q_idx].tolist()
+        if gt_gallery_index in pred_indices[:1]:
+            top1 += 1
+        if gt_gallery_index in pred_indices[: min(5, k_max)]:
+            top5 += 1
+        if gt_gallery_index in pred_indices[: min(10, k_max)]:
+            top10 += 1
 
-        for i in range(0, len(satellite_batch), BATCH_SIZE):
-            batch_pixels = torch.stack(satellite_batch[i : i + BATCH_SIZE]).to(DEVICE)
-            batch_names = satellite_names[i : i + BATCH_SIZE]
+    if valid_queries == 0:
+        print("No valid queries matched gallery labels.")
+        return
 
-            with torch.inference_mode(), torch.amp.autocast("cuda"):
-                grid_feats = encoder.ref_forward(batch_pixels)
-
-            grid_feats_np = grid_feats.float().cpu().numpy()
-            for j, name in enumerate(batch_names):
-                res_search[name] = grid_feats_np[j]
-
-        np.savez("eval_search_siglip.npz", **res_search)
-        np.savez("eval_fused_query_siglip.npz", **res_fused_query)
-        print("Evaluation feature extraction complete.")
-    else:
-        search_res = np.load("eval_search_siglip.npz")
-        fused_query_res = np.load("eval_fused_query_siglip.npz")
-
-        distances = json.load(open("/data/feihong/ckpt/distances.json", "r"))
-        test_num = 100
-        test_list = [k for k in search_res.keys() if not 'new' in k]
-        # test_list = [k for k in search_res.keys()]
-        res = {}
-        top1 = 0
-        top5 = 0
-        top10 = 0
-
-        if not test_list:
-            print("No evaluation data found in npz files.")
-            return
-
-        for key in tqdm(test_list):
-            fused_query_feature = fused_query_res[key]
-
-            ex_img_list = random.sample(
-                test_list, min(test_num - 1, len(test_list) - 1)
-            )
-            if key in ex_img_list:
-                ex_img_list.remove(key)
-            ex_img_list.append(key)
-
-            candidate_indices = [len(ex_img_list) - 1]
-            for i, name in enumerate(ex_img_list[:-1]):
-                if (
-                    f"{name}.kml" not in distances
-                    or f"{key}.kml" not in distances[f"{name}.kml"]
-                ):
-                    continue
-                if distances[f"{name}.kml"][f"{key}.kml"] < 380:
-                    candidate_indices.append(i)
-
-            res[key] = []
-            for img_name in ex_img_list:
-                cos_sim_grid = calcu_cos(fused_query_feature, search_res[img_name])
-                res[key].append(cos_sim_grid)
-
-            img_res = np.array(res[key]).mean(1).argsort()[-15:][::-1]
-
-            if any(cand in candidate_indices for cand in img_res[:1]):
-                top1 += 1
-            if any(cand in candidate_indices for cand in img_res[:5]):
-                top5 += 1
-            if any(cand in candidate_indices for cand in img_res[:10]):
-                top10 += 1
-
-        print(f"Top 1: {top1} / {len(test_list)} ({top1 / len(test_list) * 100:.2f}%)")
-        print(f"Top 5: {top5} / {len(test_list)} ({top5 / len(test_list) * 100:.2f}%)")
-        print(
-            f"Top 10: {top10} / {len(test_list)} ({top10 / len(test_list) * 100:.2f}%)"
-        )
+    print(f"Top 1: {top1} / {valid_queries} ({top1 / valid_queries * 100:.2f}%)")
+    print(f"Top 5: {top5} / {valid_queries} ({top5 / valid_queries * 100:.2f}%)")
+    print(f"Top 10: {top10} / {valid_queries} ({top10 / valid_queries * 100:.2f}%)")
 
 
 def eval_denseuav(run=False):
@@ -789,11 +652,10 @@ if __name__ == "__main__":
         print(f"Created experiment directory: {save_dir}")
 
     # Run training
-    # main(save_dir)
+    main(save_dir)
 
     # Run evaluation
-    eval(True)  # Extract features
-    eval(False)  # Calculate metrics
+    # eval()  # Evaluate Top-1/5/10 on test split
 
     # eval_denseuav(True)  # Extract features
     # eval_denseuav(False)  # Extract features

@@ -2,9 +2,79 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 import numpy as np
-import squarify
+# import squarify
 from matplotlib.colors import LinearSegmentedColormap
 import json
+
+
+def draw_shifted_bbox_heatmap(
+    bbox_json_path="/data/feihong/ckpt/shifted_bboxes.json",
+    output_path="runs/shifted_bbox_heatmap.png",
+    image_width=3170,
+    image_height=1962,
+    high_color="#F9F8F5",
+    low_color="#B89386",
+):
+    """Draw one heatmap for all bboxes from shifted_bboxes.json."""
+    with open(bbox_json_path, "r") as f:
+        data = json.load(f)
+
+    # Accumulate center-peaked contributions for each bbox.
+    heatmap = np.zeros((image_height, image_width), dtype=np.float32)
+    bbox_count = 0
+
+    for _, bbox_by_height in data.items():
+        if not isinstance(bbox_by_height, dict):
+            continue
+        for _, bbox in bbox_by_height.items():
+            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                continue
+
+            x1, y1, x2, y2 = [float(v) for v in bbox]
+            x1 = int(np.clip(np.floor(x1), 0, image_width - 1))
+            y1 = int(np.clip(np.floor(y1), 0, image_height - 1))
+            x2 = int(np.clip(np.ceil(x2), 1, image_width))
+            y2 = int(np.clip(np.ceil(y2), 1, image_height))
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            w = x2 - x1
+            h = y2 - y1
+
+            xs = np.arange(x1, x2, dtype=np.float32)
+            ys = np.arange(y1, y2, dtype=np.float32)
+            cx = (x1 + x2 - 1) / 2.0
+            cy = (y1 + y2 - 1) / 2.0
+            rx = max(w / 2.0, 1.0)
+            ry = max(h / 2.0, 1.0)
+
+            # Separable tent kernel: max at center, linearly decays to boundary.
+            wx = np.clip(1.0 - np.abs(xs - cx) / rx, 0.0, 1.0)
+            wy = np.clip(1.0 - np.abs(ys - cy) / ry, 0.0, 1.0)
+            heatmap[y1:y2, x1:x2] += np.outer(wy, wx)
+
+            bbox_count += 1
+            break
+
+    if heatmap.max() > 0:
+        heatmap = heatmap / heatmap.max()
+
+    cmap = LinearSegmentedColormap.from_list(
+        "shifted_bbox_heatmap",
+        [low_color, high_color],
+    )
+
+    plt.figure(figsize=(19.2, 10.8), dpi=200)
+    plt.imshow(heatmap, cmap=cmap, origin="upper", interpolation="nearest")
+    plt.axis("off")
+    plt.colorbar(fraction=0.025, pad=0.02, label="Normalized bbox density")
+    plt.title(f"Shifted BBox Heatmap (count={bbox_count})", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200, bbox_inches="tight", pad_inches=0)
+    plt.close()
+
+    print(f"Saved shifted bbox heatmap to {output_path}")
 
 def distance_visualize():
     # --- 1. Load distances.json ---
@@ -147,4 +217,5 @@ def hex():
 
 
 # squ()
-distance_visualize()
+# distance_visualize()
+draw_shifted_bbox_heatmap()

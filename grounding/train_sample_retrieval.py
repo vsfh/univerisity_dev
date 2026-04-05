@@ -9,26 +9,23 @@
 import time
 import random
 import json
+from pathlib import Path
 import torch
 import torch.nn as nn
 import numpy as np
 from tqdm import tqdm
 import torch.backends.cudnn as cudnn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torch.optim import Adam
 from torchvision.transforms import Compose, ToTensor, Normalize
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image
 import os
-from glob import glob
 import argparse
 import timm
 import torch.nn.functional as F
 
-from ground_cvos import (
-    format_satellite_img_bbox,
-    resize_drone_image,
-)
+from dataset import ShiftedSatelliteDroneDataset
 
 SEED = 43
 random.seed(SEED)
@@ -40,7 +37,7 @@ torch.backends.cudnn.benchmark = True
 
 IMG_SIZE = 640
 BATCH_SIZE = 4
-NUM_EPOCHS = 25
+NUM_EPOCHS = 8
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 PRINT_FREQ = 50
@@ -53,7 +50,7 @@ TRAIN_FILE = "/data/feihong/ckpt/train.txt"
 TEST_FILE = "/data/feihong/ckpt/test.txt"
 UNIV_CROP_SIZE = (640, 640)
 UNIV_DRONE_SIZE = (256, 256)
-DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 
 CVOGL_TRANSFORM = Compose(
     [
@@ -66,6 +63,34 @@ EMB_SIZE = 1024
 PROJECTION_DIM = 1024
 DATA_DIR = "/data/feihong"
 DISTANCES_FILE = os.path.join(DATA_DIR, "ckpt/distances.json")
+
+
+class TransformProcessorWrapper:
+    def __init__(self, transform):
+        self.transform = transform
+        self.size = {"height": 640, "width": 640}
+
+    def __call__(self, images, return_tensors="pt"):
+        if isinstance(images, Image.Image):
+            image_np = np.array(images)
+        else:
+            image_np = images
+        pixel_values = self.transform(image_np)
+        return {"pixel_values": pixel_values.unsqueeze(0)}
+
+
+class DummyTokenizer:
+    def __call__(
+        self,
+        text,
+        padding="max_length",
+        truncation=True,
+        max_length=64,
+        return_tensors="pt",
+    ):
+        del text, truncation, return_tensors
+        token = torch.zeros((1, max_length), dtype=torch.long)
+        return {"input_ids": token}
 
 
 class AverageMeter(object):
@@ -144,7 +169,15 @@ def info_nce_loss(query_feats, candidate_feats, positive_indices, temperature=0.
     return nn.functional.cross_entropy(sim_matrix, positive_indices)
 
 
-def train_epoch(loader, model, optimizer, epoch, print_freq=PRINT_FREQ):
+def train_epoch(
+    loader,
+    model,
+    optimizer,
+    epoch,
+    scaler,
+    use_amp=False,
+    print_freq=PRINT_FREQ,
+):
     """Train for one epoch."""
     model.train()
 
@@ -153,31 +186,37 @@ def train_epoch(loader, model, optimizer, epoch, print_freq=PRINT_FREQ):
 
     end = time.time()
     for batch_idx, batch in enumerate(loader):
-        query_imgs = batch["query_imgs"].to(DEVICE)
-        reference_imgs = batch["rs_imgs"].to(DEVICE)
+        query_imgs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
+        reference_imgs = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
         local_indices = batch["index"].to(DEVICE)
 
-        query_feats, reference_feats = model(query_imgs, reference_imgs)
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+            query_feats, reference_feats = model(query_imgs, reference_imgs)
 
-        B = query_feats.shape[0]
-        candidate_feats = reference_feats.reshape(-1, PROJECTION_DIM)
+            B = query_feats.shape[0]
+            candidate_feats = reference_feats.reshape(-1, PROJECTION_DIM)
 
-        positive_indices = torch.zeros(B, B * 9, device=DEVICE)
-        batch_offsets = torch.arange(B, device=DEVICE) * 9
-        row_indices_broad = torch.arange(B, device=DEVICE).unsqueeze(1)
-        col_offsets = torch.arange(9, device=DEVICE).unsqueeze(0)
-        same_image_cols = batch_offsets.unsqueeze(1) + col_offsets
+            positive_indices = torch.zeros(B, B * 9, device=DEVICE)
+            batch_offsets = torch.arange(B, device=DEVICE) * 9
+            row_indices_broad = torch.arange(B, device=DEVICE).unsqueeze(1)
+            col_offsets = torch.arange(9, device=DEVICE).unsqueeze(0)
+            same_image_cols = batch_offsets.unsqueeze(1) + col_offsets
 
-        positive_indices[row_indices_broad, same_image_cols] = 0.5
-        global_positive_indices = local_indices + batch_offsets
-        row_indices_flat = torch.arange(B, device=DEVICE)
-        positive_indices[row_indices_flat, global_positive_indices] = 0.95
+            positive_indices[row_indices_broad, same_image_cols] = 0.5
+            global_positive_indices = local_indices + batch_offsets
+            row_indices_flat = torch.arange(B, device=DEVICE)
+            positive_indices[row_indices_flat, global_positive_indices] = 0.95
 
-        loss = info_nce_loss(query_feats, candidate_feats, positive_indices)
+            loss = info_nce_loss(query_feats, candidate_feats, positive_indices)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         losses.update(loss.item(), query_imgs.shape[0])
         batch_time.update(time.time() - end)
@@ -193,7 +232,7 @@ def train_epoch(loader, model, optimizer, epoch, print_freq=PRINT_FREQ):
     return losses.avg
 
 
-def validate(loader, model, epoch):
+def validate(loader, model, epoch, use_amp=False):
     """Validate model with InfoNCE loss."""
     model.eval()
 
@@ -201,11 +240,13 @@ def validate(loader, model, epoch):
     total_samples = 0
 
     for batch in tqdm(loader, desc="Validating"):
-        query_imgs = batch["query_imgs"].to(DEVICE)
-        reference_imgs = batch["rs_imgs"].to(DEVICE)
+        query_imgs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
+        reference_imgs = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
         local_indices = batch["index"].to(DEVICE)
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(
+            device_type="cuda", dtype=torch.float16, enabled=use_amp
+        ):
             query_feats, reference_feats = model(query_imgs, reference_imgs)
 
         B = query_feats.shape[0]
@@ -255,34 +296,16 @@ def calcu_cos(a, b):
 
 
 def eval_model(run=False, checkpoint_path=None):
-    use_gpu = torch.cuda.is_available()
-
+    use_amp = torch.cuda.is_available()
     if run:
-        print("Loading distances.json...")
-        distances = load_distances()
-
-        print("Loading train dataset to get correct number of classes...")
-        val_pairs = []
-        with open(TEST_FILE, "r") as f:
-            for line in f:
-                # query_path = line.strip().replace('01.','41.')
-                # name = query_path.split("/")[-2]
-
-                name = line.strip().split('/')[-2]
-                query_path = f'/data/feihong/range_250/{name}_range250_heading0.png'
-                search_path = f"{UNIV_IMAGE_FOLDER}/{name}.png"
-                if os.path.exists(search_path):
-                    val_pairs.append((query_path, search_path))
-        bbox_dict = {}
-        for f in [TRAIN_BBOX_FILE, TEST_BBOX_FILE]:
-            with open(f, "r") as file:
-                data = json.load(file)
-                bbox_dict.update(data)
-        test_dataset = TargetSearchDataset(
-            image_pairs=val_pairs,
-            bbox_dict=bbox_dict,
-            mode="test",
-            transform=CVOGL_TRANSFORM,
+        print("Loading test dataset...")
+        processor = TransformProcessorWrapper(CVOGL_TRANSFORM)
+        tokenizer = DummyTokenizer()
+        test_dataset = ShiftedSatelliteDroneDataset(
+            processor=processor,
+            processor_sat=processor,
+            tokenizer=tokenizer,
+            split="test",
         )
         test_loader = DataLoader(
             test_dataset,
@@ -291,6 +314,7 @@ def eval_model(run=False, checkpoint_path=None):
             pin_memory=True,
             drop_last=False,
             num_workers=args.num_workers,
+            persistent_workers=args.num_workers > 0,
         )
         model = SampleGeoLite()
         model = model.cuda()
@@ -309,16 +333,14 @@ def eval_model(run=False, checkpoint_path=None):
         res_drone = {}
 
         for batch in tqdm(test_loader):
-            drone = batch["query_imgs"].to(DEVICE)
-            satellite = batch["rs_imgs"].to(DEVICE)
-            labels = batch["name"]
-            # for satellite, drone, labels in tqdm(test_loader, desc="Extracting features"):
-            if use_gpu:
-                satellite = satellite.cuda()
-                drone = drone.cuda()
+            drone = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
+            satellite = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
+            labels = [Path(path).stem for path in batch["satellite_path"]]
 
-            with torch.no_grad():
-                feat1, feat2 = model(satellite, drone)
+            with torch.no_grad(), torch.autocast(
+                device_type="cuda", dtype=torch.float16, enabled=use_amp
+            ):
+                feat1, feat2 = model(drone, satellite)
                 feat1 = F.normalize(feat1, p=2, dim=1)
                 feat2 = F.normalize(feat2, p=2, dim=1)
 
@@ -342,9 +364,11 @@ def eval_model(run=False, checkpoint_path=None):
                 sat_image = Image.open(sat_path).convert("RGB")
                 sat_image = sat_image.crop((840, 0, 3000, 2160)).resize((640, 640))
                 sat_img_np = np.array(sat_image)
-                sat_img = CVOGL_TRANSFORM(sat_img_np).unsqueeze(0).cuda()
+                sat_img = CVOGL_TRANSFORM(sat_img_np).unsqueeze(0).to(DEVICE)
 
-                with torch.no_grad():
+                with torch.no_grad(), torch.autocast(
+                    device_type="cuda", dtype=torch.float16, enabled=use_amp
+                ):
                     feat, _ = model(sat_img, sat_img)
                     feat = F.normalize(feat, p=2, dim=1)
 
@@ -417,91 +441,6 @@ def eval_model(run=False, checkpoint_path=None):
         )
 
 
-class TargetSearchDataset(Dataset):
-    """Dataset for retrieval training with InfoNCE loss."""
-
-    def __init__(self, image_pairs, bbox_dict, mode="train", transform=None):
-        self.image_paths = image_pairs
-        self.bbox_dict = bbox_dict
-        self.mode = mode
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        query_path, search_path = self.image_paths[idx]
-
-        img_id = query_path.split("/")[-2]
-
-        # choice = []
-        # for number in ["01.", "21.", "31.", "41.", "51."]:
-        #     new_query_path = query_path.replace("01.", number)
-        #     if not os.path.exists(new_query_path):
-        #         continue
-        #     choice.append(new_query_path)
-
-        # heading0_path = f"{HEADING_FOLDER}/{img_id}_range250_heading0.png"
-        # if os.path.exists(heading0_path):
-        #     choice.append(heading0_path)
-
-        # if choice:
-        #     query_path = random.sample(choice, 1)[0]
-
-        if "_range250_heading0" in query_path:
-            name = query_path.split("/")[-1].split("_")[0]
-        else:
-            name = query_path.split("/")[-2]
-
-        try:
-            query_image = Image.open(query_path).convert("RGB")
-            search_image = Image.open(search_path).convert("RGB")
-        except FileNotFoundError:
-            return self.__getitem__((idx + 1) % len(self))
-
-        if "_range250_heading0" in query_path:
-            query_image = query_image.crop((420, 0, 1500, 1080))
-
-        query_image = resize_drone_image(query_image, UNIV_DRONE_SIZE)
-
-        bbox_key = name
-        bbox = self.bbox_dict.get(bbox_key, None)
-        if bbox is None:
-            bbox = (1536, 656, 2268, 1374)
-
-        search_image, normalized_bbox = format_satellite_img_bbox(
-            search_image, bbox, mode=self.mode, target_size=UNIV_CROP_SIZE
-        )
-
-        center_x = (normalized_bbox[0] + normalized_bbox[2]) / 2
-        center_y = (normalized_bbox[1] + normalized_bbox[3]) / 2
-
-        col_idx = min(int(center_x * 3), 2)
-        row_idx = min(int(center_y * 3), 2)
-        index = row_idx * 3 + col_idx
-
-        query_img_np = np.array(query_image)
-        rs_img_np = np.array(search_image)
-
-        if self.transform:
-            query_img = self.transform(query_img_np)
-            rs_img = self.transform(rs_img_np)
-        else:
-            query_img = (
-                torch.tensor(query_img_np, dtype=torch.float32).permute(2, 0, 1) / 255.0
-            )
-            rs_img = (
-                torch.tensor(rs_img_np, dtype=torch.float32).permute(2, 0, 1) / 255.0
-            )
-
-        return {
-            "query_imgs": query_img,
-            "rs_imgs": rs_img,
-            "index": torch.tensor(index, dtype=torch.long),
-            "name": name,
-        }
-
-
 def main(args):
     cudnn.benchmark = False
     cudnn.deterministic = True
@@ -512,49 +451,24 @@ def main(args):
     exp_name = args.savename if args.savename else "sample_retrieval_exp"
     writer = SummaryWriter(f"runs/{exp_name}")
 
-    print("Loading bbox annotations...")
-    bbox_dict = {}
-    for f in [TRAIN_BBOX_FILE, TEST_BBOX_FILE]:
-        with open(f, "r") as file:
-            data = json.load(file)
-            bbox_dict.update(data)
+    print("Creating datasets from shared data source...")
+    processor = TransformProcessorWrapper(CVOGL_TRANSFORM)
+    tokenizer = DummyTokenizer()
 
-    print(f"Loaded {len(bbox_dict)} bbox annotations")
-
-    print("Loading image pairs...")
-    train_pairs = []
-    with open(TRAIN_FILE, "r") as f:
-        for line in f:
-            query_path = line.strip()
-            name = query_path.split("/")[-2]
-            search_path = f"{UNIV_IMAGE_FOLDER}/{name}.png"
-            if os.path.exists(search_path):
-                train_pairs.append((query_path, search_path))
-
-    val_pairs = []
-    with open(TEST_FILE, "r") as f:
-        for line in f:
-            query_path = line.strip()
-            name = query_path.split("/")[-2]
-            search_path = f"{UNIV_IMAGE_FOLDER}/{name}.png"
-            if os.path.exists(search_path):
-                val_pairs.append((query_path, search_path))
-
-    print(f"Found {len(train_pairs)} training pairs, {len(val_pairs)} validation pairs")
-
-    print("Creating datasets...")
-    train_dataset = TargetSearchDataset(
-        image_pairs=train_pairs,
-        bbox_dict=bbox_dict,
-        mode="train",
-        transform=CVOGL_TRANSFORM,
+    train_dataset = ShiftedSatelliteDroneDataset(
+        processor=processor,
+        processor_sat=processor,
+        tokenizer=tokenizer,
+        split="train",
     )
-    val_dataset = TargetSearchDataset(
-        image_pairs=val_pairs,
-        bbox_dict=bbox_dict,
-        mode="test",
-        transform=CVOGL_TRANSFORM,
+    val_dataset = ShiftedSatelliteDroneDataset(
+        processor=processor,
+        processor_sat=processor,
+        tokenizer=tokenizer,
+        split="val",
     )
+
+    print(f"Found {len(train_dataset)} training pairs, {len(val_dataset)} validation pairs")
 
     train_loader = DataLoader(
         train_dataset,
@@ -563,6 +477,7 @@ def main(args):
         pin_memory=True,
         drop_last=False,
         num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -571,19 +486,30 @@ def main(args):
         pin_memory=True,
         drop_last=False,
         num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
     )
 
     print("Creating model...")
     model = SampleGeoLite(emb_size=EMB_SIZE).to(DEVICE)
+    use_amp = torch.cuda.is_available()
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
 
     best_loss = float("inf")
     print(f"Starting training for {args.max_epoch} epochs...")
     for epoch in range(args.max_epoch):
-        train_loss = train_epoch(train_loader, model, optimizer, epoch, args.print_freq)
+        train_loss = train_epoch(
+            train_loader,
+            model,
+            optimizer,
+            epoch,
+            scaler=scaler,
+            use_amp=use_amp,
+            print_freq=args.print_freq,
+        )
 
-        val_loss = validate(val_loader, model, epoch)
+        val_loss = validate(val_loader, model, epoch, use_amp=use_amp)
         # top1, top5, top10 = evaluate(model, val_loader)
 
         writer.add_scalar("Loss/train", train_loss, epoch)
@@ -613,7 +539,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SampleGeoLite Retrieval Training")
-    parser.add_argument("--gpu", default="2", help="GPU id")
+    parser.add_argument("--gpu", default="1", help="GPU id")
     parser.add_argument(
         "--num-workers", type=int, default=8, help="num workers for data loading"
     )
@@ -643,6 +569,6 @@ if __name__ == "__main__":
 
     os.makedirs(args.checkpoint, exist_ok=True)
 
-    # main(args)
-    eval_model(run=True, checkpoint_path="/data/feihong/ckpt/retrieval_sample4geo/best.pth")
-    eval_model(run=False)
+    main(args)
+    # eval_model(run=True, checkpoint_path="/data/feihong/ckpt/retrieval_sample4geo/best.pth")
+    # eval_model(run=False)

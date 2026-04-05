@@ -14,7 +14,7 @@ import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 import torch.backends.cudnn as cudnn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.optim import Adam
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image, ImageDraw
@@ -24,6 +24,7 @@ import argparse
 from ground_cvos import LPNGeoLite
 from model.loss import yolo_loss, build_target, adjust_learning_rate
 from utils.utils import AverageMeter, eval_iou_acc
+from dataset import ShiftedSatelliteDroneDataset
 
 IMG_SIZE = 640
 BATCH_SIZE = 4
@@ -43,7 +44,7 @@ UNIV_TEST_FILE = "/data/feihong/ckpt/test.txt"
 UNIV_CROP_SIZE = (640, 640)
 UNIV_DRONE_SIZE = (256, 256)
 UNIV_SAT_SIZE = (640, 640)
-DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 CVOGL_TRANSFORM = None
 
@@ -53,6 +54,42 @@ HEADING_TO_TARGET = {
     180: [1.0, 0.0],
     270: [1.0, 1.0],
 }
+
+
+class TransformProcessorWrapper:
+    def __init__(self):
+        self.to_tensor = torch.nn.Identity()
+        self.size = {"height": 640, "width": 640}
+
+    def __call__(self, images, return_tensors="pt"):
+        image_np = np.array(images, dtype=np.float32) / 255.0
+        pixel_values = torch.from_numpy(image_np).permute(2, 0, 1)
+        return {"pixel_values": pixel_values.unsqueeze(0)}
+
+
+class DummyTokenizer:
+    def __call__(
+        self,
+        text,
+        padding="max_length",
+        truncation=True,
+        max_length=64,
+        return_tensors="pt",
+    ):
+        del text, padding, truncation, return_tensors
+        return {"input_ids": torch.zeros((1, max_length), dtype=torch.long)}
+
+
+def angle_to_heading_target(angle_tensor: torch.Tensor) -> torch.Tensor:
+    # Quantize arbitrary angles to nearest heading target used by this model.
+    angles = torch.remainder(angle_tensor.float(), 360.0)
+    heading_classes = torch.round(angles / 90.0).remainder(4).long()
+    mapping = torch.tensor(
+        [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]],
+        device=angle_tensor.device,
+        dtype=torch.float32,
+    )
+    return mapping[heading_classes]
 
 
 def format_satellite_img_bbox(
@@ -115,81 +152,6 @@ def resize_drone_image(image, target_size=UNIV_DRONE_SIZE):
     return image.resize(target_size, Image.Resampling.BILINEAR)
 
 
-class HeadingGeoDataset(Dataset):
-    """GroundSmgeoDataset with heading prediction."""
-
-    def __init__(self, image_pairs, bbox_dict, mode="train", transform=None):
-        self.image_paths = image_pairs
-        self.bbox_dict = bbox_dict
-        self.mode = mode
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        query_path, search_path = self.image_paths[idx]
-
-        if self.mode == "train":
-            heading = random.choice([0, 90, 180, 270])
-            query_path = query_path.replace("heading0", f"heading{heading}")
-        else:
-            heading = 0
-
-        name = query_path.split("/")[-2]
-
-        try:
-            query_image = Image.open(query_path).convert("RGB")
-            search_image = Image.open(search_path).convert("RGB")
-        except FileNotFoundError:
-            return self.__getitem__((idx + 1) % len(self))
-
-        query_image = resize_drone_image(query_image)
-
-        base_name = name
-        bbox_key = base_name
-        bbox = self.bbox_dict.get(bbox_key, None)
-
-        if bbox is None:
-            bbox = (1536, 656, 2268, 1374)
-
-        search_image, normalized_bbox = format_satellite_img_bbox(
-            search_image, bbox, mode=self.mode, target_size=UNIV_CROP_SIZE
-        )
-
-        query_img_np = np.array(query_image)
-        rs_img_np = np.array(search_image)
-
-        queryimg = (
-            torch.tensor(query_img_np, dtype=torch.float32).permute(2, 0, 1) / 255.0
-        )
-        rsimg = torch.tensor(rs_img_np, dtype=torch.float32).permute(2, 0, 1) / 255.0
-
-        heading_target = torch.tensor(HEADING_TO_TARGET[heading], dtype=torch.float32)
-
-        if self.transform:
-            from torchvision.transforms import Compose, ToTensor, Normalize
-
-            transform = Compose(
-                [
-                    ToTensor(),
-                ]
-            )
-            queryimg = transform(query_img_np)
-            rsimg = transform(rs_img_np)
-
-        return {
-            "query_imgs": queryimg,
-            "rs_imgs": rsimg,
-            "ori_gt_bbox": torch.tensor(normalized_bbox, dtype=torch.float32),
-            "heading": heading_target,
-            "query_img_np": query_img_np,
-            "rs_img_np": rs_img_np,
-            "query_name": name,
-            "rs_name": f"{name}.png",
-        }
-
-
 def visualize(
     image_tensor: torch.Tensor,
     bbox_tensor: torch.Tensor,
@@ -244,10 +206,10 @@ def train_epoch(
 
     end = time.time()
     for batch_idx, batch in enumerate(loader):
-        query_imgs = batch["query_imgs"].to(DEVICE)
-        rs_imgs = batch["rs_imgs"].to(DEVICE)
-        ori_gt_bbox = batch["ori_gt_bbox"].to(DEVICE)
-        heading_target = batch["heading"].to(DEVICE)
+        query_imgs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
+        rs_imgs = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
+        ori_gt_bbox = batch["bbox"].to(DEVICE)
+        heading_target = angle_to_heading_target(batch["angle"].to(DEVICE))
 
         pred_anchor, _, pred_heading = model(query_imgs, rs_imgs)
 
@@ -301,10 +263,10 @@ def validate(loader, model, anchors_full, img_size):
     heading_meter = AverageMeter()
 
     for batch in tqdm(loader, desc="Validating"):
-        query_imgs = batch["query_imgs"].to(DEVICE)
-        rs_imgs = batch["rs_imgs"].to(DEVICE)
-        ori_gt_bbox = batch["ori_gt_bbox"].to(DEVICE)
-        heading_target = batch["heading"].to(DEVICE)
+        query_imgs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
+        rs_imgs = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
+        ori_gt_bbox = batch["bbox"].to(DEVICE)
+        heading_target = angle_to_heading_target(batch["angle"].to(DEVICE))
 
         with torch.no_grad():
             pred_anchor, _, pred_heading = model(query_imgs, rs_imgs)
@@ -347,54 +309,23 @@ def main(args):
     exp_name = args.savename if args.savename else "ground_lpn_exp"
     writer = SummaryWriter(f"runs/{exp_name}")
 
-    print("Loading bbox annotations...")
-    test_bbox_file = "/data/feihong/univerisity_dev/runs/test.json"
-    train_bbox_file = "/data/feihong/univerisity_dev/runs/train.json"
-
-    bbox_dict = {}
-    for f in [test_bbox_file, train_bbox_file]:
-        with open(f, "r") as file:
-            data = json.load(file)
-            bbox_dict.update(data)
-
-    print(f"Loaded {len(bbox_dict)} bbox annotations from train.json and test.json")
-
-    print("Loading image pairs...")
-    train_pairs = []
-    with open(UNIV_TRAIN_FILE, "r") as f:
-        for line in f:
-            query_path = line.strip()
-            name = query_path.split("/")[-2]
-            heading_path = f"{HEADING_FOLDER}/{name}_range250_heading0.png"
-            search_path = f"{UNIV_IMAGE_FOLDER}/{name}.png"
-            if os.path.exists(heading_path) and os.path.exists(search_path):
-                train_pairs.append((heading_path, search_path))
-
-    val_pairs = []
-    with open(UNIV_TEST_FILE, "r") as f:
-        for line in f:
-            query_path = line.strip()
-            name = query_path.split("/")[-2]
-            heading_path = f"{HEADING_FOLDER}/{name}_range250_heading0.png"
-            search_path = f"{UNIV_IMAGE_FOLDER}/{name}.png"
-            if os.path.exists(heading_path) and os.path.exists(search_path):
-                val_pairs.append((heading_path, search_path))
-
-    print(f"Found {len(train_pairs)} training pairs, {len(val_pairs)} validation pairs")
-
-    print("Creating datasets...")
-    train_dataset = HeadingGeoDataset(
-        image_pairs=train_pairs,
-        bbox_dict=bbox_dict,
-        mode="train",
-        transform=CVOGL_TRANSFORM,
+    print("Creating datasets from shared data source...")
+    processor = TransformProcessorWrapper()
+    tokenizer = DummyTokenizer()
+    train_dataset = ShiftedSatelliteDroneDataset(
+        processor=processor,
+        processor_sat=processor,
+        tokenizer=tokenizer,
+        split="train",
     )
-    val_dataset = HeadingGeoDataset(
-        image_pairs=val_pairs,
-        bbox_dict=bbox_dict,
-        mode="test",
-        transform=CVOGL_TRANSFORM,
+    val_dataset = ShiftedSatelliteDroneDataset(
+        processor=processor,
+        processor_sat=processor,
+        tokenizer=tokenizer,
+        split="val",
     )
+
+    print(f"Found {len(train_dataset)} training samples, {len(val_dataset)} validation samples")
 
     train_loader = DataLoader(
         train_dataset,
@@ -403,6 +334,7 @@ def main(args):
         pin_memory=True,
         drop_last=False,
         num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -411,6 +343,7 @@ def main(args):
         pin_memory=True,
         drop_last=False,
         num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
     )
 
     print("Creating model...")
@@ -476,6 +409,65 @@ def main(args):
     writer.close()
 
 
+def eval(args):
+    print("Evaluating checkpoint on test split...")
+    processor = TransformProcessorWrapper()
+    tokenizer = DummyTokenizer()
+    test_dataset = ShiftedSatelliteDroneDataset(
+        processor=processor,
+        processor_sat=processor,
+        tokenizer=tokenizer,
+        split="test",
+    )
+
+    if args.subset_height is not None or args.subset_angle is not None:
+        subset_indices = []
+        for idx, sample in enumerate(test_dataset.samples):
+            if args.subset_height is not None and int(sample["height"]) != args.subset_height:
+                continue
+            if args.subset_angle is not None and int(sample["angle"]) != args.subset_angle:
+                continue
+            subset_indices.append(idx)
+        if not subset_indices:
+            print(
+                f"No samples for subset filters: height={args.subset_height}, angle={args.subset_angle}"
+            )
+            return
+        test_dataset = Subset(test_dataset, subset_indices)
+        print(
+            f"Subset test samples: {len(subset_indices)} (height={args.subset_height}, angle={args.subset_angle})"
+        )
+    else:
+        print(f"Full test samples: {len(test_dataset)}")
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        pin_memory=True,
+        drop_last=False,
+        num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
+    )
+
+    model = LPNGeoLite(emb_size=2048).to(DEVICE)
+    checkpoint_path = args.checkpoint_path or f"{args.checkpoint}/best.pth"
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=False)
+
+    anchors_full = np.array([float(x) for x in ANCHORS.split(",")])
+    anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
+    anchors_full = torch.tensor(anchors_full, dtype=torch.float32).to(DEVICE)
+
+    accu50, accu25, val_iou, val_heading = validate(
+        test_loader, model, anchors_full, args.img_size
+    )
+    print(
+        f"Eval Accu50: {accu50:.4f}, Accu25: {accu25:.4f}, IoU: {val_iou:.4f}, Heading: {val_heading:.4f}"
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="LPNGeoLite Training on GroundSmgeoDataset with Heading"
@@ -509,8 +501,34 @@ if __name__ == "__main__":
         default="/data/feihong/ckpt/ground_lpn",
         help="Path to save model checkpoints",
     )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Only run evaluation on test split",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=str,
+        default=None,
+        help="Explicit checkpoint path for evaluation",
+    )
+    parser.add_argument(
+        "--subset-height",
+        type=int,
+        default=None,
+        help="Subset test data by exact height",
+    )
+    parser.add_argument(
+        "--subset-angle",
+        type=int,
+        default=None,
+        help="Subset test data by exact angle",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.checkpoint, exist_ok=True)
 
-    main(args)
+    if args.eval_only:
+        eval(args)
+    else:
+        main(args)

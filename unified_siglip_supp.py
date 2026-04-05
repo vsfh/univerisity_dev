@@ -4,6 +4,7 @@ import json
 import random
 import time
 from glob import glob
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 import torch
@@ -29,6 +30,7 @@ from bbox.yolo_utils import (
     yolo_loss,
     eval_iou_acc,
 )
+from dataset import ShiftedSatelliteDroneDataset
 
 cudnn.benchmark = True
 
@@ -53,7 +55,7 @@ class Config:
     DRONE_SIZE = (256, 256)
 
     NUM_EPOCHS = 60
-    BATCH_SIZE = 10
+    BATCH_SIZE = 4
     GRAD_ACCUMULATION_STEPS = 2
     LEARNING_RATE = 5e-5
     LR_MIN = 1e-10
@@ -325,14 +327,13 @@ def validate(
     anchors_full: torch.Tensor,
     img_size: int,
     useap: bool = True,
-) -> Tuple[float, float, float, float, float]:
+) -> Tuple[float, float, float, float]:
     model.eval()
 
     accu50_meter = AverageMeter()
     accu25_meter = AverageMeter()
     iou_meter = AverageMeter()
     info_nce_meter = AverageMeter()
-    heading_meter = AverageMeter()
 
     for batch in tqdm(loader, desc="Validating"):
         query_imgs = batch["target_pixel_values"]
@@ -340,12 +341,11 @@ def validate(
         ori_gt_bbox = batch["bbox"]
         input_ids = batch["input_ids"]
         local_indices = batch["index"]
-        heading_target = batch["heading"]
 
         with torch.no_grad():
             (
                 pred_anchor,
-                pred_heading,
+                _,
                 text_feats,
                 anchor_feats,
                 grid_feats,
@@ -396,20 +396,16 @@ def validate(
             scores = model.scorer(fused_feats, candidate_feats)
             img_text_loss = F.cross_entropy(scores, positive_indices)
 
-        heading_loss = F.mse_loss(pred_heading, heading_target)
-
         accu50_meter.update(accu_list[0].item(), query_imgs.shape[0])
         accu25_meter.update(accu_list[1].item(), query_imgs.shape[0])
         iou_meter.update(iou.item(), query_imgs.shape[0])
         info_nce_meter.update(img_text_loss.item(), query_imgs.shape[0])
-        heading_meter.update(heading_loss.item(), query_imgs.shape[0])
 
     return (
         accu50_meter.avg,
         accu25_meter.avg,
         iou_meter.avg,
         info_nce_meter.avg,
-        heading_meter.avg,
     )
 
 
@@ -464,10 +460,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
             f"Config: batch_size={Config.BATCH_SIZE}, lr={Config.LEARNING_RATE}, epochs={Config.NUM_EPOCHS}"
         )
 
-    print("Loading data splits...")
-    train_image_pairs, test_image_pairs, train_ids, test_ids = load_data_splits()
-    print(f"Train: {len(train_image_pairs)}, Test: {len(test_image_pairs)}")
-
     print("Loading models and processor...")
     processor = AutoImageProcessor.from_pretrained(
         Config.MODEL_NAME, cache_dir=Config.CACHE_DIR
@@ -475,7 +467,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     processor_sat = AutoImageProcessor.from_pretrained(
         Config.MODEL_NAME,
         cache_dir=Config.CACHE_DIR,
-        size={"height": 640, "width": 640},
+        size={"height": 432, "width": 768},
     )
     tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
 
@@ -489,20 +481,14 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         useap=use_ap,
     )
 
-    img_to_text_dict = json.load(open(Config.TEXT_FILE, "r"))
-    train_bbox_dict = json.load(open(Config.TRAIN_BBOX_FILE, "r"))
-    test_bbox_dict = json.load(open(Config.TEST_BBOX_FILE, "r"))
-
     anchors_full = get_tensor_anchors(accelerator.device)
 
     print("Setting up dataset and dataloader...")
-    train_dataset = GeoDataset(
-        image_pairs=train_image_pairs,
+    train_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
         processor_sat=processor_sat,
         tokenizer=tokenizer,
-        img_to_text_dict=img_to_text_dict,
-        bbox_dict=train_bbox_dict,
+        split="train",
     )
     train_dataloader = DataLoader(
         train_dataset,
@@ -512,14 +498,11 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         pin_memory=True,
     )
 
-    test_dataset = GeoDataset(
-        image_pairs=test_image_pairs,
+    test_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
         processor_sat=processor_sat,
         tokenizer=tokenizer,
-        img_to_text_dict=img_to_text_dict,
-        bbox_dict=test_bbox_dict,
-        mode="test",
+        split="test",
     )
     test_dataloader = DataLoader(
         test_dataset,
@@ -528,6 +511,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         num_workers=4,
         pin_memory=True,
     )
+    print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")
 
     optimizer = AdamW(model.parameters(), lr=Config.LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -549,7 +533,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         model.train()
         total_loss = 0
         total_bbox_loss = 0
-        total_heading_loss = 0
         progress_bar = tqdm(
             train_dataloader, desc=f"Epoch {epoch + 1}/{Config.NUM_EPOCHS}"
         )
@@ -561,11 +544,10 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 input_ids = batch["input_ids"]
                 local_indices = batch["index"]
                 target_bbox = batch["bbox"]
-                heading_target = batch["heading"]
 
                 (
                     pred_anchor,
-                    pred_heading,
+                    _,
                     text_feats,
                     anchor_feats,
                     grid_feats,
@@ -592,7 +574,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     Config.UNIV_SAT_SIZE[0],
                 )
                 bbox_loss = loss_geo + loss_cls
-                heading_loss = F.mse_loss(pred_heading, heading_target)
 
                 candidate_feats = grid_feats.reshape(-1, Config.PROJECTION_DIM)
                 positive_indices = torch.zeros(B, B * 9, device=accelerator.device)
@@ -627,7 +608,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 loss = (
                     retrieval_weight * img_text_loss
                     + bbox_weight * bbox_loss
-                    # + heading_loss * Config.HEADING_LOSS_WEIGHT
                 )
 
                 accelerator.backward(loss)
@@ -636,7 +616,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 
             total_loss += loss.item()
             total_bbox_loss += bbox_loss.item()
-            total_heading_loss += heading_loss.item()
             progress_bar.set_postfix(
                 {
                     "bbox_loss": f"{bbox_loss.item():.4f}",
@@ -660,7 +639,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 
         if (epoch + 1) % 10 == 0 and accelerator.is_main_process:
             accelerator.print(f"Running validation at epoch {epoch + 1}...")
-            accu50, accu25, iou, info_nce, heading = validate(
+            accu50, accu25, iou, info_nce = validate(
                 test_dataloader,
                 model,
                 accelerator,
@@ -670,7 +649,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
             )
             accelerator.print(
                 f"Val Epoch {epoch + 1}: Accu@50={accu50:.4f}, Accu@25={accu25:.4f}, IoU={iou:.4f}, "
-                f"InfoNCE={info_nce:.4f}, Heading={heading:.4f}"
+                f"InfoNCE={info_nce:.4f}"
             )
             
             if clearml_logger is not None:
@@ -678,7 +657,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 clearml_logger.report_scalar("validation", "accu25", accu25, epoch)
                 clearml_logger.report_scalar("validation", "iou", iou, epoch)
                 clearml_logger.report_scalar("validation", "info_nce", info_nce, epoch)
-                clearml_logger.report_scalar("validation", "heading", heading, epoch)
 
             if iou > max_iou:
                 max_iou = iou
@@ -705,17 +683,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 
 
 # --- Evaluation ---
-def pred_to_heading(pred: np.ndarray) -> int:
-    min_dist = float("inf")
-    best_heading = 0
-    for (t0, t1), heading in Config.TARGET_TO_HEADING.items():
-        dist = (pred[0] - t0) ** 2 + (pred[1] - t1) ** 2
-        if dist < min_dist:
-            min_dist = dist
-            best_heading = heading
-    return best_heading
-
-
 def compute_cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     a_norm = a / np.linalg.norm(a)
     b_norm = b / np.linalg.norm(b, axis=1, keepdims=True)
@@ -767,14 +734,19 @@ def extract_features(
             if batch is None:
                 continue
 
-            names = batch["name"]
+            if "name" in batch:
+                names = batch["name"]
+            elif "satellite_path" in batch:
+                names = [Path(path).stem for path in batch["satellite_path"]]
+            else:
+                names = [str(i) for i in range(batch["target_pixel_values"].shape[0])]
             query_inputs = batch["target_pixel_values"].to(device, non_blocking=True)
             search_inputs = batch["search_pixel_values"].to(device, non_blocking=True)
             input_ids = batch["input_ids"].to(device, non_blocking=True)
 
             (
                 pred_anchor,
-                pred_heading,
+                _,
                 text_feats,
                 anchor_feats,
                 grid_feats,
@@ -918,8 +890,6 @@ def run_evaluation(end_num: float, run: bool = True, use_extra: bool = False) ->
 
     if run:
         print("Initializing Evaluation...")
-        img_to_text_dict = json.load(open(Config.TEXT_FILE, "r"))
-
         processor = AutoImageProcessor.from_pretrained(
             Config.MODEL_NAME, cache_dir=Config.CACHE_DIR
         )
@@ -929,7 +899,6 @@ def run_evaluation(end_num: float, run: bool = True, use_extra: bool = False) ->
             size={"height": 640, "width": 640},
         )
         tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
-        test_bbox_dict = json.load(open(Config.TEST_BBOX_FILE, "r"))
 
         # model = Encoder_heading(
         #     model_name=Config.MODEL_NAME, proj_dim=Config.PROJECTION_DIM
@@ -949,32 +918,13 @@ def run_evaluation(end_num: float, run: bool = True, use_extra: bool = False) ->
             return
         model.eval()
 
-        eval_image_pairs = []
-        with open("/data/feihong/ckpt/test.txt", "r") as f:
-            for line in f:
-                query_path = line.strip()
-                index = query_path.split("/")[-2]
-                search_path = f"{Config.IMAGE_FOLDER}/{index}.png"
-                if os.path.exists(query_path) and os.path.exists(search_path):
-                    eval_image_pairs.append((query_path, search_path))
-
-        print(f"Eval pairs: {len(eval_image_pairs)}")
-
-        dataset = GeoDataset(
-            eval_image_pairs,
-            processor,
-            processor_sat,
-            tokenizer,
-            img_to_text_dict,
-            test_bbox_dict,
-            mode="test",
+        dataset = ShiftedSatelliteDroneDataset(
+            processor=processor,
+            processor_sat=processor_sat,
+            tokenizer=tokenizer,
+            split="test",
         )
-
-        def collate_fn(batch):
-            batch = [b for b in batch if b is not None]
-            if len(batch) == 0:
-                return None
-            return torch.utils.data.dataloader.default_collate(batch)
+        print(f"Eval pairs: {len(dataset)}")
 
         loader = DataLoader(
             dataset,
@@ -982,7 +932,6 @@ def run_evaluation(end_num: float, run: bool = True, use_extra: bool = False) ->
             shuffle=False,
             num_workers=8,
             pin_memory=True,
-            collate_fn=collate_fn,
         )
 
         res_search, res_fused_query = extract_features(model, loader, DEVICE, use_extra)
@@ -1025,6 +974,6 @@ if __name__ == "__main__":
         os.makedirs(save_dir, exist_ok=True)
         print(f"Created experiment directory: {save_dir}")
 
-    # train(save_dir, end_num, use_ap=True)
+    train(save_dir, end_num, use_ap=True)
     run_evaluation(end_num, run=True, use_extra=False)
     run_evaluation(end_num, run=False, use_extra=False)
