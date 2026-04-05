@@ -41,10 +41,11 @@ HEADING_FOLDER = "/data/feihong/range_250"
 UNIV_BBOX_FILE = "/data/feihong/univerisity_dev/runs/test.json"
 UNIV_TRAIN_FILE = "/data/feihong/ckpt/train.txt"
 UNIV_TEST_FILE = "/data/feihong/ckpt/test.txt"
-UNIV_CROP_SIZE = (640, 640)
+UNIV_CROP_SIZE = (432, 768)
 UNIV_DRONE_SIZE = (256, 256)
-UNIV_SAT_SIZE = (640, 640)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Keep satellite tensors in HxW format for the shared dataset pipeline.
+UNIV_SAT_SIZE = (432, 768)
+DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 
 CVOGL_TRANSFORM = None
 
@@ -59,7 +60,7 @@ HEADING_TO_TARGET = {
 class TransformProcessorWrapper:
     def __init__(self):
         self.to_tensor = torch.nn.Identity()
-        self.size = {"height": 640, "width": 640}
+        self.size = {"height": 432, "width": 768}
 
     def __call__(self, images, return_tensors="pt"):
         image_np = np.array(images, dtype=np.float32) / 255.0
@@ -137,13 +138,17 @@ def format_satellite_img_bbox(
     bottom = top + crop_size
 
     image = image.crop((left, top, right, bottom))
-    ratio = image.size[0] / target_size[0]
-    image = image.resize(target_size)
+    crop_w, crop_h = image.size
 
-    new_x1 = (x1 - left) / ratio
-    new_y1 = (y1 - top) / ratio
-    new_x2 = (x2 - left) / ratio
-    new_y2 = (y2 - top) / ratio
+    target_h, target_w = int(target_size[0]), int(target_size[1])
+    image = image.resize((target_w, target_h), Image.Resampling.BILINEAR)
+
+    scale_x = target_w / max(float(crop_w), 1.0)
+    scale_y = target_h / max(float(crop_h), 1.0)
+    new_x1 = (x1 - left) * scale_x
+    new_y1 = (y1 - top) * scale_y
+    new_x2 = (x2 - left) * scale_x
+    new_y2 = (y2 - top) * scale_y
     return image, [new_x1, new_y1, new_x2, new_y2]
 
 

@@ -1,5 +1,6 @@
 import json
 import random
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -16,7 +17,9 @@ BBOX_FILE = "/data/feihong/ckpt/shifted_bboxes.json"
 TRAIN_MAX_SATELLITE_ID = 1065
 VAL_SPLIT_COUNT = 30
 MAX_TEXT_LENGTH = 64
-DEFAULT_SAT_TARGET_SIZE = (640, 640)
+DEFAULT_SAT_TARGET_SIZE = (768, 432)
+DEFAULT_ENABLE_TIMING_LOG = False
+DEFAULT_TIMING_LOG_INTERVAL = 200
 DEFAULT_MODEL_NAME = "google/siglip-base-patch16-224"
 DEFAULT_CACHE_DIR = "/data/feihong/hf_cache"
 TRAIN_HEIGHT_TO_BOX_SIZE = {
@@ -89,10 +92,25 @@ def _augment_satellite_image_with_bbox(
 	image: Image.Image,
 	bbox: Sequence[float],
 	mode: str,
+	target_size: Optional[Tuple[int, int]] = None,
 ) -> Tuple[Image.Image, List[float]]:
-	"""Randomly crop around bbox (keeping bbox inside) and resize back to original size."""
+	"""Randomly crop around bbox (keeping bbox inside) and resize to target size."""
+	if target_size is None:
+		target_h, target_w = image.height, image.width
+	else:
+		target_h, target_w = int(target_size[0]), int(target_size[1])
+
 	if mode != "train":
-		return image, [float(v) for v in bbox]
+		orig_w, orig_h = image.size
+		if (orig_h, orig_w) == (target_h, target_w):
+			return image, [float(v) for v in bbox]
+
+		x1, y1, x2, y2 = [float(v) for v in bbox]
+		scale_x = target_w / max(float(orig_w), 1.0)
+		scale_y = target_h / max(float(orig_h), 1.0)
+		resized_bbox = [x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y]
+		resized_image = image.resize((target_w, target_h), Image.Resampling.BILINEAR)
+		return resized_image, resized_bbox
 
 	x1, y1, x2, y2 = [float(v) for v in bbox]
 	orig_w, orig_h = image.size
@@ -120,20 +138,20 @@ def _augment_satellite_image_with_bbox(
 	bottom = top + crop_size
 
 	cropped = image.crop((left, top, right, bottom))
-	augmented = cropped.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
+	augmented = cropped.resize((target_w, target_h), Image.Resampling.BILINEAR)
 
-	scale_x = orig_w / max(crop_size, 1.0)
-	scale_y = orig_h / max(crop_size, 1.0)
+	scale_x = target_w / max(crop_size, 1.0)
+	scale_y = target_h / max(crop_size, 1.0)
 	new_x1 = (x1 - left) * scale_x
 	new_y1 = (y1 - top) * scale_y
 	new_x2 = (x2 - left) * scale_x
 	new_y2 = (y2 - top) * scale_y
 
 	new_bbox = [
-		max(0.0, min(float(orig_w), new_x1)),
-		max(0.0, min(float(orig_h), new_y1)),
-		max(0.0, min(float(orig_w), new_x2)),
-		max(0.0, min(float(orig_h), new_y2)),
+		max(0.0, min(float(target_w), new_x1)),
+		max(0.0, min(float(target_h), new_y1)),
+		max(0.0, min(float(target_w), new_x2)),
+		max(0.0, min(float(target_h), new_y2)),
 	]
 
 	return augmented, new_bbox
@@ -185,6 +203,8 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		val_split_count: int = VAL_SPLIT_COUNT,
 		max_text_length: int = MAX_TEXT_LENGTH,
 		sat_target_size: Tuple[int, int] = DEFAULT_SAT_TARGET_SIZE,
+		enable_timing_log: bool = DEFAULT_ENABLE_TIMING_LOG,
+		timing_log_interval: int = DEFAULT_TIMING_LOG_INTERVAL,
 	):
 		if split not in {"train", "val", "test"}:
 			raise ValueError("split must be 'train', 'val', or 'test'.")
@@ -200,6 +220,16 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			processor_sat,
 			sat_target_size,
 		)
+		self.enable_timing_log = bool(enable_timing_log)
+		self.timing_log_interval = max(1, int(timing_log_interval))
+		self._timing_acc: Dict[str, float] = {
+			"io": 0.0,
+			"augment": 0.0,
+			"query_proc": 0.0,
+			"search_proc": 0.0,
+			"total": 0.0,
+		}
+		self._timing_count = 0
 
 		self.train_satellite_root = Path(train_satellite_root)
 		self.test_satellite_root = Path(test_satellite_root)
@@ -358,13 +388,16 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		return len(self.samples)
 
 	def __getitem__(self, idx: int) -> Dict[str, Any]:
+		t_start = time.perf_counter()
 		sample = self.samples[idx]
 
+		t_io_start = time.perf_counter()
 		try:
 			query_image = Image.open(sample["drone_path"]).convert("RGB")
 			search_image = Image.open(sample["satellite_path"]).convert("RGB")
 		except FileNotFoundError:
 			return self.__getitem__((idx + 1) % len(self.samples))
+		t_io = time.perf_counter() - t_io_start
 
 		orig_w, orig_h = search_image.size
 
@@ -379,25 +412,17 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		else:
 			base_bbox = [float(v) for v in sample["bbox"]]
 
+		t_aug_start = time.perf_counter()
 		augmented_search_image, augmented_bbox = _augment_satellite_image_with_bbox(
 			image=search_image,
 			bbox=base_bbox,
 			mode=self.split,
+			target_size=self.sat_target_size,
 		)
+		t_aug = time.perf_counter() - t_aug_start
 
-		aug_w, aug_h = augmented_search_image.size
 		target_h, target_w = self.sat_target_size
-		scale_x = target_w / max(aug_w, 1)
-		scale_y = target_h / max(aug_h, 1)
-
-		x1, y1, x2, y2 = augmented_bbox
-
-		resized_bbox = [
-			x1 * scale_x,
-			y1 * scale_y,
-			x2 * scale_x,
-			y2 * scale_y,
-		]
+		resized_bbox = [float(v) for v in augmented_bbox]
 		resized_bbox = _sanitize_bbox_xyxy(
 			resized_bbox,
 			image_width=float(target_w),
@@ -411,11 +436,38 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		index = row_idx * 3 + col_idx
 
 		input_ids = self._token_cache[sample["text"]]
+		t_qproc_start = time.perf_counter()
 		query_inputs = self.processor(images=query_image, return_tensors="pt")
+		t_qproc = time.perf_counter() - t_qproc_start
+		t_sproc_start = time.perf_counter()
 		search_inputs = self.processor_sat(
 			images=augmented_search_image,
 			return_tensors="pt",
 		)
+		t_sproc = time.perf_counter() - t_sproc_start
+
+		t_total = time.perf_counter() - t_start
+		if self.enable_timing_log:
+			self._timing_acc["io"] += t_io
+			self._timing_acc["augment"] += t_aug
+			self._timing_acc["query_proc"] += t_qproc
+			self._timing_acc["search_proc"] += t_sproc
+			self._timing_acc["total"] += t_total
+			self._timing_count += 1
+
+			if self._timing_count % self.timing_log_interval == 0:
+				den = float(self._timing_count)
+				worker_info = torch.utils.data.get_worker_info()
+				worker_id = worker_info.id if worker_info is not None else 0
+				print(
+					"[DatasetTiming] "
+					f"split={self.split} worker={worker_id} samples={self._timing_count} "
+					f"io={self._timing_acc['io'] / den * 1000.0:.2f}ms "
+					f"aug={self._timing_acc['augment'] / den * 1000.0:.2f}ms "
+					f"query_proc={self._timing_acc['query_proc'] / den * 1000.0:.2f}ms "
+					f"search_proc={self._timing_acc['search_proc'] / den * 1000.0:.2f}ms "
+					f"total={self._timing_acc['total'] / den * 1000.0:.2f}ms"
+				)
 
 		return {
 			"target_pixel_values": query_inputs["pixel_values"][0],
@@ -442,6 +494,8 @@ def initialize_shifted_dataset_like_unified_siglip_supp(
 	val_split_count: int = VAL_SPLIT_COUNT,
 	max_text_length: int = MAX_TEXT_LENGTH,
 	sat_target_size: Tuple[int, int] = DEFAULT_SAT_TARGET_SIZE,
+	enable_timing_log: bool = DEFAULT_ENABLE_TIMING_LOG,
+	timing_log_interval: int = DEFAULT_TIMING_LOG_INTERVAL,
 ) -> ShiftedSatelliteDroneDataset:
 	"""Initialize dataset with SigLIP processors/tokenizer like unified_siglip_supp.py."""
 	from transformers import AutoImageProcessor, AutoTokenizer
@@ -470,6 +524,8 @@ def initialize_shifted_dataset_like_unified_siglip_supp(
 		val_split_count=val_split_count,
 		max_text_length=max_text_length,
 		sat_target_size=sat_target_size,
+		enable_timing_log=enable_timing_log,
+		timing_log_interval=timing_log_interval,
 	)
 
 

@@ -32,7 +32,7 @@ HEADING_FOLDER = "/data/feihong/range_250"
 NUM_EPOCHS = 8
 BATCH_SIZE = 16
 LEARNING_RATE = 1e-5
-DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 PROJECTION_DIM = 768
 DRONE_SIZE = (256, 256)
 NUM_WORKERS = min(16, os.cpu_count() or 8)
@@ -46,11 +46,23 @@ torch.backends.cudnn.allow_tf32 = True
 
 
 def _set_processor_size(processor, size):
-    # Keep image processor shape aligned with the wide crop used in dataset preprocessing.
+    # For non-native resolutions, we rely on interpolate_pos_encoding in forward.
+    if size is None:
+        return
     if hasattr(processor, "image_processor"):
         processor.image_processor.size = dict(size)
     elif hasattr(processor, "size"):
         processor.size = dict(size)
+
+
+def _get_patch_size(vision_model):
+    patch_size = getattr(vision_model.config, "patch_size", 16)
+    if isinstance(patch_size, (tuple, list)):
+        if len(patch_size) == 2:
+            return int(patch_size[0]), int(patch_size[1])
+        return int(patch_size[0]), int(patch_size[0])
+    patch_size = int(patch_size)
+    return patch_size, patch_size
 
 
 class TargetSearchDataset(Dataset):
@@ -210,20 +222,49 @@ class Encoder(nn.Module):
         )
 
     def ref_forward(self, pixel_values):
-        vision_outputs = self.vision_model(pixel_values)
+        vision_outputs = self.vision_model(
+            pixel_values, interpolate_pos_encoding=True
+        )
         vision_features = vision_outputs.last_hidden_state
 
         B, N, D = vision_features.shape
-        H = W = int(N**0.5)
+        patch_h, patch_w = _get_patch_size(self.vision_model)
+        grid_h = pixel_values.shape[-2] // max(1, patch_h)
+        grid_w = pixel_values.shape[-1] // max(1, patch_w)
 
-        patch_tokens_for_pooling = vision_features.permute(0, 2, 1).reshape(B, D, H, W)
+        if N == grid_h * grid_w:
+            patch_tokens = vision_features
+        elif N - 1 == grid_h * grid_w:
+            patch_tokens = vision_features[:, 1:, :]
+        else:
+            # Fallback for unexpected token layouts.
+            side = int((N) ** 0.5)
+            if side * side == N:
+                grid_h = side
+                grid_w = side
+                patch_tokens = vision_features
+            elif side * side == (N - 1):
+                grid_h = side
+                grid_w = side
+                patch_tokens = vision_features[:, 1:, :]
+            else:
+                raise RuntimeError(
+                    "Unable to infer patch grid size from SigLIP features: "
+                    f"N={N}, expected {grid_h * grid_w} or {grid_h * grid_w + 1}."
+                )
+
+        patch_tokens_for_pooling = patch_tokens.permute(0, 2, 1).reshape(
+            B, D, grid_h, grid_w
+        )
         pooled_features = self.pool(patch_tokens_for_pooling)
         final_features = pooled_features.flatten(2).permute(0, 2, 1)
 
         return final_features
 
     def query_forward(self, pixel_values):
-        pooled_features = self.vision_model(pixel_values).pooler_output
+        pooled_features = self.vision_model(
+            pixel_values, interpolate_pos_encoding=True
+        ).pooler_output
         return pooled_features
 
     def text_forward(self, input_ids, attention_mask=None):

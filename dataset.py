@@ -13,7 +13,7 @@ from torch.utils.data import Dataset
 TRAIN_SATELLITE_ROOT = "/data/feihong/image_1024"
 TEST_SATELLITE_ROOT = "/data2/feihong/image_1024_shifted"
 DRONE_IMAGE_ROOT = "/data2/feihong/drone_img"
-BBOX_FILE = "/data2/feihong/ckpt/shifted_bboxes.json"
+BBOX_FILE = "/data/feihong/ckpt/shifted_bboxes.json"
 TRAIN_MAX_SATELLITE_ID = 1065
 VAL_SPLIT_COUNT = 30
 MAX_TEXT_LENGTH = 64
