@@ -35,6 +35,22 @@ BATCH_SIZE = 16
 LEARNING_RATE = 1e-5
 DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
 PROJECTION_DIM = 768
+NUM_WORKERS = min(16, os.cpu_count() or 8)
+PREFETCH_FACTOR = 4
+PIN_MEMORY = True
+PERSISTENT_WORKERS = True
+USE_AMP = True
+PROCESSOR_IMAGE_SIZE = {"height": 432, "width": 768}
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
+def _set_processor_size(processor, size):
+    # Keep image processor shape aligned with the wide crop used in dataset preprocessing.
+    if hasattr(processor, "image_processor"):
+        processor.image_processor.size = dict(size)
+    elif hasattr(processor, "size"):
+        processor.size = dict(size)
 
 
 class TargetSearchDataset(Dataset):
@@ -257,10 +273,13 @@ def main(save_path):
     print("Loading models and processor...")
     processor = CLIPProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
+    _set_processor_size(processor, PROCESSOR_IMAGE_SIZE)
 
     model = Encoder(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM).to(DEVICE)
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    use_cuda = DEVICE.startswith("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_cuda and USE_AMP)
 
     print("Setting up dataset and dataloader...")
     train_dataset = ShiftedSatelliteDroneDataset(
@@ -270,7 +289,14 @@ def main(save_path):
         split="train",
     )
     train_dataloader = DataLoader(
-        train_dataset, shuffle=True, batch_size=BATCH_SIZE, num_workers=16
+        train_dataset,
+        shuffle=True,
+        batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY and use_cuda,
+        persistent_workers=PERSISTENT_WORKERS and NUM_WORKERS > 0,
+        prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
+        drop_last=True,
     )
 
     test_dataset = ShiftedSatelliteDroneDataset(
@@ -280,7 +306,13 @@ def main(save_path):
         split="val",
     )
     test_dataloader = DataLoader(
-        test_dataset, shuffle=False, batch_size=BATCH_SIZE, num_workers=16
+        test_dataset,
+        shuffle=False,
+        batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY and use_cuda,
+        persistent_workers=PERSISTENT_WORKERS and NUM_WORKERS > 0,
+        prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
     )
 
     print(f"Starting training on {DEVICE} for {NUM_EPOCHS} epochs...")
@@ -291,43 +323,47 @@ def main(save_path):
         progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}")
 
         for i, batch in enumerate(progress_bar):
-            target_pixel_values = batch["target_pixel_values"].to(DEVICE)
-            search_pixel_values = batch["search_pixel_values"].to(DEVICE)
-            input_ids = batch["input_ids"].to(DEVICE)
-            attention_mask = (input_ids != 0).long()
-            local_indices = batch["index"].to(DEVICE)
-
-            anchor_feats = model.query_forward(target_pixel_values)
-            grid_feats = model.ref_forward(search_pixel_values)
-            candidate_feats = grid_feats.reshape(-1, PROJECTION_DIM)
-            text_feats = model.text_forward(input_ids, attention_mask)
-
-            positive_indices = torch.zeros(
-                local_indices.shape[0], local_indices.shape[0] * 9, device=DEVICE
+            target_pixel_values = batch["target_pixel_values"].to(
+                DEVICE, non_blocking=True
             )
-            batch_offsets = torch.arange(local_indices.shape[0], device=DEVICE) * 9
-            row_indices_broad = torch.arange(
-                local_indices.shape[0], device=DEVICE
-            ).unsqueeze(1)
-            col_offsets = torch.arange(9, device=DEVICE).unsqueeze(0)
-            same_image_cols = batch_offsets.unsqueeze(1) + col_offsets
+            search_pixel_values = batch["search_pixel_values"].to(
+                DEVICE, non_blocking=True
+            )
+            input_ids = batch["input_ids"].to(DEVICE, non_blocking=True)
+            attention_mask = (input_ids != 0).long()
+            local_indices = batch["index"].to(DEVICE, non_blocking=True)
 
-            positive_indices[row_indices_broad, same_image_cols] = 0.5
-            global_positive_indices = local_indices + batch_offsets
-            row_indices_flat = torch.arange(local_indices.shape[0], device=DEVICE)
-            positive_indices[row_indices_flat, global_positive_indices] = 0.95
+            with torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
+                anchor_feats = model.query_forward(target_pixel_values)
+                grid_feats = model.ref_forward(search_pixel_values)
+                candidate_feats = grid_feats.reshape(-1, PROJECTION_DIM)
+                text_feats = model.text_forward(input_ids, attention_mask)
 
-            # combined_query_feats = model.forward_fusion(anchor_feats, text_feats)
-            # img_text_loss = info_nce_loss(combined_query_feats, candidate_feats, positive_indices)
-            img_loss = info_nce_loss(anchor_feats+text_feats, candidate_feats, positive_indices)
-            text_loss = info_nce_loss(text_feats, candidate_feats, positive_indices)
-            loss = img_loss + text_loss
+                positive_indices = torch.zeros(
+                    local_indices.shape[0], local_indices.shape[0] * 9, device=DEVICE
+                )
+                batch_offsets = torch.arange(local_indices.shape[0], device=DEVICE) * 9
+                row_indices_broad = torch.arange(
+                    local_indices.shape[0], device=DEVICE
+                ).unsqueeze(1)
+                col_offsets = torch.arange(9, device=DEVICE).unsqueeze(0)
+                same_image_cols = batch_offsets.unsqueeze(1) + col_offsets
 
-            # loss = img_text_loss
+                positive_indices[row_indices_broad, same_image_cols] = 0.5
+                global_positive_indices = local_indices + batch_offsets
+                row_indices_flat = torch.arange(local_indices.shape[0], device=DEVICE)
+                positive_indices[row_indices_flat, global_positive_indices] = 0.95
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                img_loss = info_nce_loss(
+                    anchor_feats + text_feats, candidate_feats, positive_indices
+                )
+                text_loss = info_nce_loss(text_feats, candidate_feats, positive_indices)
+                loss = img_loss + text_loss
+
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             total_loss += loss.item()
             progress_bar.set_postfix({"img_text_loss": f"{loss.item():.4f}"})
@@ -365,17 +401,18 @@ def validation(model, loader, epoch):
     progress_bar = tqdm(loader, desc=f"Valid {epoch + 1}/{NUM_EPOCHS}")
     total_loss = 0
     txt_total = 0
+    use_cuda = DEVICE.startswith("cuda")
     for batch in progress_bar:
-        target_pixel_values = batch["target_pixel_values"].to(DEVICE)
-        search_pixel_values = batch["search_pixel_values"].to(DEVICE)
-        input_ids = batch["input_ids"].to(DEVICE)
+        target_pixel_values = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
+        search_pixel_values = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
+        input_ids = batch["input_ids"].to(DEVICE, non_blocking=True)
         attention_mask = (input_ids != 0).long()
-        local_indices = batch["index"].to(DEVICE)
+        local_indices = batch["index"].to(DEVICE, non_blocking=True)
 
         batch_offsets = torch.arange(local_indices.shape[0], device=DEVICE) * 9
         positive_indices = local_indices + batch_offsets
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
             anchor_feats = model.query_forward(target_pixel_values)
             grid_feats = model.ref_forward(search_pixel_values)
             text_feats = model.text_forward(input_ids, attention_mask)
@@ -400,8 +437,10 @@ def extract_eval_features(
     gallery_feat_path="eval_clip_gallery_feats.pt",
 ):
     print("Stage 1/2: extracting and saving query/gallery features...")
+    use_cuda = DEVICE.startswith("cuda")
     processor = CLIPProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
+    _set_processor_size(processor, PROCESSOR_IMAGE_SIZE)
 
     test_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
@@ -413,8 +452,10 @@ def extract_eval_features(
         test_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY and use_cuda,
+        persistent_workers=PERSISTENT_WORKERS and NUM_WORKERS > 0,
+        prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
     )
 
     encoder = Encoder(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM).to(DEVICE)
@@ -438,9 +479,10 @@ def extract_eval_features(
             attention_mask = (input_ids != 0).long()
             satellite_paths = batch["satellite_path"]
 
-            anchor_feats = encoder.query_forward(query_inputs)
-            text_feats = encoder.text_forward(input_ids, attention_mask)
-            fused_query_feats = F.normalize(anchor_feats + text_feats, p=2, dim=1)
+            with torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
+                anchor_feats = encoder.query_forward(query_inputs)
+                text_feats = encoder.text_forward(input_ids, attention_mask)
+                fused_query_feats = F.normalize(anchor_feats + text_feats, p=2, dim=1)
             query_feats_list.append(fused_query_feats.cpu())
 
             batch_labels = [os.path.splitext(os.path.basename(path))[0] for path in satellite_paths]
@@ -457,8 +499,10 @@ def extract_eval_features(
 
             if unseen_indices:
                 gallery_batch = search_inputs[unseen_indices]
-                gallery_grid = encoder.ref_forward(gallery_batch)
-                gallery_grid = F.normalize(gallery_grid, p=2, dim=2).cpu()
+                with torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
+                    gallery_grid = encoder.ref_forward(gallery_batch)
+                    gallery_grid = F.normalize(gallery_grid, p=2, dim=2)
+                gallery_grid = gallery_grid.cpu()
                 for i, label in enumerate(unseen_labels):
                     gallery_feat_dict[label] = gallery_grid[i]
 

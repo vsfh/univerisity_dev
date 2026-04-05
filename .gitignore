@@ -210,3 +210,4 @@ runs/
 *.jpg
 *.png
 *.npz
+*.pt

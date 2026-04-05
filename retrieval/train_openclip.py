@@ -37,6 +37,9 @@ DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 PROJECTION_DIM = 768
 NUM_WORKERS = 8
 PREFETCH_FACTOR = 4
+PIN_MEMORY = True
+PERSISTENT_WORKERS = True
+USE_AMP = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -44,7 +47,7 @@ torch.backends.cudnn.allow_tf32 = True
 class OpenClipImageProcessorWrapper:
     def __init__(self, preprocess):
         self.preprocess = preprocess
-        self.size = {"height": 640, "width": 640}
+        self.size = {"height": 432, "width": 768}
 
     def __call__(self, images, return_tensors="pt"):
         pixel_values = self.preprocess(images)
@@ -298,6 +301,8 @@ def main(save_path):
     ).to(DEVICE)
     encoder.train()
     optimizer = torch.optim.AdamW(encoder.parameters(), lr=LEARNING_RATE)
+    use_cuda = DEVICE.startswith("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_cuda and USE_AMP)
 
     print("Setting up dataset and dataloader...")
     train_dataset = ShiftedSatelliteDroneDataset(
@@ -311,9 +316,10 @@ def main(save_path):
         shuffle=True,
         batch_size=BATCH_SIZE,
         num_workers=NUM_WORKERS,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=PREFETCH_FACTOR,
+        pin_memory=PIN_MEMORY and use_cuda,
+        persistent_workers=PERSISTENT_WORKERS and NUM_WORKERS > 0,
+        prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
+        drop_last=True,
     )
 
     test_dataset = ShiftedSatelliteDroneDataset(
@@ -327,9 +333,9 @@ def main(save_path):
         shuffle=False,
         batch_size=BATCH_SIZE,
         num_workers=NUM_WORKERS,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=PREFETCH_FACTOR,
+        pin_memory=PIN_MEMORY and use_cuda,
+        persistent_workers=PERSISTENT_WORKERS and NUM_WORKERS > 0,
+        prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
     )
 
     print(f"Starting training on {DEVICE} for {NUM_EPOCHS} epochs...")
@@ -350,38 +356,39 @@ def main(save_path):
             )
             input_ids = batch["input_ids"].to(DEVICE, non_blocking=True)
             attention_mask = (input_ids != 0).long()
-            local_indices = batch["index"].to(DEVICE)
+            local_indices = batch["index"].to(DEVICE, non_blocking=True)
 
-            anchor_feats = encoder.query_forward(target_pixel_values)
-            grid_feats = encoder.ref_forward(search_pixel_values)
-            candidate_feats = grid_feats.reshape(-1, PROJECTION_DIM)
-            text_feats = encoder.text_forward(input_ids, attention_mask)
+            with torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
+                anchor_feats = encoder.query_forward(target_pixel_values)
+                grid_feats = encoder.ref_forward(search_pixel_values)
+                candidate_feats = grid_feats.reshape(-1, PROJECTION_DIM)
+                text_feats = encoder.text_forward(input_ids, attention_mask)
 
-            positive_indices = torch.zeros(
-                local_indices.shape[0], local_indices.shape[0] * 9, device=DEVICE
-            )
-            batch_offsets = torch.arange(local_indices.shape[0], device=DEVICE) * 9
-            row_indices_broad = torch.arange(
-                local_indices.shape[0], device=DEVICE
-            ).unsqueeze(1)
-            col_offsets = torch.arange(9, device=DEVICE).unsqueeze(0)
-            same_image_cols = batch_offsets.unsqueeze(1) + col_offsets
+                positive_indices = torch.zeros(
+                    local_indices.shape[0], local_indices.shape[0] * 9, device=DEVICE
+                )
+                batch_offsets = torch.arange(local_indices.shape[0], device=DEVICE) * 9
+                row_indices_broad = torch.arange(
+                    local_indices.shape[0], device=DEVICE
+                ).unsqueeze(1)
+                col_offsets = torch.arange(9, device=DEVICE).unsqueeze(0)
+                same_image_cols = batch_offsets.unsqueeze(1) + col_offsets
 
-            positive_indices[row_indices_broad, same_image_cols] = 0.5
-            global_positive_indices = local_indices + batch_offsets
-            row_indices_flat = torch.arange(local_indices.shape[0], device=DEVICE)
-            positive_indices[row_indices_flat, global_positive_indices] = 0.95
+                positive_indices[row_indices_broad, same_image_cols] = 0.5
+                global_positive_indices = local_indices + batch_offsets
+                row_indices_flat = torch.arange(local_indices.shape[0], device=DEVICE)
+                positive_indices[row_indices_flat, global_positive_indices] = 0.95
 
-            # combined_query_feats = encoder.forward_fusion(anchor_feats, text_feats)
-            img_text_loss = info_nce_loss(
-                anchor_feats, candidate_feats, positive_indices
-            ) + info_nce_loss(text_feats, candidate_feats, positive_indices)
+                img_text_loss = info_nce_loss(
+                    anchor_feats, candidate_feats, positive_indices
+                ) + info_nce_loss(text_feats, candidate_feats, positive_indices)
 
-            loss = img_text_loss
+                loss = img_text_loss
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             total_loss += loss.item()
             progress_bar.set_postfix({"img_text_loss": f"{img_text_loss.item():.4f}"})
@@ -422,17 +429,18 @@ def validation(model, loader, epoch):
     progress_bar = tqdm(loader, desc=f"Valid {epoch + 1}/{NUM_EPOCHS}")
     total_loss = 0
     txt_total = 0
+    use_cuda = DEVICE.startswith("cuda")
     for batch in progress_bar:
         target_pixel_values = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
         search_pixel_values = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
         input_ids = batch["input_ids"].to(DEVICE, non_blocking=True)
         attention_mask = (input_ids != 0).long()
-        local_indices = batch["index"].to(DEVICE)
+        local_indices = batch["index"].to(DEVICE, non_blocking=True)
 
         batch_offsets = torch.arange(local_indices.shape[0], device=DEVICE) * 9
         positive_indices = local_indices + batch_offsets
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
             anchor_feats = model.query_forward(target_pixel_values)
             grid_feats = model.ref_forward(search_pixel_values)
             text_feats = model.text_forward(input_ids, attention_mask)
@@ -452,6 +460,8 @@ def validation(model, loader, epoch):
 
 
 def eval(run=False):
+    use_cuda = DEVICE.startswith("cuda")
+
     def calcu_cos(a, b):
         a_norm = a / np.linalg.norm(a)
         b_norm = b / np.linalg.norm(b, axis=1, keepdims=True)
@@ -553,8 +563,10 @@ def eval(run=False):
             dataset,
             batch_size=BATCH_SIZE,
             shuffle=False,
-            num_workers=8,
-            pin_memory=True,
+            num_workers=NUM_WORKERS,
+            pin_memory=PIN_MEMORY and use_cuda,
+            persistent_workers=PERSISTENT_WORKERS and NUM_WORKERS > 0,
+            prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
             collate_fn=collate_fn,
         )
 
@@ -562,7 +574,7 @@ def eval(run=False):
         res_fused_query = {}
 
         print(f"Starting batched inference on {len(dataset)} items...")
-        with torch.inference_mode(), torch.amp.autocast("cuda"):
+        with torch.inference_mode(), torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
             for batch in tqdm(loader):
                 if batch is None:
                     continue
@@ -607,10 +619,12 @@ def eval(run=False):
 
 
         for i in range(0, len(satellite_batch), BATCH_SIZE):
-            batch_pixels = torch.stack(satellite_batch[i : i + BATCH_SIZE]).to(DEVICE)
+            batch_pixels = torch.stack(satellite_batch[i : i + BATCH_SIZE]).to(
+                DEVICE, non_blocking=True
+            )
             batch_names = satellite_names[i : i + BATCH_SIZE]
 
-            with torch.inference_mode(), torch.amp.autocast("cuda"):
+            with torch.inference_mode(), torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
                 grid_feats = encoder.ref_forward(batch_pixels)
 
             grid_feats_np = grid_feats.float().cpu().numpy()
