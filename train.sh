@@ -3,11 +3,11 @@
 
 cd /data/feihong/univerisity_dev
 
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,1,2
 
 accelerate launch \
     --multi_gpu \
-    --num_processes 2 \
+    --num_processes 3 \
     --mixed_precision fp16 \
     --gradient_accumulation_steps 4 \
     unified_siglip_supp.py

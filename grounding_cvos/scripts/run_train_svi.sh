@@ -1,0 +1,1 @@
+python train.py --emb_size 768 --img_size 1024 --max_epoch 25 --data_root /data/feihong/CVOGL --seg_root /data/feihong/CVOGL-Seg --data_name CVOGL_SVI --beta 1.0 --savename model_svi --gpu 0,1 --batch_size 12 --num_workers 8 --print_freq 50

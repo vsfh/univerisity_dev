@@ -11,9 +11,9 @@ from torch.utils.data import Dataset
 
 # --- Configuration ---
 TRAIN_SATELLITE_ROOT = "/data/feihong/image_1024"
-TEST_SATELLITE_ROOT = "/data/feihong/image_1024_shifted"
-DRONE_IMAGE_ROOT = "/data/feihong/drone_img"
-BBOX_FILE = "/data/feihong/ckpt/shifted_bboxes.json"
+TEST_SATELLITE_ROOT = "/data2/feihong/image_1024_shifted"
+DRONE_IMAGE_ROOT = "/data2/feihong/drone_img"
+BBOX_FILE = "/data2/feihong/ckpt/shifted_bboxes.json"
 TRAIN_MAX_SATELLITE_ID = 1065
 VAL_SPLIT_COUNT = 30
 MAX_TEXT_LENGTH = 64
@@ -339,7 +339,7 @@ class ShiftedSatelliteDroneDataset(Dataset):
 
 			sat_bbox_dict: Dict[str, List[float]] = {}
 			if self.split in {"val", "test"}:
-				sat_bbox_dict = self.bbox_dict.get(sat_id+'.png', {})
+				sat_bbox_dict = self.bbox_dict.get(sat_id, {})
 				if not isinstance(sat_bbox_dict, dict):
 					continue
 

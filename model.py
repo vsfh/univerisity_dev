@@ -636,21 +636,21 @@ class Encoder_abla(nn.Module):
             nn.GELU(),
             nn.Linear(self.feature_dim, self.feature_dim),
         )
-        self.bbox_heading = nn.Sequential(
-            nn.ConvTranspose2d(
-                in_channels=self.feature_dim,
-                out_channels=self.feature_dim // 2,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.ReLU(inplace=True),
-            ResidualBlock(self.feature_dim // 2),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(self.feature_dim // 2, 2),
-        )
-        self.scorer = ScoreHead(embed_dim=self.feature_dim, num_heads=12)
+        # self.bbox_heading = nn.Sequential(
+        #     nn.ConvTranspose2d(
+        #         in_channels=self.feature_dim,
+        #         out_channels=self.feature_dim // 2,
+        #         kernel_size=4,
+        #         stride=2,
+        #         padding=1,
+        #     ),
+        #     nn.ReLU(inplace=True),
+        #     ResidualBlock(self.feature_dim // 2),
+        #     nn.AdaptiveAvgPool2d((1, 1)),
+        #     nn.Flatten(),
+        #     nn.Linear(self.feature_dim // 2, 2),
+        # )
+        # self.scorer = ScoreHead(embed_dim=self.feature_dim, num_heads=12)
 
     def text_forward(self, input_ids, attention_mask=None):
         text_outputs = self.text_model(
@@ -695,7 +695,7 @@ class Encoder_abla(nn.Module):
         )
 
         pred_anchor = self.bbox_fcn_out(fused_features)
-        pred_heading = torch.sigmoid(self.bbox_heading(fused_features))
+        # pred_heading = torch.sigmoid(self.bbox_heading(fused_features))
 
         # if self.useap:
         #     sat_feature_2d_pool = (
@@ -715,7 +715,7 @@ class Encoder_abla(nn.Module):
 
         return (
             pred_anchor,
-            pred_heading,
+            None,
             text_feats,
             anchor_pooler,
             sat_feature_2d_pool,

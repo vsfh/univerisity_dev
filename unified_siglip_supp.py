@@ -3,6 +3,7 @@ import os
 import json
 import random
 import time
+from contextlib import nullcontext
 from glob import glob
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -33,6 +34,8 @@ from bbox.yolo_utils import (
 from dataset import ShiftedSatelliteDroneDataset
 
 cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 
 # --- Configuration ---
@@ -51,18 +54,29 @@ class Config:
     SATELLITE_FOLDER = "/data/feihong/asian_univ"
 
     SAT_ORIG_SIZE = (3840, 2160)
-    UNIV_SAT_SIZE = (640, 640)
+    UNIV_SAT_SIZE = (768, 432)
     DRONE_SIZE = (256, 256)
 
-    NUM_EPOCHS = 60
-    BATCH_SIZE = 4
+    NUM_EPOCHS = 20
+    BATCH_SIZE = 8
     GRAD_ACCUMULATION_STEPS = 2
     LEARNING_RATE = 5e-5
     LR_MIN = 1e-10
-    COSINE_EPOCHS = 60
+    COSINE_EPOCHS = 20
     BBOX_LOSS_WEIGHT = 0.1
     HEADING_LOSS_WEIGHT = 0.01
     PROJECTION_DIM = 768
+
+    NUM_WORKERS_TRAIN = 8
+    NUM_WORKERS_VAL = 4
+    NUM_WORKERS_EVAL = 8
+    PIN_MEMORY = True
+    PERSISTENT_WORKERS = True
+    PREFETCH_FACTOR = 4
+    DROP_LAST_TRAIN = True
+
+    USE_AMP = True
+    ENABLE_TF32 = True
 
     HEADING_TO_TARGET = {
         0: [0.0, 0.0],
@@ -92,6 +106,18 @@ class AverageMeter:
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+
+
+def build_dataloader_kwargs(num_workers: int, drop_last: bool = False) -> Dict:
+    kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": Config.PIN_MEMORY,
+        "drop_last": drop_last,
+        "persistent_workers": Config.PERSISTENT_WORKERS and num_workers > 0,
+    }
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = Config.PREFETCH_FACTOR
+    return kwargs
 
 
 def get_loss_weights(
@@ -137,13 +163,15 @@ def format_satellite_img_bbox(
     bottom = top + crop_size
 
     image = image.crop((left, top, right, bottom))
-    ratio = image.size[0] / target_size[0]
+    crop_w, crop_h = image.size
+    target_w, target_h = target_size
     image = image.resize(target_size)
 
-    new_x1 = (x1 - left) / ratio
-    new_y1 = (y1 - top) / ratio
-    new_x2 = (x2 - left) / ratio
-    new_y2 = (y2 - top) / ratio
+    # x and y require separate scales when target width != target height.
+    new_x1 = (x1 - left) * (target_w / crop_w)
+    new_y1 = (y1 - top) * (target_h / crop_h)
+    new_x2 = (x2 - left) * (target_w / crop_w)
+    new_y2 = (y2 - top) * (target_h / crop_h)
 
     return image, [new_x1, new_y1, new_x2, new_y2]
 
@@ -158,11 +186,13 @@ def visualize_batch(
     batch: Dict, save_dir: str = "runs/visualizations", max_samples: int = 6
 ) -> None:
     import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
 
     os.makedirs(save_dir, exist_ok=True)
 
     target_pixels = batch["target_pixel_values"]
     search_pixels = batch["search_pixel_values"]
+    bboxes = batch.get("bbox", None)
     names = batch.get("name", [f"sample_{i}" for i in range(target_pixels.shape[0])])
 
     for i in range(min(target_pixels.shape[0], max_samples)):
@@ -183,6 +213,33 @@ def visualize_batch(
 
         axes[1].imshow(search_img)
         axes[1].set_title("Search (Satellite View)", fontsize=12)
+
+        if bboxes is not None:
+            bbox = bboxes[i].detach().cpu().float().tolist()
+            x1, y1, x2, y2 = bbox
+
+            h, w = search_img.shape[0], search_img.shape[1]
+            sx = w / float(Config.UNIV_SAT_SIZE[0])
+            sy = h / float(Config.UNIV_SAT_SIZE[1])
+
+            x1, x2 = x1 * sx, x2 * sx
+            y1, y2 = y1 * sy, y2 * sy
+
+            x1 = max(0.0, min(x1, w - 1))
+            y1 = max(0.0, min(y1, h - 1))
+            x2 = max(0.0, min(x2, w - 1))
+            y2 = max(0.0, min(y2, h - 1))
+
+            rect = patches.Rectangle(
+                (x1, y1),
+                max(1.0, x2 - x1),
+                max(1.0, y2 - y1),
+                linewidth=2,
+                edgecolor="lime",
+                facecolor="none",
+            )
+            axes[1].add_patch(rect)
+
         axes[1].axis("off")
 
         plt.tight_layout()
@@ -272,7 +329,7 @@ class GeoDataset(Dataset):
             (normalized_bbox[0] + normalized_bbox[2]) / 2 / Config.UNIV_SAT_SIZE[0]
         )
         center_y = (
-            (normalized_bbox[1] + normalized_bbox[3]) / 2 / Config.UNIV_SAT_SIZE[0]
+            (normalized_bbox[1] + normalized_bbox[3]) / 2 / Config.UNIV_SAT_SIZE[1]
         )
 
         col_idx = min(int(center_x * 3), 2)
@@ -325,24 +382,31 @@ def validate(
     model: nn.Module,
     accelerator: Accelerator,
     anchors_full: torch.Tensor,
-    img_size: int,
+    img_size: Tuple[int, int],
     useap: bool = True,
 ) -> Tuple[float, float, float, float]:
     model.eval()
 
-    accu50_meter = AverageMeter()
-    accu25_meter = AverageMeter()
-    iou_meter = AverageMeter()
-    info_nce_meter = AverageMeter()
+    accu50_sum = torch.tensor(0.0, device=accelerator.device)
+    accu25_sum = torch.tensor(0.0, device=accelerator.device)
+    iou_sum = torch.tensor(0.0, device=accelerator.device)
+    info_nce_sum = torch.tensor(0.0, device=accelerator.device)
+    sample_count = torch.tensor(0.0, device=accelerator.device)
 
-    for batch in tqdm(loader, desc="Validating"):
-        query_imgs = batch["target_pixel_values"]
-        rs_imgs = batch["search_pixel_values"]
-        ori_gt_bbox = batch["bbox"]
-        input_ids = batch["input_ids"]
-        local_indices = batch["index"]
+    amp_enabled = Config.USE_AMP and accelerator.device.type == "cuda"
 
-        with torch.no_grad():
+    for batch in tqdm(loader, desc="Validating", disable=not accelerator.is_main_process):
+        query_imgs = batch["target_pixel_values"].to(
+            accelerator.device, non_blocking=True
+        )
+        rs_imgs = batch["search_pixel_values"].to(
+            accelerator.device, non_blocking=True
+        )
+        ori_gt_bbox = batch["bbox"].to(accelerator.device, non_blocking=True)
+        input_ids = batch["input_ids"].to(accelerator.device, non_blocking=True)
+        local_indices = batch["index"].to(accelerator.device, non_blocking=True)
+
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
             (
                 pred_anchor,
                 _,
@@ -358,7 +422,10 @@ def validate(
         )
 
         _, best_anchor_gi_gj = build_target(
-            ori_gt_bbox, anchors_full, img_size, pred_anchor.shape[3]
+            ori_gt_bbox,
+            anchors_full,
+            (Config.UNIV_SAT_SIZE[0], Config.UNIV_SAT_SIZE[1]),
+            (pred_anchor.shape[4], pred_anchor.shape[3]),
         )
 
         accu_list, accu_center, iou, _, _, _ = eval_iou_acc(
@@ -396,16 +463,24 @@ def validate(
             scores = model.scorer(fused_feats, candidate_feats)
             img_text_loss = F.cross_entropy(scores, positive_indices)
 
-        accu50_meter.update(accu_list[0].item(), query_imgs.shape[0])
-        accu25_meter.update(accu_list[1].item(), query_imgs.shape[0])
-        iou_meter.update(iou.item(), query_imgs.shape[0])
-        info_nce_meter.update(img_text_loss.item(), query_imgs.shape[0])
+        batch_n = torch.tensor(float(query_imgs.shape[0]), device=accelerator.device)
+        accu50_sum += accu_list[0].detach() * batch_n
+        accu25_sum += accu_list[1].detach() * batch_n
+        iou_sum += iou.detach() * batch_n
+        info_nce_sum += img_text_loss.detach() * batch_n
+        sample_count += batch_n
+
+    reduced = accelerator.reduce(
+        torch.stack([accu50_sum, accu25_sum, iou_sum, info_nce_sum, sample_count]),
+        reduction="sum",
+    )
+    denom = reduced[4].clamp(min=1.0)
 
     return (
-        accu50_meter.avg,
-        accu25_meter.avg,
-        iou_meter.avg,
-        info_nce_meter.avg,
+        (reduced[0] / denom).item(),
+        (reduced[1] / denom).item(),
+        (reduced[2] / denom).item(),
+        (reduced[3] / denom).item(),
     )
 
 
@@ -436,15 +511,22 @@ def load_data_splits() -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], se
 
 
 def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
-        mixed_precision="fp16",
+        mixed_precision="no",
         gradient_accumulation_steps=Config.GRAD_ACCUMULATION_STEPS,
         kwargs_handlers=[ddp_kwargs],
     )
 
+    if accelerator.is_main_process:
+        torch.backends.cuda.matmul.allow_tf32 = Config.ENABLE_TF32
+        torch.backends.cudnn.allow_tf32 = Config.ENABLE_TF32
+
     exp_name = save_path.split("/")[-1] if save_path else "default_exp"
-    writer = SummaryWriter(f"runs/{exp_name}")
+    writer = SummaryWriter(f"runs/{exp_name}") if accelerator.is_main_process else None
+    scaler = torch.amp.GradScaler(
+        "cuda", enabled=Config.USE_AMP and accelerator.device.type == "cuda"
+    )
 
     clearml_task = None
     clearml_logger = None
@@ -460,7 +542,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
             f"Config: batch_size={Config.BATCH_SIZE}, lr={Config.LEARNING_RATE}, epochs={Config.NUM_EPOCHS}"
         )
 
-    print("Loading models and processor...")
+    accelerator.print("Loading models and processor...")
     processor = AutoImageProcessor.from_pretrained(
         Config.MODEL_NAME, cache_dir=Config.CACHE_DIR
     )
@@ -483,7 +565,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 
     anchors_full = get_tensor_anchors(accelerator.device)
 
-    print("Setting up dataset and dataloader...")
+    accelerator.print("Setting up dataset and dataloader...")
     train_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
         processor_sat=processor_sat,
@@ -494,8 +576,9 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         train_dataset,
         shuffle=True,
         batch_size=Config.BATCH_SIZE,
-        num_workers=8,
-        pin_memory=True,
+        **build_dataloader_kwargs(
+            Config.NUM_WORKERS_TRAIN, drop_last=Config.DROP_LAST_TRAIN
+        ),
     )
 
     test_dataset = ShiftedSatelliteDroneDataset(
@@ -508,10 +591,9 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         test_dataset,
         shuffle=False,
         batch_size=Config.BATCH_SIZE,
-        num_workers=4,
-        pin_memory=True,
+        **build_dataloader_kwargs(Config.NUM_WORKERS_VAL),
     )
-    print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")
+    accelerator.print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")
 
     optimizer = AdamW(model.parameters(), lr=Config.LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -528,91 +610,101 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     soft_label = 0.5
     max_iou = 0
     min_info = 1000
+    amp_enabled = Config.USE_AMP and accelerator.device.type == "cuda"
 
     for epoch in range(Config.NUM_EPOCHS):
         model.train()
         total_loss = 0
         total_bbox_loss = 0
         progress_bar = tqdm(
-            train_dataloader, desc=f"Epoch {epoch + 1}/{Config.NUM_EPOCHS}"
+            train_dataloader,
+            desc=f"Epoch {epoch + 1}/{Config.NUM_EPOCHS}",
+            disable=not accelerator.is_main_process,
         )
 
         for i, batch in enumerate(progress_bar):
             with accelerator.accumulate(model):
-                target_pixel_values = batch["target_pixel_values"]
-                search_pixel_values = batch["search_pixel_values"]
-                input_ids = batch["input_ids"]
-                local_indices = batch["index"]
-                target_bbox = batch["bbox"]
-
-                (
-                    pred_anchor,
-                    _,
-                    text_feats,
-                    anchor_feats,
-                    grid_feats,
-                    fused_feats,
-                ) = model(target_pixel_values, search_pixel_values, input_ids)
-
-                B = pred_anchor.shape[0]
-                pred_anchor = pred_anchor.view(
-                    B, 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
+                target_pixel_values = batch["target_pixel_values"].to(
+                    accelerator.device, non_blocking=True
                 )
-
-                new_gt_bbox, best_anchor_gi_gj = build_target(
-                    target_bbox,
-                    anchors_full,
-                    Config.UNIV_SAT_SIZE[0],
-                    pred_anchor.shape[3],
+                search_pixel_values = batch["search_pixel_values"].to(
+                    accelerator.device, non_blocking=True
                 )
-
-                loss_geo, loss_cls = yolo_loss(
-                    pred_anchor,
-                    new_gt_bbox,
-                    anchors_full,
-                    best_anchor_gi_gj,
-                    Config.UNIV_SAT_SIZE[0],
+                input_ids = batch["input_ids"].to(
+                    accelerator.device, non_blocking=True
                 )
-                bbox_loss = loss_geo + loss_cls
+                local_indices = batch["index"].to(
+                    accelerator.device, non_blocking=True
+                )
+                target_bbox = batch["bbox"].to(accelerator.device, non_blocking=True)
 
-                candidate_feats = grid_feats.reshape(-1, Config.PROJECTION_DIM)
-                positive_indices = torch.zeros(B, B * 9, device=accelerator.device)
+                with torch.amp.autocast("cuda", enabled=amp_enabled):
+                    (
+                        pred_anchor,
+                        _,
+                        text_feats,
+                        anchor_feats,
+                        grid_feats,
+                        fused_feats,
+                    ) = model(target_pixel_values, search_pixel_values, input_ids)
 
-                batch_offsets = torch.arange(B, device=accelerator.device) * 9
-                row_indices_broad = torch.arange(
-                    B, device=accelerator.device
-                ).unsqueeze(1)
-                col_offsets = torch.arange(9, device=accelerator.device).unsqueeze(0)
-
-                same_image_cols = batch_offsets.unsqueeze(1) + col_offsets
-                positive_indices[row_indices_broad, same_image_cols] = soft_label
-
-                global_positive_indices = local_indices + batch_offsets
-                row_indices_flat = torch.arange(B, device=accelerator.device)
-                positive_indices[row_indices_flat, global_positive_indices] = 0.95
-
-                if use_ap:
-                    img_text_loss = 0.7 * info_nce_loss(
-                        fused_feats, candidate_feats, positive_indices
+                    B = pred_anchor.shape[0]
+                    pred_anchor = pred_anchor.view(
+                        B, 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
                     )
-                    img_text_loss += 0.3 * info_nce_loss(
-                        anchor_feats, candidate_feats, positive_indices
+
+                    new_gt_bbox, best_anchor_gi_gj = build_target(
+                        target_bbox,
+                        anchors_full,
+                        (Config.UNIV_SAT_SIZE[0], Config.UNIV_SAT_SIZE[1]),
+                        (pred_anchor.shape[4], pred_anchor.shape[3]),
                     )
-                else:
-                    scores = model.scorer(fused_feats, candidate_feats)
-                    img_text_loss = F.cross_entropy(scores, positive_indices)
 
-                bbox_weight, retrieval_weight = get_loss_weights(
-                    epoch, Config.COSINE_EPOCHS, end_num
-                )
-                loss = (
-                    retrieval_weight * img_text_loss
-                    + bbox_weight * bbox_loss
-                )
+                    loss_geo, loss_cls = yolo_loss(
+                        pred_anchor,
+                        new_gt_bbox,
+                        anchors_full,
+                        best_anchor_gi_gj,
+                        (Config.UNIV_SAT_SIZE[0], Config.UNIV_SAT_SIZE[1]),
+                    )
+                    bbox_loss = loss_geo + loss_cls
 
-                accelerator.backward(loss)
-                optimizer.step()
-                optimizer.zero_grad()
+                    candidate_feats = grid_feats.reshape(-1, Config.PROJECTION_DIM)
+                    positive_indices = torch.zeros(B, B * 9, device=accelerator.device)
+
+                    batch_offsets = torch.arange(B, device=accelerator.device) * 9
+                    row_indices_broad = torch.arange(
+                        B, device=accelerator.device
+                    ).unsqueeze(1)
+                    col_offsets = torch.arange(9, device=accelerator.device).unsqueeze(0)
+
+                    same_image_cols = batch_offsets.unsqueeze(1) + col_offsets
+                    positive_indices[row_indices_broad, same_image_cols] = soft_label
+
+                    global_positive_indices = local_indices + batch_offsets
+                    row_indices_flat = torch.arange(B, device=accelerator.device)
+                    positive_indices[row_indices_flat, global_positive_indices] = 0.95
+
+                    if use_ap:
+                        img_text_loss = 0.7 * info_nce_loss(
+                            fused_feats, candidate_feats, positive_indices
+                        )
+                        img_text_loss += 0.3 * info_nce_loss(
+                            anchor_feats, candidate_feats, positive_indices
+                        )
+                    else:
+                        scores = model.scorer(fused_feats, candidate_feats)
+                        img_text_loss = F.cross_entropy(scores, positive_indices)
+
+                    bbox_weight, retrieval_weight = get_loss_weights(
+                        epoch, Config.COSINE_EPOCHS, end_num
+                    )
+                    loss = retrieval_weight * img_text_loss + bbox_weight * bbox_loss
+
+                optimizer.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
             total_loss += loss.item()
             total_bbox_loss += bbox_loss.item()
@@ -637,34 +729,35 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 
         scheduler.step()
 
-        if (epoch + 1) % 10 == 0 and accelerator.is_main_process:
+        if (epoch + 1) % 10 == 0:
             accelerator.print(f"Running validation at epoch {epoch + 1}...")
             accu50, accu25, iou, info_nce = validate(
                 test_dataloader,
                 model,
                 accelerator,
                 anchors_full,
-                Config.UNIV_SAT_SIZE[0],
+                (Config.UNIV_SAT_SIZE[0], Config.UNIV_SAT_SIZE[1]),
                 useap=use_ap,
             )
-            accelerator.print(
-                f"Val Epoch {epoch + 1}: Accu@50={accu50:.4f}, Accu@25={accu25:.4f}, IoU={iou:.4f}, "
-                f"InfoNCE={info_nce:.4f}"
-            )
-            
-            if clearml_logger is not None:
-                clearml_logger.report_scalar("validation", "accu50", accu50, epoch)
-                clearml_logger.report_scalar("validation", "accu25", accu25, epoch)
-                clearml_logger.report_scalar("validation", "iou", iou, epoch)
-                clearml_logger.report_scalar("validation", "info_nce", info_nce, epoch)
+            if accelerator.is_main_process:
+                accelerator.print(
+                    f"Val Epoch {epoch + 1}: Accu@50={accu50:.4f}, Accu@25={accu25:.4f}, IoU={iou:.4f}, "
+                    f"InfoNCE={info_nce:.4f}"
+                )
 
-            if iou > max_iou:
-                max_iou = iou
-                os.makedirs(save_path, exist_ok=True)
-                unwrapped_model = accelerator.unwrap_model(model)
-                save_filename = f"{save_path}/best_iou.pth"
-                accelerator.save(unwrapped_model.state_dict(), save_filename)
-                accelerator.print(f"Saved best IoU checkpoint: {save_filename}")
+                if clearml_logger is not None:
+                    clearml_logger.report_scalar("validation", "accu50", accu50, epoch)
+                    clearml_logger.report_scalar("validation", "accu25", accu25, epoch)
+                    clearml_logger.report_scalar("validation", "iou", iou, epoch)
+                    clearml_logger.report_scalar("validation", "info_nce", info_nce, epoch)
+
+                if iou > max_iou:
+                    max_iou = iou
+                    os.makedirs(save_path, exist_ok=True)
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    save_filename = f"{save_path}/best_iou.pth"
+                    accelerator.save(unwrapped_model.state_dict(), save_filename)
+                    accelerator.print(f"Saved best IoU checkpoint: {save_filename}")
 
         if clearml_logger is not None:
             current_lr = optimizer.param_groups[0]["lr"]
@@ -679,7 +772,8 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         print(f"Saved checkpoint: {save_filename}")
         if clearml_task is not None:
             clearml_task.close()
-    writer.close()
+    if writer is not None:
+        writer.close()
 
 
 # --- Evaluation ---
@@ -728,8 +822,9 @@ def extract_features(
     model.eval()
     res_search = {}
     res_fused_query = {}
+    amp_enabled = Config.USE_AMP and str(device).startswith("cuda")
 
-    with torch.inference_mode(), torch.amp.autocast("cuda", enabled=True):
+    with torch.inference_mode(), torch.amp.autocast("cuda", enabled=amp_enabled):
         for batch in tqdm(loader):
             if batch is None:
                 continue
@@ -796,7 +891,7 @@ def extract_features(
             )
             batch_names = satellite_names[i : i + Config.BATCH_SIZE]
 
-            with torch.inference_mode(), torch.amp.autocast("cuda", enabled=True):
+            with torch.inference_mode(), torch.amp.autocast("cuda", enabled=amp_enabled):
                 grid_feats = model.ref_forward(batch_pixels)
 
             grid_feats_np = grid_feats.float().cpu().numpy()
@@ -930,8 +1025,7 @@ def run_evaluation(end_num: float, run: bool = True, use_extra: bool = False) ->
             dataset,
             batch_size=Config.BATCH_SIZE,
             shuffle=False,
-            num_workers=8,
-            pin_memory=True,
+            **build_dataloader_kwargs(Config.NUM_WORKERS_EVAL),
         )
 
         res_search, res_fused_query = extract_features(model, loader, DEVICE, use_extra)
