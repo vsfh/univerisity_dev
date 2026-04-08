@@ -161,15 +161,26 @@ def compute_ap(recall, precision):
 def eval_iou_acc(pred_anchor, target_bbox, anchors_full, target_gi, target_gj, image_wh, iou_threshold_list=[0.5]):
     #print(pred_anchor)
 
-    batch_size, grid_stride = target_bbox.shape[0], image_wh // pred_anchor.shape[3]
+    if isinstance(image_wh, (tuple, list)):
+        image_h, image_w = float(image_wh[0]), float(image_wh[1])
+    else:
+        image_h = float(image_wh)
+        image_w = float(image_wh)
+
+    batch_size = target_bbox.shape[0]
+    grid_h = float(pred_anchor.shape[3])
+    grid_w = float(pred_anchor.shape[4])
+    stride_h = image_h / max(grid_h, 1.0)
+    stride_w = image_w / max(grid_w, 1.0)
     #batch_size, anchor_count, xywh+confidence, grid_height, grid_width
     assert(len(pred_anchor.shape) == 5)
-    assert(pred_anchor.shape[3] == pred_anchor.shape[4])
     
     ## eval: convert center+offset to box prediction
     ## calculate at rescaled image during validation for speed-up
     pred_confidence = pred_anchor[:,:,4,:,:]
-    scaled_anchors = anchors_full / grid_stride
+    scaled_anchors = anchors_full.clone()
+    scaled_anchors[:, 0] = scaled_anchors[:, 0] / stride_w
+    scaled_anchors[:, 1] = scaled_anchors[:, 1] / stride_h
     
     pred_gi, pred_gj = torch.zeros_like(target_gi), torch.zeros_like(target_gj)
     pred_bbox = torch.zeros_like(target_bbox)
@@ -183,7 +194,10 @@ def eval_iou_acc(pred_anchor, target_bbox, anchors_full, target_gi, target_gj, i
         pred_bbox[batch_idx, 1] = pred_anchor[batch_idx, best_n, 1, gj, gi].sigmoid() + gj
         pred_bbox[batch_idx, 2] = torch.exp(pred_anchor[batch_idx, best_n, 2, gj, gi]) * scaled_anchors[best_n][0]
         pred_bbox[batch_idx, 3] = torch.exp(pred_anchor[batch_idx, best_n, 3, gj, gi]) * scaled_anchors[best_n][1]
-    pred_bbox = pred_bbox * grid_stride
+    pred_bbox[:, 0] = pred_bbox[:, 0] * stride_w
+    pred_bbox[:, 1] = pred_bbox[:, 1] * stride_h
+    pred_bbox[:, 2] = pred_bbox[:, 2] * stride_w
+    pred_bbox[:, 3] = pred_bbox[:, 3] * stride_h
     pred_bbox = xywh2xyxy(pred_bbox)
     
     ## box iou

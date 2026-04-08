@@ -535,40 +535,6 @@ class Encoder_heading(nn.Module):
 
         return sat_feature_2d_pool
         
-
-class ScoreHead(nn.Module):
-    def __init__(self, embed_dim=768, num_heads=8):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.q_proj = nn.Linear(embed_dim, embed_dim)
-        self.k_proj = nn.Linear(embed_dim, embed_dim)
-        self.score_fusion = nn.Sequential(
-            nn.Linear(num_heads, num_heads // 2),
-            nn.GELU(),
-            nn.Linear(num_heads // 2, 1)
-        )
-
-    def forward(self, query: torch.Tensor, search: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            query: Tensor of shape (B, 768)
-            search: Tensor of shape (B * n, 768)
-        Returns:
-            scores: Tensor of shape (B, B * n)
-        """
-        B = query.size(0)
-        N_total = search.size(0) # This is B * n
-        q = self.q_proj(query).view(B, self.num_heads, self.head_dim)
-        k = self.k_proj(search).view(N_total, self.num_heads, self.head_dim)
-        q = q.transpose(0, 1) 
-        k = k.permute(1, 2, 0) 
-        attn_logits = torch.bmm(q, k) * self.scale
-        attn_logits = attn_logits.permute(1, 2, 0)
-        scores = self.score_fusion(attn_logits)
-        return scores.squeeze(-1)
-    
 class Encoder_abla(nn.Module):
     """Enhanced encoder with GeM pooling, gated fusion, and residual connections.
 

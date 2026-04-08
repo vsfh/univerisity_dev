@@ -39,7 +39,6 @@ NUM_WORKERS = min(16, os.cpu_count() or 8)
 PREFETCH_FACTOR = 4
 PIN_MEMORY = True
 PERSISTENT_WORKERS = True
-USE_AMP = True
 PROCESSOR_IMAGE_SIZE = {"height": 432, "width": 768}
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -279,7 +278,7 @@ def main(save_path):
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     use_cuda = DEVICE.startswith("cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_cuda and USE_AMP)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
 
     print("Setting up dataset and dataloader...")
     train_dataset = ShiftedSatelliteDroneDataset(
@@ -333,7 +332,7 @@ def main(save_path):
             attention_mask = (input_ids != 0).long()
             local_indices = batch["index"].to(DEVICE, non_blocking=True)
 
-            with torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
+            with torch.amp.autocast("cuda", enabled=False):
                 anchor_feats = model.query_forward(target_pixel_values)
                 grid_feats = model.ref_forward(search_pixel_values)
                 candidate_feats = grid_feats.reshape(-1, PROJECTION_DIM)
@@ -412,7 +411,7 @@ def validation(model, loader, epoch):
         batch_offsets = torch.arange(local_indices.shape[0], device=DEVICE) * 9
         positive_indices = local_indices + batch_offsets
 
-        with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=False):
             anchor_feats = model.query_forward(target_pixel_values)
             grid_feats = model.ref_forward(search_pixel_values)
             text_feats = model.text_forward(input_ids, attention_mask)
@@ -479,7 +478,7 @@ def extract_eval_features(
             attention_mask = (input_ids != 0).long()
             satellite_paths = batch["satellite_path"]
 
-            with torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
+            with torch.amp.autocast("cuda", enabled=False):
                 anchor_feats = encoder.query_forward(query_inputs)
                 text_feats = encoder.text_forward(input_ids, attention_mask)
                 fused_query_feats = F.normalize(anchor_feats + text_feats, p=2, dim=1)
@@ -499,7 +498,7 @@ def extract_eval_features(
 
             if unseen_indices:
                 gallery_batch = search_inputs[unseen_indices]
-                with torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
+                with torch.amp.autocast("cuda", enabled=False):
                     gallery_grid = encoder.ref_forward(gallery_batch)
                     gallery_grid = F.normalize(gallery_grid, p=2, dim=2)
                 gallery_grid = gallery_grid.cpu()

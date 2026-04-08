@@ -8,6 +8,15 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from utils.utils import bbox_iou, xyxy2xywh
 
+
+def _parse_hw(shape_like):
+    if isinstance(shape_like, (tuple, list)):
+        if len(shape_like) != 2:
+            raise ValueError(f"Expected (h, w), got: {shape_like}")
+        return float(shape_like[0]), float(shape_like[1])
+    val = float(shape_like)
+    return val, val
+
 def adjust_learning_rate(args, optimizer, i_iter):
 
     lr = args.lr*((0.1)**(i_iter//10))
@@ -16,11 +25,18 @@ def adjust_learning_rate(args, optimizer, i_iter):
     for param_idx, param in enumerate(optimizer.param_groups):
         param['lr'] = lr
 
-# the shape of the target is (batch_size, anchor_count, 5, grid_wh, grid_wh)
+# the shape of predictions is (batch_size, anchor_count, 5, grid_h, grid_w)
 def yolo_loss(predictions, gt_bboxes, anchors_full, best_anchor_gi_gj, image_wh):
-    batch_size, grid_stride = predictions.shape[0], image_wh // predictions.shape[3]
+    batch_size = predictions.shape[0]
+    image_h, image_w = _parse_hw(image_wh)
+    grid_h = float(predictions.shape[3])
+    grid_w = float(predictions.shape[4])
+    stride_h = image_h / max(grid_h, 1.0)
+    stride_w = image_w / max(grid_w, 1.0)
     best_anchor, gi, gj = best_anchor_gi_gj[:, 0], best_anchor_gi_gj[:, 1], best_anchor_gi_gj[:, 2]
-    scaled_anchors = anchors_full / grid_stride
+    scaled_anchors = anchors_full.clone()
+    scaled_anchors[:, 0] = scaled_anchors[:, 0] / stride_w
+    scaled_anchors[:, 1] = scaled_anchors[:, 1] / stride_h
     mseloss = torch.nn.MSELoss(reduction='mean')
     celoss_confidence = torch.nn.CrossEntropyLoss(reduction='mean')
     #celoss_cls = torch.nn.CrossEntropyLoss(size_average=True)
@@ -52,11 +68,23 @@ def yolo_loss(predictions, gt_bboxes, anchors_full, best_anchor_gi_gj, image_wh)
 #target_coord:batch_size, 5
 def build_target(ori_gt_bboxes, anchors_full, image_wh, grid_wh):
     #the default value of coord_dim is 5
-    batch_size, coord_dim, grid_stride, anchor_count = ori_gt_bboxes.shape[0], ori_gt_bboxes.shape[1], image_wh//grid_wh, anchors_full.shape[0]
+    batch_size = ori_gt_bboxes.shape[0]
+    coord_dim = ori_gt_bboxes.shape[1]
+    anchor_count = anchors_full.shape[0]
+    image_h, image_w = _parse_hw(image_wh)
+    grid_h, grid_w = _parse_hw(grid_wh)
+    stride_h = image_h / max(grid_h, 1.0)
+    stride_w = image_w / max(grid_w, 1.0)
     
     gt_bboxes = xyxy2xywh(ori_gt_bboxes)
-    gt_bboxes = (gt_bboxes/image_wh) * grid_wh
-    scaled_anchors = anchors_full/grid_stride
+    gt_bboxes = gt_bboxes.clone()
+    gt_bboxes[:, 0] = (gt_bboxes[:, 0] / image_w) * grid_w
+    gt_bboxes[:, 1] = (gt_bboxes[:, 1] / image_h) * grid_h
+    gt_bboxes[:, 2] = (gt_bboxes[:, 2] / image_w) * grid_w
+    gt_bboxes[:, 3] = (gt_bboxes[:, 3] / image_h) * grid_h
+    scaled_anchors = anchors_full.clone()
+    scaled_anchors[:, 0] = scaled_anchors[:, 0] / stride_w
+    scaled_anchors[:, 1] = scaled_anchors[:, 1] / stride_h
 
     gxy = gt_bboxes[:, 0:2]
     gwh = gt_bboxes[:, 2:4]

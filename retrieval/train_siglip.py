@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import argparse
 from torch.utils.data import Dataset, DataLoader, Subset
 from transformers import AutoImageProcessor, AutoModel, AutoTokenizer
 from PIL import Image
@@ -29,8 +30,8 @@ DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
 IMAGE_FOLDER = "/data/feihong/image_1024"
 HEADING_FOLDER = "/data/feihong/range_250"
 
-NUM_EPOCHS = 8
-BATCH_SIZE = 16
+NUM_EPOCHS = 20
+BATCH_SIZE = 8
 LEARNING_RATE = 1e-5
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 PROJECTION_DIM = 768
@@ -39,8 +40,9 @@ NUM_WORKERS = min(16, os.cpu_count() or 8)
 PREFETCH_FACTOR = 4
 PIN_MEMORY = True
 PERSISTENT_WORKERS = True
-USE_AMP = True
 PROCESSOR_IMAGE_SIZE = {"height": 432, "width": 768}
+DEFAULT_SUBSET_HEIGHTS = [250, 300]
+DEFAULT_SUBSET_ANGLES = [0, 90, 180, 270]
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -63,6 +65,14 @@ def _get_patch_size(vision_model):
         return int(patch_size[0]), int(patch_size[0])
     patch_size = int(patch_size)
     return patch_size, patch_size
+
+
+def _normalize_subset(values, defaults):
+    if values is None:
+        return {int(v) for v in defaults}
+    if isinstance(values, (list, tuple, set)):
+        return {int(v) for v in values}
+    return {int(values)}
 
 
 class TargetSearchDataset(Dataset):
@@ -290,22 +300,25 @@ def main(save_path):
 
     print("Loading models and processor...")
     processor = AutoImageProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
-    _set_processor_size(processor, PROCESSOR_IMAGE_SIZE)
+    processor_sat = AutoImageProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
+    _set_processor_size(processor_sat, PROCESSOR_IMAGE_SIZE)
 
     model = Encoder(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM).to(DEVICE)
     model.train()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     use_cuda = DEVICE.startswith("cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_cuda and USE_AMP)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
 
     print("Setting up dataset and dataloader...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     train_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
-        processor_sat=processor,
+        processor_sat=processor_sat,
         tokenizer=tokenizer,
         split="train",
+        subset_heights=DEFAULT_SUBSET_HEIGHTS,
+        subset_angles=DEFAULT_SUBSET_ANGLES,
     )
     train_dataloader = DataLoader(
         train_dataset,
@@ -320,9 +333,11 @@ def main(save_path):
 
     test_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
-        processor_sat=processor,
+        processor_sat=processor_sat,
         tokenizer=tokenizer,
         split="val",
+        subset_heights=DEFAULT_SUBSET_HEIGHTS,
+        subset_angles=DEFAULT_SUBSET_ANGLES,
     )
     test_dataloader = DataLoader(
         test_dataset,
@@ -351,7 +366,7 @@ def main(save_path):
             input_ids = batch["input_ids"].to(DEVICE, non_blocking=True)
             local_indices = batch["index"].to(DEVICE, non_blocking=True)
 
-            with torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
+            with torch.amp.autocast("cuda", enabled=False):
                 anchor_feats = model.query_forward(target_pixel_values)
                 grid_feats = model.ref_forward(search_pixel_values)
                 candidate_feats = grid_feats.reshape(-1, PROJECTION_DIM)
@@ -430,7 +445,7 @@ def validation(model, loader, epoch):
         batch_offsets = torch.arange(local_indices.shape[0], device=DEVICE) * 9
         positive_indices = local_indices + batch_offsets
 
-        with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=False):
             anchor_feats = model.query_forward(target_pixel_values)
             grid_feats = model.ref_forward(search_pixel_values)
             text_feats = model.text_forward(input_ids)
@@ -449,41 +464,31 @@ def validation(model, loader, epoch):
     return avg_loss, txt_avg_loss
 
 
-def eval(checkpoint_path=None, subset_height=None, subset_angle=None):
-    print("Evaluating retrieval accuracy on test split...")
-    processor = AutoImageProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    _set_processor_size(processor, PROCESSOR_IMAGE_SIZE)
+def extract_eval_features(
+    checkpoint_path=None,
+    query_feat_path="eval_siglip_query_feats.pt",
+    gallery_feat_path="eval_siglip_gallery_feats.pt",
+    subset_heights=None,
+    subset_angles=None,
+):
+    print("Stage 1/2: extracting and saving query/gallery features...")
     use_cuda = DEVICE.startswith("cuda")
+    processor = AutoImageProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
+    processor_sat = AutoImageProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    _set_processor_size(processor_sat, PROCESSOR_IMAGE_SIZE)
 
-    base_test_dataset = ShiftedSatelliteDroneDataset(
+    subset_heights = _normalize_subset(subset_heights, DEFAULT_SUBSET_HEIGHTS)
+    subset_angles = _normalize_subset(subset_angles, DEFAULT_SUBSET_ANGLES)
+
+    test_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
-        processor_sat=processor,
+        processor_sat=processor_sat,
         tokenizer=tokenizer,
         split="test",
+        subset_heights=sorted(subset_heights),
+        subset_angles=sorted(subset_angles),
     )
-
-    selected_indices = []
-    for idx, sample in enumerate(base_test_dataset.samples):
-        if subset_height is not None and int(sample["height"]) != int(subset_height):
-            continue
-        if subset_angle is not None and int(sample["angle"]) != int(subset_angle):
-            continue
-        selected_indices.append(idx)
-
-    if not selected_indices:
-        print(
-            f"No samples found for filters: height={subset_height}, angle={subset_angle}."
-        )
-        return
-
-    test_dataset = Subset(base_test_dataset, selected_indices)
-    selected_samples = [base_test_dataset.samples[idx] for idx in selected_indices]
-    print(
-        f"Using {len(selected_indices)} / {len(base_test_dataset)} test samples "
-        f"(height={subset_height}, angle={subset_angle})."
-    )
-
     test_loader = DataLoader(
         test_dataset,
         batch_size=BATCH_SIZE,
@@ -503,58 +508,149 @@ def eval(checkpoint_path=None, subset_height=None, subset_angle=None):
 
     query_feats_list = []
     query_labels = []
+    query_heights = []
+    query_angles = []
+    gallery_feat_dict = {}
 
-    with torch.inference_mode(), torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
-        for batch in tqdm(test_loader, desc="Extracting query features"):
+    with torch.inference_mode():
+        for batch in tqdm(test_loader, desc="Extracting query and gallery features"):
             query_inputs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
+            search_inputs = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
             input_ids = batch["input_ids"].to(DEVICE, non_blocking=True)
+            satellite_paths = batch["satellite_path"]
 
-            anchor_feats = encoder.query_forward(query_inputs)
-            text_feats = encoder.text_forward(input_ids)
-            fused_query_feats = F.normalize(anchor_feats + text_feats, p=2, dim=1)
+            with torch.amp.autocast("cuda", enabled=False):
+                anchor_feats = encoder.query_forward(query_inputs)
+                text_feats = encoder.text_forward(input_ids)
+                fused_query_feats = F.normalize(anchor_feats + text_feats, p=2, dim=1)
+            query_feats_list.append(fused_query_feats.cpu())
 
-            query_feats_list.append(fused_query_feats)
-            query_labels.extend(
-                [os.path.splitext(os.path.basename(path))[0] for path in batch["satellite_path"]]
-            )
+            batch_labels = [
+                os.path.splitext(os.path.basename(path))[0] for path in satellite_paths
+            ]
+            query_labels.extend(batch_labels)
+            query_heights.extend(batch["height"].cpu().tolist())
+            query_angles.extend(batch["angle"].cpu().tolist())
 
-    unique_satellite_paths = sorted({sample["satellite_path"] for sample in selected_samples})
-    gallery_labels = [os.path.splitext(os.path.basename(path))[0] for path in unique_satellite_paths]
+            unseen_indices = []
+            unseen_labels = []
+            for i, label in enumerate(batch_labels):
+                if label not in gallery_feat_dict:
+                    unseen_indices.append(i)
+                    unseen_labels.append(label)
 
-    gallery_pixels = []
-    valid_gallery_labels = []
-    for sat_path, sat_label in tqdm(
-        zip(unique_satellite_paths, gallery_labels),
-        total=len(unique_satellite_paths),
-        desc="Preparing gallery images",
-    ):
-        try:
-            sat_image = Image.open(sat_path).convert("RGB")
-            sat_pixels = processor(images=sat_image, return_tensors="pt")["pixel_values"][0]
-            gallery_pixels.append(sat_pixels)
-            valid_gallery_labels.append(sat_label)
-        except Exception as e:
-            print(f"Skip gallery image {sat_path}: {e}")
+            if unseen_indices:
+                gallery_batch = search_inputs[unseen_indices]
+                with torch.amp.autocast("cuda", enabled=False):
+                    gallery_grid = encoder.ref_forward(gallery_batch)
+                    gallery_grid = F.normalize(gallery_grid, p=2, dim=2)
+                gallery_grid = gallery_grid.cpu()
+                for i, label in enumerate(unseen_labels):
+                    gallery_feat_dict[label] = gallery_grid[i]
 
-    gallery_grid_feats = []
-    for i in tqdm(range(0, len(gallery_pixels), BATCH_SIZE), desc="Extracting gallery features"):
-        batch_pixels = torch.stack(gallery_pixels[i : i + BATCH_SIZE]).to(DEVICE, non_blocking=True)
-        with torch.inference_mode(), torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
-            batch_grid = encoder.ref_forward(batch_pixels)
-            batch_grid = F.normalize(batch_grid, p=2, dim=2)
-        gallery_grid_feats.append(batch_grid)
-
-    if not query_feats_list or not gallery_grid_feats:
-        print("No valid query/gallery features found.")
+    if not query_feats_list or not gallery_feat_dict:
+        print("No valid features extracted.")
         return
 
-    query_feats = torch.cat(query_feats_list, dim=0)
-    gallery_feats = torch.cat(gallery_grid_feats, dim=0)
-    scores = torch.einsum("qd,gkd->qgk", query_feats, gallery_feats).mean(dim=2)
+    query_payload = {
+        "features": torch.cat(query_feats_list, dim=0),
+        "labels": query_labels,
+        "heights": query_heights,
+        "angles": query_angles,
+    }
 
-    k_max = min(10, scores.shape[1])
-    topk_indices = torch.topk(scores, k=k_max, dim=1).indices
-    label_to_gallery_index = {label: idx for idx, label in enumerate(valid_gallery_labels)}
+    gallery_labels = sorted(gallery_feat_dict.keys())
+    gallery_feats = torch.stack(
+        [gallery_feat_dict[label] for label in gallery_labels], dim=0
+    )
+    gallery_payload = {
+        "features": gallery_feats,
+        "labels": gallery_labels,
+    }
+
+    torch.save(query_payload, query_feat_path)
+    torch.save(gallery_payload, gallery_feat_path)
+    print(f"Saved query features to: {query_feat_path}")
+    print(f"Saved gallery features to: {gallery_feat_path}")
+    print(f"Queries: {len(query_labels)}, Gallery: {len(gallery_labels)}")
+
+
+def score_eval_from_saved(
+    query_feat_path="eval_siglip_query_feats.pt",
+    gallery_feat_path="eval_siglip_gallery_feats.pt",
+    subset_heights=None,
+    subset_angles=None,
+    test_num=100,
+):
+    print("Stage 2/2: loading saved features and scoring...")
+    if not os.path.exists(query_feat_path):
+        raise FileNotFoundError(f"Query feature file not found: {query_feat_path}")
+    if not os.path.exists(gallery_feat_path):
+        raise FileNotFoundError(f"Gallery feature file not found: {gallery_feat_path}")
+
+    query_payload = torch.load(query_feat_path, map_location="cpu")
+    gallery_payload = torch.load(gallery_feat_path, map_location="cpu")
+
+    include_file = "/data/feihong/ckpt/include.json"
+    include_map = {}
+
+    def _norm_label(label):
+        return str(label).strip().split(".")[0]
+
+    if os.path.exists(include_file):
+        with open(include_file, "r") as f:
+            include_raw = json.load(f)
+
+        for key, values in include_raw.items():
+            norm_key = _norm_label(key)
+            if isinstance(values, list):
+                include_map[norm_key] = {_norm_label(v) for v in values}
+            else:
+                include_map[norm_key] = {_norm_label(values)}
+    else:
+        print(f"Warning: include file not found: {include_file}. Fallback to exact-match GT.")
+
+    query_feats = query_payload["features"]
+    query_labels = query_payload["labels"]
+    query_heights = query_payload["heights"]
+    query_angles = query_payload["angles"]
+    subset_heights = _normalize_subset(subset_heights, DEFAULT_SUBSET_HEIGHTS)
+    subset_angles = _normalize_subset(subset_angles, DEFAULT_SUBSET_ANGLES)
+
+    gallery_feats = gallery_payload["features"]
+    gallery_labels = gallery_payload["labels"]
+
+    selected_indices = []
+    for idx, (h, a) in enumerate(zip(query_heights, query_angles)):
+        if int(h) not in subset_heights:
+            continue
+        if int(a) not in subset_angles:
+            continue
+        selected_indices.append(idx)
+
+    if not selected_indices:
+        print(
+            f"No queries found for filters: heights={sorted(subset_heights)}, angles={sorted(subset_angles)}."
+        )
+        return
+
+    query_feats = query_feats[selected_indices]
+    query_labels = [query_labels[idx] for idx in selected_indices]
+    print(
+        f"Scoring {len(selected_indices)} / {len(query_payload['labels'])} queries "
+        f"(heights={sorted(subset_heights)}, angles={sorted(subset_angles)}, test_num={test_num})"
+    )
+
+    if test_num is None:
+        test_num = len(gallery_labels)
+    test_num = int(test_num)
+    if test_num <= 0:
+        raise ValueError("test_num must be a positive integer.")
+
+    query_feats = query_feats.to(DEVICE)
+    gallery_feats = gallery_feats.to(DEVICE)
+    label_to_gallery_index = {label: idx for idx, label in enumerate(gallery_labels)}
+    norm_gallery_labels = [_norm_label(label) for label in gallery_labels]
 
     valid_queries = 0
     top1 = 0
@@ -565,13 +661,43 @@ def eval(checkpoint_path=None, subset_height=None, subset_angle=None):
         gt_gallery_index = label_to_gallery_index.get(gt_label)
         if gt_gallery_index is None:
             continue
+
+        gt_norm = _norm_label(gt_label)
+        positive_label_set = set(include_map.get(gt_norm, set()))
+        positive_label_set.add(gt_norm)
+
+        all_indices = list(range(len(gallery_labels)))
+        if test_num >= len(all_indices):
+            candidate_indices = all_indices
+        else:
+            negative_pool = [idx for idx in all_indices if idx != gt_gallery_index]
+            sampled_negatives = random.sample(negative_pool, test_num - 1)
+            candidate_indices = sampled_negatives + [gt_gallery_index]
+            random.shuffle(candidate_indices)
+
+        candidate_gallery_feats = gallery_feats[candidate_indices]
+        score_vec = torch.einsum(
+            "d,knd->kn", query_feats[q_idx], candidate_gallery_feats
+        ).mean(dim=1)
+
+        k_max = min(10, score_vec.shape[0])
+        topk_local_indices = torch.topk(score_vec, k=k_max, dim=0).indices.tolist()
+
+        positive_local_indices = [
+            local_idx
+            for local_idx, global_idx in enumerate(candidate_indices)
+            if norm_gallery_labels[global_idx] in positive_label_set
+        ]
+
         valid_queries += 1
-        pred_indices = topk_indices[q_idx].tolist()
-        if gt_gallery_index in pred_indices[:1]:
+        if any(idx in topk_local_indices[:1] for idx in positive_local_indices):
             top1 += 1
-        if gt_gallery_index in pred_indices[: min(5, k_max)]:
+        if any(idx in topk_local_indices[: min(5, k_max)] for idx in positive_local_indices):
             top5 += 1
-        if gt_gallery_index in pred_indices[: min(10, k_max)]:
+        if any(
+            idx in topk_local_indices[: min(10, k_max)]
+            for idx in positive_local_indices
+        ):
             top10 += 1
 
     if valid_queries == 0:
@@ -583,147 +709,45 @@ def eval(checkpoint_path=None, subset_height=None, subset_angle=None):
     print(f"Top 10: {top10} / {valid_queries} ({top10 / valid_queries * 100:.2f}%)")
 
 
-def eval_denseuav(run=False):
-    DENSE_UAV_ROOT = "/data/feihong/DenseUAV"
-    TEST_DENSE_FILE = "/data/feihong/ckpt/test_dense.txt"
+def eval(
+    checkpoint_path=None,
+    subset_heights=None,
+    subset_angles=None,
+    test_num=100,
+    query_feat_path="eval_siglip_query_feats.pt",
+    gallery_feat_path="eval_siglip_gallery_feats.pt",
+    run_extract=True,
+):
+    subset_heights = _normalize_subset(subset_heights, DEFAULT_SUBSET_HEIGHTS)
+    subset_angles = _normalize_subset(subset_angles, DEFAULT_SUBSET_ANGLES)
 
-    def calcu_cos(a, b):
-        a_norm = a / np.linalg.norm(a)
-        b_norm = b / np.linalg.norm(b, axis=1, keepdims=True)
-        return np.dot(b_norm, a_norm[..., None]).flatten()
-
-    if run:
-        img_to_text_dict = json.load(
-            open("/data/feihong/drone_text_single_long.json", "r")
+    if run_extract:
+        extract_eval_features(
+            checkpoint_path=checkpoint_path,
+            query_feat_path=query_feat_path,
+            gallery_feat_path=gallery_feat_path,
+            subset_heights=subset_heights,
+            subset_angles=subset_angles,
         )
-        processor = AutoImageProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    score_eval_from_saved(
+        query_feat_path=query_feat_path,
+        gallery_feat_path=gallery_feat_path,
+        subset_heights=subset_heights,
+        subset_angles=subset_angles,
+        test_num=test_num,
+    )
 
-        encoder = Encoder(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM).to(DEVICE)
-        model_path = f"../ckpt/train_siglip_proj/best.pth"
-
-        if os.path.exists(model_path):
-            encoder.load_state_dict(
-                torch.load(model_path, map_location="cpu"), strict=False
-            )
-        encoder.eval()
-
-        res_search = {}
-        res_fused_query = {}
-
-        print("Setting up dataset and dataloader for eval_denseuav...")
-        eval_list = []
-        with open(TEST_DENSE_FILE, "r") as f:
-            for line in f:
-                query_path = line.strip()
-                eval_list.append(query_path)
-
-        for img_path in tqdm(eval_list):
-            parts = img_path.split("/")
-            drone_id = parts[-2]
-            is_train = "train" in parts
-
-            if is_train:
-                search_path = f"{DENSE_UAV_ROOT}/train/satellite/{drone_id}/H100.tif"
-            else:
-                search_path = (
-                    f"{DENSE_UAV_ROOT}/test/gallery_satellite/{drone_id}/H100.tif"
-                )
-
-            if os.path.exists(search_path):
-                try:
-                    query_image = Image.open(img_path).convert("RGB")
-                    search_image = Image.open(search_path).convert("RGB")
-                    search_image = search_image.resize((640, 640))
-
-                    text_name = drone_id + "_01"
-                    text_description = img_to_text_dict.get(text_name, "")
-                    for noun in [
-                        "**",
-                        "\n",
-                        "noun",
-                        "phrases",
-                        "Phrase",
-                        "Noun",
-                        "Summary",
-                        "Environment",
-                        "32 tokens",
-                    ]:
-                        text_description = text_description.replace(noun, "")
-
-                    query_inputs = processor(images=query_image, return_tensors="pt")[
-                        "pixel_values"
-                    ].to(DEVICE)
-                    search_inputs = processor(images=search_image, return_tensors="pt")[
-                        "pixel_values"
-                    ].to(DEVICE)
-                    text_inputs = tokenizer(
-                        text_description,
-                        padding="max_length",
-                        truncation=True,
-                        max_length=64,
-                        return_tensors="pt",
-                    )
-                    input_ids = text_inputs["input_ids"].to(DEVICE)
-
-                    with torch.no_grad():
-                        anchor_feats = encoder.query_forward(query_inputs)
-                        grid_feats = encoder.ref_forward(search_inputs)
-                        # text_feats = encoder.text_forward(input_ids)
-                        fused_query_feats = anchor_feats
-
-                    res_search[drone_id] = grid_feats.cpu().numpy()
-                    res_fused_query[drone_id] = fused_query_feats.cpu().numpy()
-                except Exception as e:
-                    print(f"Error processing {drone_id}: {e}")
-
-        np.savez("eval_denseuav_search.npz", **res_search)
-        np.savez("eval_denseuav_fused_query.npz", **res_fused_query)
-        print("Evaluation feature extraction complete.")
-    else:
-        search_res = np.load("eval_denseuav_search.npz")
-        fused_query_res = np.load("eval_denseuav_fused_query.npz")
-
-        test_list = [k for k in search_res.keys()]
-        res = {}
-        top1 = 0
-        top5 = 0
-        top10 = 0
-
-        if not test_list:
-            print("No evaluation data found in npz files.")
-            return
-
-        for key in tqdm(test_list):
-            fused_query_feature = fused_query_res[key]
-
-            ex_img_list = random.sample(test_list, min(99, len(test_list) - 1))
-            if key in ex_img_list:
-                ex_img_list.remove(key)
-            ex_img_list.append(key)
-            right_num = len(ex_img_list) - 1
-            res[key] = []
-            for img_name in ex_img_list:
-                cos_sim_grid = calcu_cos(fused_query_feature, search_res[img_name])
-                res[key].append(cos_sim_grid)
-
-            img_res = np.array(res[key]).mean(1).argsort()[-15:][::-1]
-
-            if right_num in img_res[:1]:
-                top1 += 1
-            if right_num in img_res[:5]:
-                top5 += 1
-            if right_num in img_res[:10]:
-                top10 += 1
-
-        print(f"Top 1: {top1} / {len(test_list)} ({top1 / len(test_list) * 100:.2f}%)")
-        print(f"Top 5: {top5} / {len(test_list)} ({top5 / len(test_list) * 100:.2f}%)")
-        print(
-            f"Top 10: {top10} / {len(test_list)} ({top10 / len(test_list) * 100:.2f}%)"
-        )
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="SigLIP retrieval train/eval")
+    parser.add_argument(
+        "--eval",
+        action="store_true",
+        help="Run training loop.",
+    )
+    args = parser.parse_args()
+
     exp_name = "retrieval_siglip"
     save_dir = f"../ckpt/{exp_name}"
 
@@ -735,10 +759,12 @@ if __name__ == "__main__":
         print(f"Created experiment directory: {save_dir}")
 
     # Run training
-    main(save_dir)
-
-    # Run evaluation
-    # eval()  # Evaluate Top-1/5/10 on test split
-
-    # eval_denseuav(True)  # Extract features
-    # eval_denseuav(False)  # Extract features
+    if not args.eval:
+        main(save_dir)
+    else:
+        # Run evaluation
+        eval(
+            f"{save_dir}/best.pth",
+            subset_heights=DEFAULT_SUBSET_HEIGHTS,
+            subset_angles=DEFAULT_SUBSET_ANGLES,
+        )  # Extract features + score Top-1/5/10

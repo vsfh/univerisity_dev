@@ -39,7 +39,6 @@ NUM_WORKERS = 8
 PREFETCH_FACTOR = 4
 PIN_MEMORY = True
 PERSISTENT_WORKERS = True
-USE_AMP = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -302,7 +301,7 @@ def main(save_path):
     encoder.train()
     optimizer = torch.optim.AdamW(encoder.parameters(), lr=LEARNING_RATE)
     use_cuda = DEVICE.startswith("cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_cuda and USE_AMP)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
 
     print("Setting up dataset and dataloader...")
     train_dataset = ShiftedSatelliteDroneDataset(
@@ -358,7 +357,7 @@ def main(save_path):
             attention_mask = (input_ids != 0).long()
             local_indices = batch["index"].to(DEVICE, non_blocking=True)
 
-            with torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
+            with torch.amp.autocast("cuda", enabled=False):
                 anchor_feats = encoder.query_forward(target_pixel_values)
                 grid_feats = encoder.ref_forward(search_pixel_values)
                 candidate_feats = grid_feats.reshape(-1, PROJECTION_DIM)
@@ -440,7 +439,7 @@ def validation(model, loader, epoch):
         batch_offsets = torch.arange(local_indices.shape[0], device=DEVICE) * 9
         positive_indices = local_indices + batch_offsets
 
-        with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=False):
             anchor_feats = model.query_forward(target_pixel_values)
             grid_feats = model.ref_forward(search_pixel_values)
             text_feats = model.text_forward(input_ids, attention_mask)
@@ -574,7 +573,7 @@ def eval(run=False):
         res_fused_query = {}
 
         print(f"Starting batched inference on {len(dataset)} items...")
-        with torch.inference_mode(), torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
+        with torch.inference_mode(), torch.amp.autocast("cuda", enabled=False):
             for batch in tqdm(loader):
                 if batch is None:
                     continue
@@ -624,7 +623,7 @@ def eval(run=False):
             )
             batch_names = satellite_names[i : i + BATCH_SIZE]
 
-            with torch.inference_mode(), torch.amp.autocast("cuda", enabled=use_cuda and USE_AMP):
+            with torch.inference_mode(), torch.amp.autocast("cuda", enabled=False):
                 grid_feats = encoder.ref_forward(batch_pixels)
 
             grid_feats_np = grid_feats.float().cpu().numpy()

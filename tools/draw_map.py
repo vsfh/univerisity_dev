@@ -905,12 +905,39 @@ def rewrite_targets_without_centers(
 
     refreshed = sum(len(lines) for lines in replacements.values()) if centers_to_fix else 0
     print(f"Rewrote {len(output_rows)} rows to {output_file} (refreshed {refreshed} entries).")
+
+
+def write_drone_folder_names_to_train_txt(
+    source_dir: str = "/data/feihong/drone_view/drone",
+    output_file: str = "/data/feihong/ckpt/train.txt",
+    sort_names: bool = True,
+) -> None:
+    """Write one subfolder name per line from source_dir to output_file."""
+    if not os.path.isdir(source_dir):
+        raise NotADirectoryError(f"Source directory does not exist: {source_dir}")
+
+    folder_names = [
+        name
+        for name in os.listdir(source_dir)
+        if os.path.isdir(os.path.join(source_dir, name))
+    ]
+
+    if sort_names:
+        folder_names.sort()
+
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        for name in folder_names:
+            f.write(f"{name}\n")
+
+    print(f"Wrote {len(folder_names)} folder names to {output_file}")
 # get_lib_coord()
 # get_world_map_two()
 # match_libraries()
 # collect_spread_university_targets()
-rewrite_targets_without_centers(
-    input_file="runs/university_targets_clean_twice.txt",
-    output_file="runs/university_targets_clean_third.txt",
-    sleep_between=10  # optional: reduce delay for small batches
-)
+# rewrite_targets_without_centers(
+#     input_file="runs/university_targets_clean_twice.txt",
+#     output_file="runs/university_targets_clean_third.txt",
+#     sleep_between=10  # optional: reduce delay for small batches
+# )
+write_drone_folder_names_to_train_txt()

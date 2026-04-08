@@ -2,8 +2,10 @@ import json
 import random
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+import cv2
+import numpy as np
 import torch
 from PIL import Image, ImageDraw
 from torch.utils.data import Dataset
@@ -15,9 +17,16 @@ TEST_SATELLITE_ROOT = "/data/feihong/image_1024_shifted"
 DRONE_IMAGE_ROOT = "/data/feihong/drone_img"
 BBOX_FILE = "/data/feihong/ckpt/shifted_bboxes.json"
 TRAIN_MAX_SATELLITE_ID = 1065
-VAL_SPLIT_COUNT = 30
+TRAIN_SPLIT_FILE = "/data/feihong/ckpt/train.txt"
+VAL_SPLIT_FILE = "/data/feihong/ckpt/val.txt"
+TEST_SPLIT_FILE = "/data/feihong/ckpt/test.txt"
+VAL_SPLIT_COUNT = 20
+TEST_SPLIT_COUNT = 400
 MAX_TEXT_LENGTH = 64
-DEFAULT_SAT_TARGET_SIZE = (768, 432)
+DEFAULT_SAT_TARGET_SIZE = (432, 768)
+DEFAULT_TEST_CROP_RATIO = 1.0
+DEFAULT_SUBSET_HEIGHTS = [150, 200, 250, 300]
+DEFAULT_SUBSET_ANGLES = [0, 90, 180, 270]
 DEFAULT_ENABLE_TIMING_LOG = False
 DEFAULT_TIMING_LOG_INTERVAL = 200
 DEFAULT_MODEL_NAME = "google/siglip-base-patch16-224"
@@ -50,6 +59,90 @@ def _safe_int(text: str) -> Optional[int]:
 		return None
 
 
+def _parse_split_ids_from_text_file(file_path: Path) -> Set[int]:
+	"""Parse numeric IDs from a split file with one token per line or CSV first column."""
+	if not file_path.exists():
+		return set()
+
+	ids: Set[int] = set()
+	with open(file_path, "r", encoding="utf-8") as f:
+		for raw_line in f:
+			line = raw_line.strip()
+			if not line:
+				continue
+
+			first_field = line.split(",")[0].strip()
+			token = Path(first_field).name
+			candidates = [first_field, token, Path(first_field).stem, Path(token).stem]
+
+			parsed = None
+			for candidate in candidates:
+				parsed = _safe_int(candidate)
+				if parsed is not None:
+					break
+
+			if parsed is not None:
+				ids.add(parsed)
+
+	return ids
+
+
+def create_val_test_split_files(
+	test_satellite_root: str = TEST_SATELLITE_ROOT,
+	train_split_file: str = TRAIN_SPLIT_FILE,
+	val_split_file: str = VAL_SPLIT_FILE,
+	test_split_file: str = TEST_SPLIT_FILE,
+	val_count: int = VAL_SPLIT_COUNT,
+	test_count: int = TEST_SPLIT_COUNT,
+	seed: int = 43,
+) -> Tuple[int, int]:
+	"""
+	Create val/test split files from shifted satellite set, excluding train IDs.
+	Returns (num_val_written, num_test_written).
+	"""
+	test_root = Path(test_satellite_root)
+	if not test_root.is_dir():
+		raise NotADirectoryError(f"Satellite directory does not exist: {test_root}")
+
+	train_ids = _parse_split_ids_from_text_file(Path(train_split_file))
+
+	all_ids: Set[int] = set()
+	for ext in ("*.png", "*.jpg", "*.jpeg", "*.webp"):
+		for path in test_root.glob(ext):
+			parsed = _safe_int(path.stem)
+			if parsed is not None:
+				all_ids.add(parsed)
+
+	candidate_ids = sorted(idx for idx in all_ids if idx not in train_ids)
+	if not candidate_ids:
+		raise ValueError(
+			"No candidate IDs found in shifted satellite root after excluding train split IDs."
+		)
+
+	rng = random.Random(seed)
+	rng.shuffle(candidate_ids)
+
+	actual_val_count = min(max(0, int(val_count)), len(candidate_ids))
+	remaining = candidate_ids[actual_val_count:]
+	actual_test_count = min(max(0, int(test_count)), len(remaining))
+
+	val_ids = sorted(candidate_ids[:actual_val_count])
+	test_ids = sorted(remaining[:actual_test_count])
+
+	for out_path in (Path(val_split_file), Path(test_split_file)):
+		out_path.parent.mkdir(parents=True, exist_ok=True)
+
+	with open(val_split_file, "w", encoding="utf-8") as f:
+		for idx in val_ids:
+			f.write(f"{idx:04d}\n")
+
+	with open(test_split_file, "w", encoding="utf-8") as f:
+		for idx in test_ids:
+			f.write(f"{idx:04d}\n")
+
+	return len(val_ids), len(test_ids)
+
+
 def _resolve_processor_target_size(
 	processor_sat: Any,
 	fallback_size: Tuple[int, int],
@@ -67,6 +160,15 @@ def _resolve_processor_target_size(
 	if isinstance(size, Sequence) and len(size) == 2:
 		return int(size[0]), int(size[1])
 	return fallback_size
+
+
+def _normalize_subset_values(
+	values: Optional[Sequence[int]],
+	default_values: Sequence[int],
+) -> Set[int]:
+	if values is None:
+		return {int(v) for v in default_values}
+	return {int(v) for v in values}
 
 
 def _build_center_bbox(
@@ -93,40 +195,90 @@ def _augment_satellite_image_with_bbox(
 	bbox: Sequence[float],
 	mode: str,
 	target_size: Optional[Tuple[int, int]] = None,
+	test_crop_ratio: float = DEFAULT_TEST_CROP_RATIO,
 ) -> Tuple[Image.Image, List[float]]:
-	"""Randomly crop around bbox (keeping bbox inside) and resize to target size."""
+	"""Crop around bbox and resize using OpenCV, enforcing >=2.5x bbox coverage."""
 	if target_size is None:
 		target_h, target_w = image.height, image.width
 	else:
 		target_h, target_w = int(target_size[0]), int(target_size[1])
 
-	if mode != "train":
-		orig_w, orig_h = image.size
-		if (orig_h, orig_w) == (target_h, target_w):
-			return image, [float(v) for v in bbox]
-
-		x1, y1, x2, y2 = [float(v) for v in bbox]
-		scale_x = target_w / max(float(orig_w), 1.0)
-		scale_y = target_h / max(float(orig_h), 1.0)
-		resized_bbox = [x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y]
-		resized_image = image.resize((target_w, target_h), Image.Resampling.BILINEAR)
-		return resized_image, resized_bbox
-
-	x1, y1, x2, y2 = [float(v) for v in bbox]
 	orig_w, orig_h = image.size
+	x1, y1, x2, y2 = [float(v) for v in bbox]
+
+	if mode != "train":
+		ratio = float(test_crop_ratio)
+		# Keep original behavior when ratio >= 1.0 (no test-time crop).
+		if ratio >= 1.0:
+			if (orig_h, orig_w) == (target_h, target_w):
+				return image, [float(v) for v in bbox]
+			scale_x = target_w / max(float(orig_w), 1.0)
+			scale_y = target_h / max(float(orig_h), 1.0)
+			resized_bbox = [x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y]
+			img_np = np.asarray(image, dtype=np.uint8)
+			resized_np = cv2.resize(img_np, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+			return Image.fromarray(resized_np), resized_bbox
+
+		ratio = max(1e-3, min(ratio, 1.0))
+		bbox_w = max(1.0, x2 - x1)
+		bbox_h = max(1.0, y2 - y1)
+
+		# Ensure requested crop can still contain full bbox while preserving image aspect ratio.
+		min_ratio = max(bbox_w / max(float(orig_w), 1.0), bbox_h / max(float(orig_h), 1.0))
+		ratio = max(ratio, min_ratio)
+
+		crop_w = max(1.0, min(float(orig_w), float(orig_w) * ratio))
+		crop_h = max(1.0, min(float(orig_h), float(orig_h) * ratio))
+
+		left_min = max(0.0, x2 - crop_w)
+		left_max = min(float(orig_w) - crop_w, x1)
+		top_min = max(0.0, y2 - crop_h)
+		top_max = min(float(orig_h) - crop_h, y1)
+
+		if left_max < left_min:
+			left_min = left_max = min(max(0.0, x1), float(orig_w) - crop_w)
+		if top_max < top_min:
+			top_min = top_max = min(max(0.0, y1), float(orig_h) - crop_h)
+
+		# Deterministic crop position at the center of the feasible region.
+		left = 0.5 * (left_min + left_max)
+		top = 0.5 * (top_min + top_max)
+		right = left + crop_w
+		bottom = top + crop_h
+
+		img_np = np.asarray(image, dtype=np.uint8)
+		left_i = int(max(0, min(orig_w - 1, round(left))))
+		top_i = int(max(0, min(orig_h - 1, round(top))))
+		right_i = int(max(left_i + 1, min(orig_w, round(right))))
+		bottom_i = int(max(top_i + 1, min(orig_h, round(bottom))))
+
+		cropped_np = img_np[top_i:bottom_i, left_i:right_i]
+		resized_np = cv2.resize(cropped_np, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+		actual_crop_w = float(max(1, right_i - left_i))
+		actual_crop_h = float(max(1, bottom_i - top_i))
+		scale_x = target_w / actual_crop_w
+		scale_y = target_h / actual_crop_h
+		new_bbox = [
+			(x1 - left_i) * scale_x,
+			(y1 - top_i) * scale_y,
+			(x2 - left_i) * scale_x,
+			(y2 - top_i) * scale_y,
+		]
+		return Image.fromarray(resized_np), new_bbox
 
 	bbox_w = max(1.0, x2 - x1)
 	bbox_h = max(1.0, y2 - y1)
-	min_crop = max(bbox_w, bbox_h) * 1.2
+	min_crop = max(3 * bbox_w, 3 * bbox_h)
 	max_crop = float(min(orig_w, orig_h))
-	crop_size = random.uniform(min_crop, max(min_crop, max_crop))
-	crop_size = min(crop_size, float(orig_w), float(orig_h))
+	if max_crop <= 1.0:
+		max_crop = 1.0
+	crop_size = min(max_crop, random.uniform(min(min_crop, max_crop), max_crop))
 
 	min_left = max(0.0, x2 - crop_size)
 	max_left = min(float(orig_w) - crop_size, x1)
 	min_top = max(0.0, y2 - crop_size)
 	max_top = min(float(orig_h) - crop_size, y1)
-
 	if max_left < min_left:
 		max_left = min_left
 	if max_top < min_top:
@@ -137,15 +289,23 @@ def _augment_satellite_image_with_bbox(
 	right = left + crop_size
 	bottom = top + crop_size
 
-	cropped = image.crop((left, top, right, bottom))
-	augmented = cropped.resize((target_w, target_h), Image.Resampling.BILINEAR)
+	img_np = np.asarray(image, dtype=np.uint8)
+	left_i = int(max(0, min(orig_w - 1, round(left))))
+	top_i = int(max(0, min(orig_h - 1, round(top))))
+	right_i = int(max(left_i + 1, min(orig_w, round(right))))
+	bottom_i = int(max(top_i + 1, min(orig_h, round(bottom))))
 
-	scale_x = target_w / max(crop_size, 1.0)
-	scale_y = target_h / max(crop_size, 1.0)
-	new_x1 = (x1 - left) * scale_x
-	new_y1 = (y1 - top) * scale_y
-	new_x2 = (x2 - left) * scale_x
-	new_y2 = (y2 - top) * scale_y
+	cropped_np = img_np[top_i:bottom_i, left_i:right_i]
+	resized_np = cv2.resize(cropped_np, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+	actual_crop_w = float(max(1, right_i - left_i))
+	actual_crop_h = float(max(1, bottom_i - top_i))
+	scale_x = target_w / actual_crop_w
+	scale_y = target_h / actual_crop_h
+	new_x1 = (x1 - left_i) * scale_x
+	new_y1 = (y1 - top_i) * scale_y
+	new_x2 = (x2 - left_i) * scale_x
+	new_y2 = (y2 - top_i) * scale_y
 
 	new_bbox = [
 		max(0.0, min(float(target_w), new_x1)),
@@ -154,7 +314,7 @@ def _augment_satellite_image_with_bbox(
 		max(0.0, min(float(target_h), new_y2)),
 	]
 
-	return augmented, new_bbox
+	return Image.fromarray(resized_np), new_bbox
 
 
 def _sanitize_bbox_xyxy(
@@ -200,9 +360,15 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		drone_image_root: str = DRONE_IMAGE_ROOT,
 		bbox_file: str = BBOX_FILE,
 		train_max_satellite_id: int = TRAIN_MAX_SATELLITE_ID,
+		train_split_file: str = TRAIN_SPLIT_FILE,
+		val_split_file: str = VAL_SPLIT_FILE,
+		test_split_file: str = TEST_SPLIT_FILE,
 		val_split_count: int = VAL_SPLIT_COUNT,
 		max_text_length: int = MAX_TEXT_LENGTH,
 		sat_target_size: Tuple[int, int] = DEFAULT_SAT_TARGET_SIZE,
+		test_crop_ratio: float = DEFAULT_TEST_CROP_RATIO,
+		subset_heights: Optional[Sequence[int]] = None,
+		subset_angles: Optional[Sequence[int]] = None,
 		enable_timing_log: bool = DEFAULT_ENABLE_TIMING_LOG,
 		timing_log_interval: int = DEFAULT_TIMING_LOG_INTERVAL,
 	):
@@ -214,17 +380,37 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		self.tokenizer = tokenizer
 		self.split = split
 		self.train_max_satellite_id = train_max_satellite_id
+		self.train_split_file = Path(train_split_file)
+		self.val_split_file = Path(val_split_file)
+		self.test_split_file = Path(test_split_file)
 		self.val_split_count = max(0, int(val_split_count))
 		self.max_text_length = max_text_length
+		self.train_split_ids: Optional[Set[int]] = None
+		self.val_split_ids: Optional[Set[int]] = None
+		self.test_split_ids: Optional[Set[int]] = None
+		if self.split == "train":
+			self.train_split_ids = self._load_train_split_ids()
+		elif self.split == "val":
+			self.val_split_ids = self._load_optional_split_ids(self.val_split_file)
+		elif self.split == "test":
+			self.test_split_ids = self._load_optional_split_ids(self.test_split_file)
 		self.sat_target_size = _resolve_processor_target_size(
 			processor_sat,
 			sat_target_size,
+		)
+		self.test_crop_ratio = max(0.0, min(1.0, float(test_crop_ratio)))
+		self.subset_heights = _normalize_subset_values(
+			subset_heights,
+			DEFAULT_SUBSET_HEIGHTS,
+		)
+		self.subset_angles = _normalize_subset_values(
+			subset_angles,
+			DEFAULT_SUBSET_ANGLES,
 		)
 		self.enable_timing_log = bool(enable_timing_log)
 		self.timing_log_interval = max(1, int(timing_log_interval))
 		self._timing_acc: Dict[str, float] = {
 			"io": 0.0,
-			"augment": 0.0,
 			"query_proc": 0.0,
 			"search_proc": 0.0,
 			"total": 0.0,
@@ -241,13 +427,6 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		self.samples: List[Dict[str, Any]] = self._build_samples()
 		if not self.samples:
 			raise ValueError(f"No valid samples found for split={split}.")
-
-		# Tokenization in __getitem__ is a CPU hotspot; cache per unique text once.
-		self._token_cache: Dict[str, torch.Tensor] = {}
-		for sample in self.samples:
-			text = sample["text"]
-			if text not in self._token_cache:
-				self._token_cache[text] = self._tokenize_text(text)
 
 	def _tokenize_text(self, text: str) -> torch.Tensor:
 		text_inputs = self.tokenizer(
@@ -280,11 +459,54 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			return (parsed, path.name)
 
 		sorted_files = sorted(files, key=sort_key)
+		if self.split == "train":
+			if not self.train_split_ids:
+				raise ValueError("Train split IDs are empty.")
+			return [
+				path
+				for path in sorted_files
+				if _safe_int(path.stem) in self.train_split_ids
+			]
 		if self.split == "val":
+			if self.val_split_ids:
+				return [
+					path
+					for path in sorted_files
+					if _safe_int(path.stem) in self.val_split_ids
+				]
 			return sorted_files[: self.val_split_count]
 		if self.split == "test":
+			if self.test_split_ids:
+				return [
+					path
+					for path in sorted_files
+					if _safe_int(path.stem) in self.test_split_ids
+				]
 			return sorted_files[self.val_split_count :]
 		return sorted_files
+
+	def _load_train_split_ids(self) -> Set[int]:
+		if not self.train_split_file.exists():
+			raise FileNotFoundError(
+				f"Train split file not found: {self.train_split_file}"
+			)
+
+		train_ids = _parse_split_ids_from_text_file(self.train_split_file)
+
+		if not train_ids:
+			raise ValueError(
+				f"No valid numeric folder names found in train split file: {self.train_split_file}"
+			)
+
+		return train_ids
+
+	def _load_optional_split_ids(self, split_file: Path) -> Optional[Set[int]]:
+		if not split_file.exists():
+			return None
+		parsed_ids = _parse_split_ids_from_text_file(split_file)
+		if not parsed_ids:
+			return None
+		return parsed_ids
 
 	def _select_drone_dir(self, satellite_id: str) -> Optional[Path]:
 		candidate_1 = self.drone_image_root / satellite_id
@@ -325,7 +547,11 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			if sat_id_int is None:
 				continue
 
-			if self.split == "train" and not (0 <= sat_id_int <= self.train_max_satellite_id):
+			if (
+				self.split == "train"
+				and self.train_split_ids is None
+				and not (0 <= sat_id_int <= self.train_max_satellite_id)
+			):
 				continue
 
 			sat_id = f"{sat_id_int:04d}"
@@ -339,7 +565,7 @@ class ShiftedSatelliteDroneDataset(Dataset):
 
 			sat_bbox_dict: Dict[str, List[float]] = {}
 			if self.split in {"val", "test"}:
-				sat_bbox_dict = self.bbox_dict.get(sat_id+'.png', {})
+				sat_bbox_dict = self.bbox_dict.get(sat_id, {})
 				if not isinstance(sat_bbox_dict, dict):
 					continue
 
@@ -354,6 +580,12 @@ class ShiftedSatelliteDroneDataset(Dataset):
 					continue
 
 				height, angle = parsed
+				if int(height) not in self.subset_heights:
+					continue
+				if int(angle) not in self.subset_angles:
+					continue
+				if str(angle).endswith("5"):
+					continue
 
 				sample: Dict[str, Any] = {
 					"satellite_path": str(sat_path),
@@ -388,7 +620,6 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		return len(self.samples)
 
 	def __getitem__(self, idx: int) -> Dict[str, Any]:
-		t_start = time.perf_counter()
 		sample = self.samples[idx]
 
 		t_io_start = time.perf_counter()
@@ -397,7 +628,6 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			search_image = Image.open(sample["satellite_path"]).convert("RGB")
 		except FileNotFoundError:
 			return self.__getitem__((idx + 1) % len(self.samples))
-		t_io = time.perf_counter() - t_io_start
 
 		orig_w, orig_h = search_image.size
 
@@ -412,14 +642,13 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		else:
 			base_bbox = [float(v) for v in sample["bbox"]]
 
-		t_aug_start = time.perf_counter()
 		augmented_search_image, augmented_bbox = _augment_satellite_image_with_bbox(
 			image=search_image,
 			bbox=base_bbox,
 			mode=self.split,
 			target_size=self.sat_target_size,
+			test_crop_ratio=self.test_crop_ratio,
 		)
-		t_aug = time.perf_counter() - t_aug_start
 
 		target_h, target_w = self.sat_target_size
 		resized_bbox = [float(v) for v in augmented_bbox]
@@ -435,39 +664,12 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		row_idx = min(int(center_y * 3), 2)
 		index = row_idx * 3 + col_idx
 
-		input_ids = self._token_cache[sample["text"]]
-		t_qproc_start = time.perf_counter()
+		input_ids = self._tokenize_text(sample["text"])
 		query_inputs = self.processor(images=query_image, return_tensors="pt")
-		t_qproc = time.perf_counter() - t_qproc_start
-		t_sproc_start = time.perf_counter()
 		search_inputs = self.processor_sat(
 			images=augmented_search_image,
 			return_tensors="pt",
 		)
-		t_sproc = time.perf_counter() - t_sproc_start
-
-		t_total = time.perf_counter() - t_start
-		if self.enable_timing_log:
-			self._timing_acc["io"] += t_io
-			self._timing_acc["augment"] += t_aug
-			self._timing_acc["query_proc"] += t_qproc
-			self._timing_acc["search_proc"] += t_sproc
-			self._timing_acc["total"] += t_total
-			self._timing_count += 1
-
-			if self._timing_count % self.timing_log_interval == 0:
-				den = float(self._timing_count)
-				worker_info = torch.utils.data.get_worker_info()
-				worker_id = worker_info.id if worker_info is not None else 0
-				print(
-					"[DatasetTiming] "
-					f"split={self.split} worker={worker_id} samples={self._timing_count} "
-					f"io={self._timing_acc['io'] / den * 1000.0:.2f}ms "
-					f"aug={self._timing_acc['augment'] / den * 1000.0:.2f}ms "
-					f"query_proc={self._timing_acc['query_proc'] / den * 1000.0:.2f}ms "
-					f"search_proc={self._timing_acc['search_proc'] / den * 1000.0:.2f}ms "
-					f"total={self._timing_acc['total'] / den * 1000.0:.2f}ms"
-				)
 
 		return {
 			"target_pixel_values": query_inputs["pixel_values"][0],
@@ -491,9 +693,15 @@ def initialize_shifted_dataset_like_unified_siglip_supp(
 	drone_image_root: str = DRONE_IMAGE_ROOT,
 	bbox_file: str = BBOX_FILE,
 	train_max_satellite_id: int = TRAIN_MAX_SATELLITE_ID,
+	train_split_file: str = TRAIN_SPLIT_FILE,
+	val_split_file: str = VAL_SPLIT_FILE,
+	test_split_file: str = TEST_SPLIT_FILE,
 	val_split_count: int = VAL_SPLIT_COUNT,
 	max_text_length: int = MAX_TEXT_LENGTH,
 	sat_target_size: Tuple[int, int] = DEFAULT_SAT_TARGET_SIZE,
+	test_crop_ratio: float = DEFAULT_TEST_CROP_RATIO,
+	subset_heights: Optional[Sequence[int]] = None,
+	subset_angles: Optional[Sequence[int]] = None,
 	enable_timing_log: bool = DEFAULT_ENABLE_TIMING_LOG,
 	timing_log_interval: int = DEFAULT_TIMING_LOG_INTERVAL,
 ) -> ShiftedSatelliteDroneDataset:
@@ -521,9 +729,15 @@ def initialize_shifted_dataset_like_unified_siglip_supp(
 		drone_image_root=drone_image_root,
 		bbox_file=bbox_file,
 		train_max_satellite_id=train_max_satellite_id,
+		train_split_file=train_split_file,
+		val_split_file=val_split_file,
+		test_split_file=test_split_file,
 		val_split_count=val_split_count,
 		max_text_length=max_text_length,
 		sat_target_size=sat_target_size,
+		test_crop_ratio=test_crop_ratio,
+		subset_heights=subset_heights,
+		subset_angles=subset_angles,
 		enable_timing_log=enable_timing_log,
 		timing_log_interval=timing_log_interval,
 	)

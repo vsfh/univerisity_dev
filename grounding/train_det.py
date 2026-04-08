@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 @file train_det.py
-@desc Training DetGeoLite on GroundSmgeoDataset with heading prediction.
+@desc Training DetGeoLite on GroundSmgeoDataset.
 """
 
 import time
@@ -10,7 +10,6 @@ import random
 import json
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 import torch.backends.cudnn as cudnn
@@ -23,21 +22,19 @@ from typing import Dict, List, Tuple, Optional
 import argparse
 from ground_cvos import DetGeoLite
 from model.loss import yolo_loss, build_target, adjust_learning_rate
-from utils.utils import AverageMeter, eval_iou_acc
+from utils.utils import AverageMeter, bbox_iou, eval_iou_acc
 from dataset import ShiftedSatelliteDroneDataset
 
 IMG_SIZE = 640
-BATCH_SIZE = 4
+BATCH_SIZE = 2
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
 NUM_EPOCHS = 25
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 PRINT_FREQ = 50
-HEADING_LOSS_WEIGHT = 8.0
 
 UNIV_IMAGE_FOLDER = "/data/feihong/image_1024"
-HEADING_FOLDER = "/data/feihong/range_250"
 UNIV_BBOX_FILE = "/data/feihong/univerisity_dev/runs/test.json"
 UNIV_TRAIN_FILE = "/data/feihong/ckpt/train.txt"
 UNIV_TEST_FILE = "/data/feihong/ckpt/test.txt"
@@ -45,16 +42,9 @@ UNIV_CROP_SIZE = (432, 768)
 UNIV_DRONE_SIZE = (256, 256)
 # Keep satellite tensors in HxW format for the shared dataset pipeline.
 UNIV_SAT_SIZE = (432, 768)
-DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
 
 CVOGL_TRANSFORM = None
-
-HEADING_TO_TARGET = {
-    0: [0.0, 0.0],
-    90: [0.0, 1.0],
-    180: [1.0, 0.0],
-    270: [1.0, 1.0],
-}
 
 
 class TransformProcessorWrapper:
@@ -79,18 +69,6 @@ class DummyTokenizer:
     ):
         del text, padding, truncation, return_tensors
         return {"input_ids": torch.zeros((1, max_length), dtype=torch.long)}
-
-
-def angle_to_heading_target(angle_tensor: torch.Tensor) -> torch.Tensor:
-    # Quantize arbitrary angles to nearest heading target used by this model.
-    angles = torch.remainder(angle_tensor.float(), 360.0)
-    heading_classes = torch.round(angles / 90.0).remainder(4).long()
-    mapping = torch.tensor(
-        [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]],
-        device=angle_tensor.device,
-        dtype=torch.float32,
-    )
-    return mapping[heading_classes]
 
 
 def format_satellite_img_bbox(
@@ -197,7 +175,6 @@ def train_epoch(
     epoch,
     anchors_full,
     img_size,
-    heading_loss_weight,
     print_freq=PRINT_FREQ,
 ):
     """Train for one epoch."""
@@ -207,31 +184,30 @@ def train_epoch(
     losses = AverageMeter()
     geo_losses = AverageMeter()
     cls_losses = AverageMeter()
-    heading_losses = AverageMeter()
 
     end = time.time()
     for batch_idx, batch in enumerate(loader):
         query_imgs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
         rs_imgs = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
         ori_gt_bbox = batch["bbox"].to(DEVICE)
-        heading_target = angle_to_heading_target(batch["angle"].to(DEVICE))
 
-        pred_anchor, _, pred_heading = model(query_imgs, rs_imgs)
+        pred_anchor, _ = model(query_imgs, rs_imgs)
 
         pred_anchor = pred_anchor.view(
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
         )
 
+        image_hw = (rs_imgs.shape[-2], rs_imgs.shape[-1])
+        grid_hw = (pred_anchor.shape[3], pred_anchor.shape[4])
+
         new_gt_bbox, best_anchor_gi_gj = build_target(
-            ori_gt_bbox, anchors_full, img_size, pred_anchor.shape[3]
+            ori_gt_bbox, anchors_full, image_hw, grid_hw
         )
 
         loss_geo, loss_cls = yolo_loss(
-            pred_anchor, new_gt_bbox, anchors_full, best_anchor_gi_gj, img_size
+            pred_anchor, new_gt_bbox, anchors_full, best_anchor_gi_gj, image_hw
         )
-        bbox_loss = loss_geo + loss_cls
-        heading_loss = F.mse_loss(pred_heading, heading_target)
-        loss = bbox_loss + heading_loss * heading_loss_weight
+        loss = loss_geo + loss_cls
 
         optimizer.zero_grad()
         loss.backward()
@@ -240,7 +216,6 @@ def train_epoch(
         losses.update(loss.item(), query_imgs.shape[0])
         geo_losses.update(loss_geo.item(), query_imgs.shape[0])
         cls_losses.update(loss_cls.item(), query_imgs.shape[0])
-        heading_losses.update(heading_loss.item(), query_imgs.shape[0])
 
         batch_time.update(time.time() - end)
         end = time.time()
@@ -251,57 +226,81 @@ def train_epoch(
                 f"Time: {batch_time.val:.3f}\t"
                 f"Loss: {losses.val:.4f} ({losses.avg:.4f})\t"
                 f"Geo: {geo_losses.val:.4f} ({geo_losses.avg:.4f})\t"
-                f"Cls: {cls_losses.val:.4f} ({cls_losses.avg:.4f})\t"
-                f"Heading: {heading_losses.val:.4f} ({heading_losses.avg:.4f})"
+                f"Cls: {cls_losses.val:.4f} ({cls_losses.avg:.4f})"
             )
 
-    return losses.avg, geo_losses.avg, cls_losses.avg, heading_losses.avg
+    return losses.avg, geo_losses.avg, cls_losses.avg
 
 
 def validate(loader, model, anchors_full, img_size):
-    """Validate model."""
+    """Validate model with eval_ground-style metrics."""
     model.eval()
 
-    accu50_meter = AverageMeter()
-    accu25_meter = AverageMeter()
-    iou_meter = AverageMeter()
-    heading_meter = AverageMeter()
+    iou_values: List[float] = []
+    center_distances: List[float] = []
 
     for batch in tqdm(loader, desc="Validating"):
         query_imgs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
         rs_imgs = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
         ori_gt_bbox = batch["bbox"].to(DEVICE)
-        heading_target = angle_to_heading_target(batch["angle"].to(DEVICE))
 
         with torch.no_grad():
-            pred_anchor, _, pred_heading = model(query_imgs, rs_imgs)
+            pred_anchor, _ = model(query_imgs, rs_imgs)
 
         pred_anchor = pred_anchor.view(
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
         )
 
+        image_hw = (rs_imgs.shape[-2], rs_imgs.shape[-1])
+        grid_hw = (pred_anchor.shape[3], pred_anchor.shape[4])
+
         _, best_anchor_gi_gj = build_target(
-            ori_gt_bbox, anchors_full, img_size, pred_anchor.shape[3]
+            ori_gt_bbox, anchors_full, image_hw, grid_hw
         )
 
-        accu_list, accu_center, iou, _, _, _ = eval_iou_acc(
+        _, _, _, _, pred_bbox_xyxy, target_bbox_xyxy = eval_iou_acc(
             pred_anchor,
             ori_gt_bbox,
             anchors_full,
             best_anchor_gi_gj[:, 1],
             best_anchor_gi_gj[:, 2],
-            img_size,
+            image_hw,
             iou_threshold_list=[0.5, 0.25],
         )
 
-        heading_loss = F.mse_loss(pred_heading, heading_target)
+        for idx in range(pred_bbox_xyxy.shape[0]):
+            pred_xyxy = pred_bbox_xyxy[idx].float()
+            gt_xyxy = target_bbox_xyxy[idx].float()
 
-        accu50_meter.update(accu_list[0].item(), query_imgs.shape[0])
-        accu25_meter.update(accu_list[1].item(), query_imgs.shape[0])
-        iou_meter.update(iou.item(), query_imgs.shape[0])
-        heading_meter.update(heading_loss.item(), query_imgs.shape[0])
+            iou = float(
+                bbox_iou(
+                    pred_xyxy.unsqueeze(0),
+                    gt_xyxy.unsqueeze(0),
+                    x1y1x2y2=True,
+                ).item()
+            )
 
-    return accu50_meter.avg, accu25_meter.avg, iou_meter.avg, heading_meter.avg
+            pred_cx = 0.5 * (pred_xyxy[0] + pred_xyxy[2])
+            pred_cy = 0.5 * (pred_xyxy[1] + pred_xyxy[3])
+            gt_cx = 0.5 * (gt_xyxy[0] + gt_xyxy[2])
+            gt_cy = 0.5 * (gt_xyxy[1] + gt_xyxy[3])
+            center_dist = float(
+                torch.sqrt((pred_cx - gt_cx) ** 2 + (pred_cy - gt_cy) ** 2).item()
+            )
+
+            iou_values.append(iou)
+            center_distances.append(center_dist)
+
+    if not iou_values:
+        return 0.0, 0.0, 0.0
+
+    iou_arr = np.array(iou_values, dtype=np.float32)
+    center_arr = np.array(center_distances, dtype=np.float32)
+    mean_iou = float(iou_arr.mean())
+    ratio_iou_gt_0_5 = float((iou_arr > 0.5).mean())
+    mean_center_distance = float(center_arr.mean())
+
+    return mean_iou, ratio_iou_gt_0_5, mean_center_distance
 
 
 def main(args):
@@ -362,42 +361,37 @@ def main(args):
 
     best_iou = -float("Inf")
     update = 0
-    heading_loss_weight = args.heading_loss_weight
     print(f"Starting training for {args.max_epoch} epochs...")
     for epoch in range(args.max_epoch):
         adjust_learning_rate(args, optimizer, epoch)
 
-        train_loss, train_geo, train_cls, train_heading = train_epoch(
+        train_loss, train_geo, train_cls = train_epoch(
             train_loader,
             model,
             optimizer,
             epoch,
             anchors_full,
             args.img_size,
-            heading_loss_weight,
             args.print_freq,
         )
 
-        accu50, accu25, val_iou, val_heading = validate(
+        val_iou, val_ratio_50, val_center_distance = validate(
             val_loader, model, anchors_full, args.img_size
         )
 
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/train_geo", train_geo, epoch)
         writer.add_scalar("Loss/train_cls", train_cls, epoch)
-        writer.add_scalar("Loss/train_heading", train_heading, epoch)
-        writer.add_scalar("Metrics/val_accu50", accu50, epoch)
-        writer.add_scalar("Metrics/val_accu25", accu25, epoch)
         writer.add_scalar("Metrics/val_iou", val_iou, epoch)
-        writer.add_scalar("Metrics/val_heading", val_heading, epoch)
+        writer.add_scalar("Metrics/val_ratio_iou_gt_0_5", val_ratio_50, epoch)
+        writer.add_scalar("Metrics/val_center_distance", val_center_distance, epoch)
 
         print(
             f"Epoch {epoch + 1}/{args.max_epoch}:\t"
-            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f}, Heading: {train_heading:.4f})\t"
-            f"Val Accu50: {accu50:.4f}\t"
-            f"Val Accu25: {accu25:.4f}\t"
-            f"Val IoU: {val_iou:.4f}\t"
-            f"Val Heading: {val_heading:.4f}"
+            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})\t"
+            f"Val Mean IoU: {val_iou:.4f}\t"
+            f"Val IoU>0.5 Ratio: {val_ratio_50:.4f}\t"
+            f"Val Center Dist: {val_center_distance:.4f}"
         )
 
         is_best = val_iou > best_iou
@@ -409,73 +403,16 @@ def main(args):
             update += 1
         if update > 5:
             print("No improvement for 6 epochs, stopping early.")
+            break
 
     print(f"\nTraining complete. Best Val IoU: {best_iou:.4f}")
     writer.close()
 
 
-def eval(args):
-    print("Evaluating checkpoint on test split...")
-    processor = TransformProcessorWrapper()
-    tokenizer = DummyTokenizer()
-    test_dataset = ShiftedSatelliteDroneDataset(
-        processor=processor,
-        processor_sat=processor,
-        tokenizer=tokenizer,
-        split="test",
-    )
-
-    if args.subset_height is not None or args.subset_angle is not None:
-        subset_indices = []
-        for idx, sample in enumerate(test_dataset.samples):
-            if args.subset_height is not None and int(sample["height"]) != args.subset_height:
-                continue
-            if args.subset_angle is not None and int(sample["angle"]) != args.subset_angle:
-                continue
-            subset_indices.append(idx)
-        if not subset_indices:
-            print(
-                f"No samples for subset filters: height={args.subset_height}, angle={args.subset_angle}"
-            )
-            return
-        test_dataset = Subset(test_dataset, subset_indices)
-        print(
-            f"Subset test samples: {len(subset_indices)} (height={args.subset_height}, angle={args.subset_angle})"
-        )
-    else:
-        print(f"Full test samples: {len(test_dataset)}")
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        pin_memory=True,
-        drop_last=False,
-        num_workers=args.num_workers,
-        persistent_workers=args.num_workers > 0,
-    )
-
-    model = DetGeoLite(emb_size=512).to(DEVICE)
-    checkpoint_path = args.checkpoint_path or f"{args.checkpoint}/best.pth"
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=False)
-
-    anchors_full = np.array([float(x) for x in ANCHORS.split(",")])
-    anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
-    anchors_full = torch.tensor(anchors_full, dtype=torch.float32).to(DEVICE)
-
-    accu50, accu25, val_iou, val_heading = validate(
-        test_loader, model, anchors_full, args.img_size
-    )
-    print(
-        f"Eval Accu50: {accu50:.4f}, Accu25: {accu25:.4f}, IoU: {val_iou:.4f}, Heading: {val_heading:.4f}"
-    )
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="DetGeoLite Training on GroundSmgeoDataset with Heading"
+        description="DetGeoLite Training on GroundSmgeoDataset"
     )
     parser.add_argument(
         "--num-workers", type=int, default=8, help="num workers for data loading"
@@ -486,12 +423,6 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="learning rate")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="batch size")
     parser.add_argument("--img-size", type=int, default=IMG_SIZE, help="image size")
-    parser.add_argument(
-        "--heading-loss-weight",
-        type=float,
-        default=HEADING_LOSS_WEIGHT,
-        help="heading loss weight",
-    )
     parser.add_argument(
         "--savename", type=str, default="ground_det", help="Name head for saved model"
     )

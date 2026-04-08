@@ -413,21 +413,6 @@ class DetGeoLite(nn.Module):
             nn.Conv2d(emb_size // 2, 1, kernel_size=1),
         )
 
-        self.bbox_heading = nn.Sequential(
-            nn.ConvTranspose2d(
-                in_channels=emb_size,
-                out_channels=emb_size // 2,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.ReLU(inplace=True),
-            ResidualBlock(emb_size // 2),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(emb_size // 2, 2),
-        )
-
     def forward(self, query_imgs, reference_imgs, click_pts=None):
         if click_pts is not None:
             click_pts = click_pts.unsqueeze(1)
@@ -456,9 +441,8 @@ class DetGeoLite(nn.Module):
 
         outbox = self.fcn_out(fused_features)
         coodrs = self.coodrs_out(fused_features)
-        pred_heading = torch.sigmoid(self.bbox_heading(fused_features))
 
-        return outbox, coodrs, pred_heading
+        return outbox, coodrs
 
     def bbox_forward(self, query_imgs, reference_imgs, click_pts=None):
         if click_pts is not None:
@@ -488,9 +472,8 @@ class DetGeoLite(nn.Module):
 
         outbox = self.fcn_out(fused_features)
         coodrs = self.coodrs_out(fused_features)
-        pred_heading = torch.sigmoid(self.bbox_heading(fused_features))
 
-        return outbox, coodrs, pred_heading
+        return outbox, coodrs
 
 
 def visualize_bbox_comparison(

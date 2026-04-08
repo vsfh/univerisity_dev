@@ -1,0 +1,471 @@
+import json
+import os
+import random
+import importlib.util
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Set
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from transformers import AutoImageProcessor, AutoTokenizer, CLIPProcessor
+
+import open_clip
+
+from dataset import ShiftedSatelliteDroneDataset
+from train_clip import (
+	CACHE_DIR as CLIP_CACHE_DIR,
+	MODEL_NAME as CLIP_MODEL_NAME,
+	PROJECTION_DIM as CLIP_PROJECTION_DIM,
+	Encoder as ClipEncoder,
+	_set_processor_size as set_clip_processor_size,
+)
+from train_evaclip import (
+	CACHE_DIR as EVACLIP_CACHE_DIR,
+	MODEL_NAME as EVACLIP_MODEL_NAME,
+	PROJECTION_DIM as EVACLIP_PROJECTION_DIM,
+	Encoder as EvaClipEncoder,
+	OpenClipImageProcessorWrapper as EvaImageProcessorWrapper,
+	OpenClipTokenizerWrapper as EvaTokenizerWrapper,
+)
+from train_openclip import (
+	CACHE_DIR as OPENCLIP_CACHE_DIR,
+	MODEL_NAME as OPENCLIP_MODEL_NAME,
+	PRETRAINED as OPENCLIP_PRETRAINED,
+	PROJECTION_DIM as OPENCLIP_PROJECTION_DIM,
+	Encoder as OpenClipEncoder,
+	OpenClipImageProcessorWrapper,
+	OpenClipTokenizerWrapper,
+)
+from train_siglip import (
+	CACHE_DIR as SIGLIP_CACHE_DIR,
+	DEFAULT_SUBSET_ANGLES,
+	DEFAULT_SUBSET_HEIGHTS,
+	MODEL_NAME as SIGLIP_MODEL_NAME,
+	PROCESSOR_IMAGE_SIZE,
+	PROJECTION_DIM as SIGLIP_PROJECTION_DIM,
+	Encoder as SiglipEncoder,
+	_set_processor_size as set_siglip_processor_size,
+)
+
+
+SEED = 43
+random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_encoder_abla_class():
+	"""Load root model.py explicitly to avoid import ambiguity."""
+	model_path = REPO_ROOT / "model.py"
+	spec = importlib.util.spec_from_file_location("root_model_module", str(model_path))
+	if spec is None or spec.loader is None:
+		raise ImportError(f"Unable to load model module from: {model_path}")
+	module = importlib.util.module_from_spec(spec)
+	spec.loader.exec_module(module)
+	return module.Encoder_abla
+
+
+EncoderAbla = _load_encoder_abla_class()
+
+
+EVAL_CONFIG = {
+	"device": None,
+	"include_file": "/data/feihong/ckpt/include.json",
+	"subset_heights": [300],
+	"subset_angles": [0],
+	"candidate_size": 100,
+	"batch_size": 16,
+	"num_workers": 8,
+	"models": {
+		"siglip": {"run": True, "checkpoint": '/data/feihong/ckpt/retrieval_siglip/best.pth'},
+		"encoder_abla": {"run": False, "checkpoint": None},
+		"clip": {"run": False, "checkpoint": None},
+		"openclip": {"run": False, "checkpoint": None},
+		"evaclip": {"run": False, "checkpoint": None},
+	},
+}
+
+
+def _canonical_model_type(model_type: str) -> str:
+	name = model_type.lower()
+	if name in {"abla", "encoder_abla"}:
+		return "encoder_abla"
+	return name
+
+
+def _is_encoder_abla(model_type: str) -> bool:
+	return _canonical_model_type(model_type) == "encoder_abla"
+
+
+def _normalize_subset(values: Optional[Sequence[int]], defaults: Sequence[int]) -> Set[int]:
+	if values is None:
+		return {int(v) for v in defaults}
+	return {int(v) for v in values}
+
+
+def _normalize_label(label: str) -> str:
+	return str(label).strip().split(".")[0]
+
+
+def _load_include_map(include_file: Optional[str]) -> Dict[str, Set[str]]:
+	include_map: Dict[str, Set[str]] = {}
+	if not include_file:
+		return include_map
+	if not os.path.exists(include_file):
+		print(f"Warning: include file not found: {include_file}. Fallback to exact-match GT.")
+		return include_map
+
+	with open(include_file, "r", encoding="utf-8") as f:
+		include_raw = json.load(f)
+
+	for key, values in include_raw.items():
+		norm_key = _normalize_label(key)
+		if isinstance(values, list):
+			include_map[norm_key] = {_normalize_label(v) for v in values}
+		else:
+			include_map[norm_key] = {_normalize_label(values)}
+
+	return include_map
+
+
+def _default_checkpoint_for(model_type: str) -> str:
+	model_type = _canonical_model_type(model_type)
+	return str(REPO_ROOT / "ckpt" / f"retrieval_{model_type}" / "best.pth")
+
+
+def _build_model_and_io(model_type: str, device: str):
+	model_type = _canonical_model_type(model_type)
+
+	if model_type == "siglip":
+		processor = AutoImageProcessor.from_pretrained(
+			SIGLIP_MODEL_NAME,
+			cache_dir=SIGLIP_CACHE_DIR,
+		)
+		processor_sat = AutoImageProcessor.from_pretrained(
+			SIGLIP_MODEL_NAME,
+			cache_dir=SIGLIP_CACHE_DIR,
+		)
+		set_siglip_processor_size(processor_sat, PROCESSOR_IMAGE_SIZE)
+		tokenizer = AutoTokenizer.from_pretrained(SIGLIP_MODEL_NAME)
+		model = SiglipEncoder(SIGLIP_MODEL_NAME, proj_dim=SIGLIP_PROJECTION_DIM).to(device)
+		return model, processor, processor_sat, tokenizer
+
+	if model_type == "encoder_abla":
+		processor = AutoImageProcessor.from_pretrained(
+			SIGLIP_MODEL_NAME,
+			cache_dir=SIGLIP_CACHE_DIR,
+		)
+		processor_sat = AutoImageProcessor.from_pretrained(
+			SIGLIP_MODEL_NAME,
+			cache_dir=SIGLIP_CACHE_DIR,
+		)
+		set_siglip_processor_size(processor_sat, PROCESSOR_IMAGE_SIZE)
+		tokenizer = AutoTokenizer.from_pretrained(SIGLIP_MODEL_NAME)
+		model = EncoderAbla(
+			model_name=SIGLIP_MODEL_NAME,
+			proj_dim=SIGLIP_PROJECTION_DIM,
+			usesg=True,
+			useap=True,
+		).to(device)
+		return model, processor, processor_sat, tokenizer
+
+	if model_type == "clip":
+		processor = CLIPProcessor.from_pretrained(
+			CLIP_MODEL_NAME,
+			cache_dir=CLIP_CACHE_DIR,
+		)
+		processor_sat = CLIPProcessor.from_pretrained(
+			CLIP_MODEL_NAME,
+			cache_dir=CLIP_CACHE_DIR,
+		)
+		set_clip_processor_size(processor_sat, PROCESSOR_IMAGE_SIZE)
+		tokenizer = AutoTokenizer.from_pretrained(CLIP_MODEL_NAME, cache_dir=CLIP_CACHE_DIR)
+		model = ClipEncoder(CLIP_MODEL_NAME, proj_dim=CLIP_PROJECTION_DIM).to(device)
+		return model, processor, processor_sat, tokenizer
+
+	if model_type == "openclip":
+		_, _, preprocess = open_clip.create_model_and_transforms(
+			OPENCLIP_MODEL_NAME,
+			pretrained=OPENCLIP_PRETRAINED,
+			cache_dir=OPENCLIP_CACHE_DIR,
+		)
+		tokenizer = open_clip.get_tokenizer(OPENCLIP_MODEL_NAME)
+		processor_wrapper = OpenClipImageProcessorWrapper(preprocess)
+		tokenizer_wrapper = OpenClipTokenizerWrapper(tokenizer)
+		model = OpenClipEncoder(
+			model_name=OPENCLIP_MODEL_NAME,
+			pretrained=OPENCLIP_PRETRAINED,
+			proj_dim=OPENCLIP_PROJECTION_DIM,
+		).to(device)
+		return model, processor_wrapper, processor_wrapper, tokenizer_wrapper
+
+	if model_type == "evaclip":
+		_, _, preprocess = open_clip.create_model_and_transforms(
+			EVACLIP_MODEL_NAME,
+			cache_dir=EVACLIP_CACHE_DIR,
+		)
+		tokenizer = open_clip.get_tokenizer(EVACLIP_MODEL_NAME)
+		processor_wrapper = EvaImageProcessorWrapper(preprocess)
+		tokenizer_wrapper = EvaTokenizerWrapper(tokenizer)
+		model = EvaClipEncoder(
+			model_name=EVACLIP_MODEL_NAME,
+			proj_dim=EVACLIP_PROJECTION_DIM,
+		).to(device)
+		return model, processor_wrapper, processor_wrapper, tokenizer_wrapper
+
+	raise ValueError(f"Unsupported model type: {model_type}")
+
+
+def _extract_features(
+	model_type: str,
+	checkpoint_path: Optional[str],
+	device: str,
+	batch_size: int,
+	num_workers: int,
+	subset_heights: Sequence[int],
+	subset_angles: Sequence[int],
+):
+	model_type = _canonical_model_type(model_type)
+	model, processor, processor_sat, tokenizer = _build_model_and_io(model_type, device)
+
+	resolved_checkpoint = checkpoint_path or _default_checkpoint_for(model_type)
+	if not os.path.exists(resolved_checkpoint):
+		raise FileNotFoundError(f"Checkpoint not found: {resolved_checkpoint}")
+
+	model.load_state_dict(torch.load(resolved_checkpoint, map_location="cpu"), strict=False)
+	model.eval()
+
+	dataset = ShiftedSatelliteDroneDataset(
+		processor=processor,
+		processor_sat=processor_sat,
+		tokenizer=tokenizer,
+		split="test",
+		subset_heights=list(subset_heights),
+		subset_angles=list(subset_angles),
+	)
+	loader = DataLoader(
+		dataset,
+		batch_size=batch_size,
+		shuffle=False,
+		num_workers=num_workers,
+		pin_memory=device.startswith("cuda"),
+		persistent_workers=num_workers > 0,
+		prefetch_factor=4 if num_workers > 0 else None,
+	)
+
+	query_feats: List[torch.Tensor] = []
+	query_labels: List[str] = []
+	gallery_feat_dict: Dict[str, torch.Tensor] = {}
+
+	with torch.inference_mode():
+		for batch in tqdm(loader, desc=f"Extract features [{model_type}]"):
+			query_inputs = batch["target_pixel_values"].to(device, non_blocking=True)
+			search_inputs = batch["search_pixel_values"].to(device, non_blocking=True)
+			input_ids = batch["input_ids"].to(device, non_blocking=True)
+			satellite_paths = batch["satellite_path"]
+
+			if _is_encoder_abla(model_type):
+				_, _, _, _, grid_feats, fused_feats = model(query_inputs, search_inputs, input_ids)
+				if fused_feats is None:
+					raise RuntimeError("Encoder_abla did not return fused query features.")
+				fused_query_feats = F.normalize(fused_feats, p=2, dim=1)
+				gallery_grid_batch = F.normalize(grid_feats, p=2, dim=2)
+			else:
+				attention_mask = (input_ids != 0).long()
+				anchor_feats = model.query_forward(query_inputs)
+				# Different model wrappers expose text_forward with or without attention_mask.
+				try:
+					text_feats = model.text_forward(input_ids, attention_mask)
+				except TypeError:
+					text_feats = model.text_forward(input_ids)
+				fused_query_feats = F.normalize(anchor_feats + text_feats, p=2, dim=1)
+				gallery_grid_batch = None
+			query_feats.append(fused_query_feats.cpu())
+
+			batch_labels = [
+				os.path.splitext(os.path.basename(path))[0] for path in satellite_paths
+			]
+			query_labels.extend(batch_labels)
+
+			unseen_indices = []
+			unseen_labels = []
+			for i, label in enumerate(batch_labels):
+				if label not in gallery_feat_dict:
+					unseen_indices.append(i)
+					unseen_labels.append(label)
+
+			if unseen_indices:
+				if _is_encoder_abla(model_type):
+					gallery_grid = gallery_grid_batch[unseen_indices]
+				else:
+					gallery_batch = search_inputs[unseen_indices]
+					with torch.amp.autocast("cuda", enabled=False):
+						gallery_grid = model.ref_forward(gallery_batch)
+						gallery_grid = F.normalize(gallery_grid, p=2, dim=2)
+				gallery_grid = gallery_grid.cpu()
+				for i, label in enumerate(unseen_labels):
+					gallery_feat_dict[label] = gallery_grid[i]
+
+	if not query_feats or not gallery_feat_dict:
+		raise RuntimeError("No valid query/gallery features extracted.")
+
+	query_tensor = torch.cat(query_feats, dim=0)
+	gallery_labels = sorted(gallery_feat_dict.keys())
+	gallery_tensor = torch.stack([gallery_feat_dict[label] for label in gallery_labels], dim=0)
+
+	return query_tensor, query_labels, gallery_tensor, gallery_labels
+
+
+def _score_recall(
+	query_feats: torch.Tensor,
+	query_labels: List[str],
+	gallery_feats: torch.Tensor,
+	gallery_labels: List[str],
+	include_map: Dict[str, Set[str]],
+	device: str,
+	candidate_size: Optional[int] = None,
+) -> Dict[str, float]:
+	label_to_gallery_index = {label: idx for idx, label in enumerate(gallery_labels)}
+	norm_gallery_labels = [_normalize_label(label) for label in gallery_labels]
+
+	query_feats = query_feats.to(device)
+	gallery_feats = gallery_feats.to(device)
+
+	valid_queries = 0
+	top1 = 0
+	top5 = 0
+	top10 = 0
+
+	all_indices = list(range(len(gallery_labels)))
+	if candidate_size is not None:
+		candidate_size = int(candidate_size)
+		if candidate_size <= 0:
+			raise ValueError("candidate_size must be a positive integer.")
+
+	for q_idx, gt_label in enumerate(query_labels):
+		gt_gallery_index = label_to_gallery_index.get(gt_label)
+		if gt_gallery_index is None:
+			continue
+
+		gt_norm = _normalize_label(gt_label)
+		positive_label_set = set(include_map.get(gt_norm, set()))
+		positive_label_set.add(gt_norm)
+
+		if candidate_size is None or candidate_size >= len(all_indices):
+			candidate_indices = all_indices
+		else:
+			negative_pool = [idx for idx in all_indices if idx != gt_gallery_index]
+			sampled_negatives = random.sample(negative_pool, candidate_size - 1)
+			candidate_indices = sampled_negatives + [gt_gallery_index]
+			# random.shuffle(candidate_indices)
+
+		candidate_gallery_feats = gallery_feats[candidate_indices]
+		score_vec = torch.einsum("d,knd->kn", query_feats[q_idx], candidate_gallery_feats).mean(dim=1)
+		k_max = min(10, score_vec.shape[0])
+		topk_local_indices = torch.topk(score_vec, k=k_max, dim=0).indices.tolist()
+
+		positive_local_indices = [
+			local_idx
+			for local_idx, global_idx in enumerate(candidate_indices)
+			if norm_gallery_labels[global_idx] in positive_label_set
+		]
+
+		valid_queries += 1
+		if any(idx in topk_local_indices[:1] for idx in positive_local_indices):
+			top1 += 1
+		if any(idx in topk_local_indices[: min(5, k_max)] for idx in positive_local_indices):
+			top5 += 1
+		if any(idx in topk_local_indices[: min(10, k_max)] for idx in positive_local_indices):
+			top10 += 1
+
+	if valid_queries == 0:
+		raise RuntimeError("No valid queries matched gallery labels.")
+
+	return {
+		"num_queries": valid_queries,
+		"recall@1": top1 / valid_queries,
+		"recall@5": top5 / valid_queries,
+		"recall@10": top10 / valid_queries,
+		"top1_hits": top1,
+		"top5_hits": top5,
+		"top10_hits": top10,
+	}
+
+
+def eval(
+	model_type: str,
+	checkpoint_path: Optional[str] = None,
+	subset_heights: Optional[Sequence[int]] = None,
+	subset_angles: Optional[Sequence[int]] = None,
+	candidate_size: Optional[int] = None,
+	include_file: str = "/data/feihong/ckpt/include.json",
+	batch_size: int = 16,
+	num_workers: int = 8,
+	device: Optional[str] = None,
+) -> Dict[str, float]:
+	if device is None:
+		device = "cuda" if torch.cuda.is_available() else "cpu"
+
+	subset_height_set = _normalize_subset(subset_heights, DEFAULT_SUBSET_HEIGHTS)
+	subset_angle_set = _normalize_subset(subset_angles, DEFAULT_SUBSET_ANGLES)
+	include_map = _load_include_map(include_file)
+
+	print(
+		f"Evaluating {model_type} with heights={sorted(subset_height_set)} "
+		f"angles={sorted(subset_angle_set)} candidate_size={candidate_size}"
+	)
+
+	query_feats, query_labels, gallery_feats, gallery_labels = _extract_features(
+		model_type=model_type,
+		checkpoint_path=checkpoint_path,
+		device=device,
+		batch_size=batch_size,
+		num_workers=num_workers,
+		subset_heights=sorted(subset_height_set),
+		subset_angles=sorted(subset_angle_set),
+	)
+
+	metrics = _score_recall(
+		query_feats=query_feats,
+		query_labels=query_labels,
+		gallery_feats=gallery_feats,
+		gallery_labels=gallery_labels,
+		include_map=include_map,
+		device=device,
+		candidate_size=candidate_size,
+	)
+
+	n = metrics["num_queries"]
+	print(
+		f"Recall@1: {metrics['top1_hits']} / {n} ({metrics['recall@1'] * 100:.2f}%)\n"
+		f"Recall@5: {metrics['top5_hits']} / {n} ({metrics['recall@5'] * 100:.2f}%)\n"
+		f"Recall@10: {metrics['top10_hits']} / {n} ({metrics['recall@10'] * 100:.2f}%)"
+	)
+	return metrics
+
+
+
+if __name__ == "__main__":
+    model_cfg = EVAL_CONFIG["models"]
+    selected_models = [name for name, cfg in model_cfg.items() if cfg.get("run", False)]
+
+    if not selected_models:
+        raise ValueError("No model selected. Set EVAL_CONFIG['models'][name]['run'] = True.")
+
+
+    for model_type in selected_models:
+        eval(
+            model_type=model_type,
+            checkpoint_path=model_cfg[model_type].get("checkpoint"),
+            subset_heights=EVAL_CONFIG["subset_heights"],
+            subset_angles=EVAL_CONFIG["subset_angles"],
+            candidate_size=EVAL_CONFIG["candidate_size"],
+            include_file=EVAL_CONFIG["include_file"],
+            batch_size=EVAL_CONFIG["batch_size"],
+            num_workers=EVAL_CONFIG["num_workers"],
+            device=EVAL_CONFIG["device"],
+        )

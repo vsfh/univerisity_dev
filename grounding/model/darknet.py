@@ -309,15 +309,21 @@ class YOLOLayer(nn.Module):
     def forward(self, x, targets=None):
         nA = self.num_anchors
         nB = x.size(0)
-        nG = x.size(2)
-        stride = self.image_dim / nG
+        nGh = x.size(2)
+        nGw = x.size(3)
+        stride_y = self.image_dim / nGh
+        stride_x = self.image_dim / nGw
 
         # Tensors for cuda support
         FloatTensor = torch.cuda.FloatTensor if x.is_cuda else torch.FloatTensor
         LongTensor = torch.cuda.LongTensor if x.is_cuda else torch.LongTensor
         ByteTensor = torch.cuda.ByteTensor if x.is_cuda else torch.ByteTensor
 
-        prediction = x.view(nB, nA, self.bbox_attrs, nG, nG).permute(0, 1, 3, 4, 2).contiguous()
+        prediction = (
+            x.view(nB, nA, self.bbox_attrs, nGh, nGw)
+            .permute(0, 1, 3, 4, 2)
+            .contiguous()
+        )
 
         # Get outputs
         x = torch.sigmoid(prediction[..., 0])  # Center x
@@ -328,12 +334,27 @@ class YOLOLayer(nn.Module):
         pred_cls = torch.sigmoid(prediction[..., 5:])  # Cls pred.
 
         # Calculate offsets for each grid
-        grid_x = torch.arange(nG).repeat(nG, 1).view([1, 1, nG, nG]).type(FloatTensor).to(x.device)
-        grid_y = torch.arange(nG).repeat(nG, 1).t().view([1, 1, nG, nG]).type(FloatTensor).to(x.device)
+        grid_x = (
+            torch.arange(nGw)
+            .repeat(nGh, 1)
+            .view([1, 1, nGh, nGw])
+            .type(FloatTensor)
+            .to(x.device)
+        )
+        grid_y = (
+            torch.arange(nGh)
+            .unsqueeze(1)
+            .repeat(1, nGw)
+            .view([1, 1, nGh, nGw])
+            .type(FloatTensor)
+            .to(x.device)
+        )
         # scaled_anchors = FloatTensor([(a_w / stride, a_h / stride) for a_w, a_h in self.anchors])
         #sunyuxi
         #scaled_anchors = FloatTensor([(a_w / (416 / nG), a_h / (416 / nG)) for a_w, a_h in self.anchors])
-        scaled_anchors = FloatTensor([(a_w / stride, a_h / stride) for a_w, a_h in self.anchors]).to(x.device)
+        scaled_anchors = FloatTensor(
+            [(a_w / stride_x, a_h / stride_y) for a_w, a_h in self.anchors]
+        ).to(x.device)
         anchor_w = scaled_anchors[:, 0:1].view((1, nA, 1, 1))
         anchor_h = scaled_anchors[:, 1:2].view((1, nA, 1, 1))
 
@@ -346,6 +367,11 @@ class YOLOLayer(nn.Module):
 
         # Training
         if targets is not None:
+            if nGh != nGw:
+                raise ValueError(
+                    "YOLOLayer target building currently expects square feature grids. "
+                    f"Got nGh={nGh}, nGw={nGw}."
+                )
             targets = targets.clone()
             targets[:,:,1:] = targets[:,:,1:]/self.image_dim
             for b_i in range(targets.shape[0]):
@@ -364,7 +390,7 @@ class YOLOLayer(nn.Module):
                 anchors=scaled_anchors.cpu().data,
                 num_anchors=nA,
                 num_classes=self.num_classes,
-                grid_size=nG,
+                grid_size=nGh,
                 ignore_thres=self.ignore_thres,
                 img_dim=self.image_dim,
             )
@@ -413,9 +439,14 @@ class YOLOLayer(nn.Module):
 
         else:
             # If not in training phase return predictions
+            pred_boxes_scaled = pred_boxes.clone()
+            pred_boxes_scaled[..., 0] = pred_boxes_scaled[..., 0] * stride_x
+            pred_boxes_scaled[..., 1] = pred_boxes_scaled[..., 1] * stride_y
+            pred_boxes_scaled[..., 2] = pred_boxes_scaled[..., 2] * stride_x
+            pred_boxes_scaled[..., 3] = pred_boxes_scaled[..., 3] * stride_y
             output = torch.cat(
                 (
-                    pred_boxes.view(nB, -1, 4) * stride,
+                    pred_boxes_scaled.view(nB, -1, 4),
                     pred_conf.view(nB, -1, 1),
                     pred_cls.view(nB, -1, self.num_classes),
                 ),
@@ -438,6 +469,13 @@ class Darknet(nn.Module):
         self.header_info = np.array([0, 0, 0, self.seen, 0])
         self.loss_names = ["x", "y", "w", "h", "conf", "cls", "recall", "precision"]
 
+    @staticmethod
+    def _align_to_min_spatial(tensors):
+        """Crop tensors to a common (min_h, min_w) so route/shortcut ops are shape-safe."""
+        min_h = min(t.shape[2] for t in tensors)
+        min_w = min(t.shape[3] for t in tensors)
+        return [t[:, :, :min_h, :min_w] for t in tensors]
+
     def forward(self, x, targets=None):
         assert targets is None
         
@@ -451,10 +489,13 @@ class Darknet(nn.Module):
                 x = module(x)
             elif module_def["type"] == "route":
                 layer_i = [int(x) for x in module_def["layers"].split(",")]
-                x = torch.cat([layer_outputs[i] for i in layer_i], 1)
+                route_tensors = [layer_outputs[i] for i in layer_i]
+                route_tensors = self._align_to_min_spatial(route_tensors)
+                x = torch.cat(route_tensors, 1)
             elif module_def["type"] == "shortcut":
                 layer_i = int(module_def["from"])
-                x = layer_outputs[-1] + layer_outputs[layer_i]
+                a, b = self._align_to_min_spatial([layer_outputs[-1], layer_outputs[layer_i]])
+                x = a + b
             elif module_def["type"] == "yoloconvolutional":
                 output.append(x)    ## save final feature block
                 x = module(x)
