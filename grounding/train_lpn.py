@@ -8,6 +8,7 @@
 import time
 import random
 import json
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,11 +20,17 @@ from torch.optim import Adam
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image, ImageDraw
 import os
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import argparse
 from ground_cvos import LPNGeoLite
 from model.loss import yolo_loss, build_target, adjust_learning_rate
 from utils.utils import AverageMeter, eval_iou_acc
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from dataset import ShiftedSatelliteDroneDataset
 
 IMG_SIZE = 640

@@ -1,24 +1,7 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Unified grounding evaluation using shared test split from root dataset.py.
-Metrics:
-- mean IoU
-- ratio(IoU > 0.5)
-- mean center distance (pixels)
-- optional subset filtering by drone heights/angles
-
-Supports model types:
-- siglip
-- det
-- lpn
-- smgeo
-- trogeolite
-"""
-
 import importlib.util
 import json
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -70,6 +53,26 @@ EVAL_CONFIG = {
 }
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_encoder_abla_class():
+    """Load root model.py explicitly to avoid import ambiguity."""
+    repo_root_str = str(REPO_ROOT)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+    model_path = REPO_ROOT / "model.py"
+    spec = importlib.util.spec_from_file_location("root_model_module", str(model_path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load model module from: {model_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.Encoder_abla
+
+
+EncoderAbla = _load_encoder_abla_class()
+
+
 def _load_shared_dataset_class():
     """Load root dataset.py explicitly to avoid importing grounding/dataset.py by name."""
     dataset_path = Path(__file__).resolve().parents[1] / "dataset.py"
@@ -83,19 +86,6 @@ def _load_shared_dataset_class():
 
 ShiftedSatelliteDroneDataset = _load_shared_dataset_class()
 
-
-def _load_encoder_abla_class():
-    """Load root model.py explicitly to avoid importing grounding/model package."""
-    model_path = Path(__file__).resolve().parents[1] / "model.py"
-    spec = importlib.util.spec_from_file_location("root_model_module", str(model_path))
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Unable to load model module from: {model_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.Encoder_abla
-
-
-EncoderAbla = _load_encoder_abla_class()
 
 
 class TransformProcessorWrapper:

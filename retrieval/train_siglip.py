@@ -7,11 +7,17 @@ from transformers import AutoImageProcessor, AutoModel, AutoTokenizer
 from PIL import Image
 from tqdm import tqdm
 import os
+import sys
 from glob import glob
+from pathlib import Path
 import numpy as np
 import random
 from torch.utils.tensorboard import SummaryWriter
 import json
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from dataset import ShiftedSatelliteDroneDataset
 

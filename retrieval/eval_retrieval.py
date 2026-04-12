@@ -2,18 +2,20 @@ import json
 import os
 import random
 import importlib.util
+import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoImageProcessor, AutoTokenizer, CLIPProcessor
+from PIL import Image, ImageDraw
+import numpy as np
 
 import open_clip
 
-from dataset import ShiftedSatelliteDroneDataset
 from train_clip import (
 	CACHE_DIR as CLIP_CACHE_DIR,
 	MODEL_NAME as CLIP_MODEL_NAME,
@@ -57,9 +59,17 @@ torch.cuda.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+if str(REPO_ROOT) not in sys.path:
+	sys.path.insert(0, str(REPO_ROOT))
+
+from dataset import ShiftedSatelliteDroneDataset
+from unified_siglip_supp import visualize_batch
 
 def _load_encoder_abla_class():
 	"""Load root model.py explicitly to avoid import ambiguity."""
+	repo_root_str = str(REPO_ROOT)
+	if repo_root_str not in sys.path:
+		sys.path.insert(0, repo_root_str)
 	model_path = REPO_ROOT / "model.py"
 	spec = importlib.util.spec_from_file_location("root_model_module", str(model_path))
 	if spec is None or spec.loader is None:
@@ -74,15 +84,25 @@ EncoderAbla = _load_encoder_abla_class()
 
 EVAL_CONFIG = {
 	"device": None,
-	"include_file": "/data/feihong/ckpt/include.json",
-	"subset_heights": [300],
+	"include_file": "/data/feihong/ckpt/include_train.json",
+	"subset_heights": [250],
 	"subset_angles": [0],
 	"candidate_size": 100,
 	"batch_size": 16,
 	"num_workers": 8,
+	"pca_visualization": {
+		"run": False,
+		"output_dir": "runs/visualizations/pca_search",
+		"max_batches": 1,
+		"max_images_per_batch": 8,
+	},
+	"error_analysis": {
+		"run": True,
+		"output_dir": "runs/visualizations/retrieval_top1_errors",
+	},
 	"models": {
-		"siglip": {"run": True, "checkpoint": '/data/feihong/ckpt/retrieval_siglip/best.pth'},
-		"encoder_abla": {"run": False, "checkpoint": None},
+		"siglip": {"run": False, "checkpoint": '/data/feihong/ckpt/retrieval_siglip/best.pth'},
+		"encoder_abla": {"run": True, "checkpoint": '/data/feihong/ckpt/rope_0.1/last.pth'},
 		"clip": {"run": False, "checkpoint": None},
 		"openclip": {"run": False, "checkpoint": None},
 		"evaclip": {"run": False, "checkpoint": None},
@@ -137,6 +157,176 @@ def _default_checkpoint_for(model_type: str) -> str:
 	return str(REPO_ROOT / "ckpt" / f"retrieval_{model_type}" / "best.pth")
 
 
+def _infer_token_grid_hw(n_tokens: int, input_h: int, input_w: int) -> Tuple[int, int]:
+	"""Infer token grid (h, w) from token count using input image aspect ratio."""
+	if n_tokens <= 0:
+		return 1, 1
+
+	target_ratio = float(input_w) / max(float(input_h), 1.0)
+	best_h, best_w = 1, int(n_tokens)
+	best_score = abs((best_w / max(float(best_h), 1.0)) - target_ratio)
+
+	max_factor = int(n_tokens**0.5)
+	for h in range(1, max_factor + 1):
+		if n_tokens % h != 0:
+			continue
+		w = n_tokens // h
+		for hh, ww in ((h, w), (w, h)):
+			ratio = float(ww) / max(float(hh), 1.0)
+			score = abs(ratio - target_ratio)
+			if score < best_score:
+				best_h, best_w = int(hh), int(ww)
+				best_score = score
+
+	return best_h, best_w
+
+
+def _load_rgb_or_blank(path: Optional[str], fallback_size: Tuple[int, int] = (640, 640)) -> Image.Image:
+	if path and os.path.exists(path):
+		try:
+			return Image.open(path).convert("RGB")
+		except Exception:
+			pass
+	return Image.new("RGB", fallback_size, color=(20, 20, 20))
+
+
+def _save_correct_pair_image(
+	drone_path: Optional[str],
+	gt_satellite_path: Optional[str],
+	pred_satellite_index: int,
+	pred_satellite_path: Optional[str],
+	gt_label: str,
+	pred_label: str,
+	output_path: str,
+) -> None:
+	"""Save one image containing the correct drone-satellite pair, with wrong top1 index metadata."""
+	drone_img = _load_rgb_or_blank(drone_path, fallback_size=(256, 256))
+	gt_sat_img = _load_rgb_or_blank(gt_satellite_path, fallback_size=(640, 640))
+
+	target_h = 512
+	drone_w = max(1, int(round(drone_img.width * target_h / max(1, drone_img.height))))
+	gt_w = max(1, int(round(gt_sat_img.width * target_h / max(1, gt_sat_img.height))))
+	drone_img = drone_img.resize((drone_w, target_h), Image.Resampling.BILINEAR)
+	gt_sat_img = gt_sat_img.resize((gt_w, target_h), Image.Resampling.BILINEAR)
+
+	pad = 12
+	header_h = 70
+	canvas_w = pad * 3 + drone_w + gt_w
+	canvas_h = header_h + pad * 2 + target_h
+	canvas = Image.new("RGB", (canvas_w, canvas_h), color=(15, 15, 15))
+
+	canvas.paste(drone_img, (pad, header_h + pad))
+	canvas.paste(gt_sat_img, (pad * 2 + drone_w, header_h + pad))
+
+	draw = ImageDraw.Draw(canvas)
+	draw.text(
+		(pad, 8),
+		f"Top1 Miss | wrong_sat_index={pred_satellite_index} | pred={pred_label} | gt={gt_label}",
+		fill=(240, 240, 240),
+	)
+	draw.text(
+		(pad, 30),
+		"Left: Drone query (correct) | Right: GT satellite (correct pair)",
+		fill=(180, 220, 180),
+	)
+	if pred_satellite_path:
+		draw.text(
+			(pad, 50),
+			f"Pred satellite path: {pred_satellite_path}",
+			fill=(220, 160, 160),
+		)
+
+	os.makedirs(os.path.dirname(output_path), exist_ok=True)
+	canvas.save(output_path)
+
+
+def pca_visualization(
+	batch,
+	search_grid_feats: torch.Tensor,
+	output_dir: str = "runs/visualizations/pca_search",
+	max_images: int = 8,
+	file_prefix: str = "",
+	interp_scale: float = 9.0,
+) -> List[str]:
+	"""Save PCA RGB maps from search feature tokens shaped [B, N, D]."""
+	output_root = Path(output_dir)
+	output_root.mkdir(parents=True, exist_ok=True)
+
+	if search_grid_feats.ndim != 3:
+		raise ValueError(
+			f"search_grid_feats must be [B, N, D], got shape={tuple(search_grid_feats.shape)}"
+		)
+
+	saved_paths: List[str] = []
+	features_cpu = search_grid_feats.detach().float().cpu()
+	sat_paths = list(batch.get("satellite_path", []))
+	search_pixels = batch.get("search_pixel_values", None)
+	batch_count = min(int(max_images), int(features_cpu.shape[0]))
+
+	for i in range(batch_count):
+		token_feats = features_cpu[i]  # [N, D]
+		n_tokens = int(token_feats.shape[0])
+
+		if isinstance(search_pixels, torch.Tensor) and search_pixels.ndim == 4 and i < search_pixels.shape[0]:
+			input_h = int(search_pixels[i].shape[-2])
+			input_w = int(search_pixels[i].shape[-1])
+		else:
+			side = int(n_tokens**0.5)
+			if side * side == n_tokens:
+				input_h, input_w = side, side
+			else:
+				input_h, input_w = 1, n_tokens
+
+		h, w = _infer_token_grid_hw(n_tokens=n_tokens, input_h=input_h, input_w=input_w)
+
+		# Interpolate the spatial token grid before PCA so visualization has higher native resolution.
+		token_grid = token_feats.reshape(h, w, -1).permute(2, 0, 1).unsqueeze(0)
+		up_h = max(1, int(round(float(h) * float(interp_scale))))
+		up_w = max(1, int(round(float(w) * float(interp_scale))))
+		if up_h != h or up_w != w:
+			token_grid = F.interpolate(
+				token_grid,
+				size=(up_h, up_w),
+				mode="bilinear",
+				align_corners=False,
+			)
+		else:
+			up_h, up_w = h, w
+
+		x = token_grid.squeeze(0).permute(1, 2, 0).reshape(up_h * up_w, -1)
+		x = x - x.mean(dim=0, keepdim=True)
+		q = max(1, min(3, int(x.shape[0]), int(x.shape[1])))
+		_, _, v = torch.pca_lowrank(x, q=q)
+		proj = x @ v[:, :q]
+		if q < 3:
+			pad = torch.zeros((proj.shape[0], 3 - q), dtype=proj.dtype)
+			proj = torch.cat([proj, pad], dim=1)
+
+		proj = proj.reshape(up_h, up_w, 3).numpy()
+		for c in range(3):
+			channel = proj[:, :, c]
+			ch_min = float(channel.min())
+			ch_max = float(channel.max())
+			if ch_max > ch_min:
+				proj[:, :, c] = (channel - ch_min) / (ch_max - ch_min)
+			else:
+				proj[:, :, c] = 0.0
+
+		rgb_uint8 = (proj * 255.0).clip(0.0, 255.0).astype(np.uint8)
+		image = Image.fromarray(rgb_uint8, mode="RGB")
+		# image = image.resize((640, 640), Image.Resampling.BILINEAR)
+
+		sat_stem = f"sample_{i}"
+		if i < len(sat_paths):
+			sat_stem = Path(str(sat_paths[i])).stem
+
+		out_path = output_root / f"{file_prefix}{sat_stem}_pca.png"
+		image.save(out_path)
+		saved_paths.append(str(out_path))
+
+	return saved_paths
+
+
 def _build_model_and_io(model_type: str, device: str):
 	model_type = _canonical_model_type(model_type)
 
@@ -163,7 +353,7 @@ def _build_model_and_io(model_type: str, device: str):
 			SIGLIP_MODEL_NAME,
 			cache_dir=SIGLIP_CACHE_DIR,
 		)
-		set_siglip_processor_size(processor_sat, PROCESSOR_IMAGE_SIZE)
+		set_siglip_processor_size(processor_sat, {"height": 640, "width": 640})
 		tokenizer = AutoTokenizer.from_pretrained(SIGLIP_MODEL_NAME)
 		model = EncoderAbla(
 			model_name=SIGLIP_MODEL_NAME,
@@ -236,14 +426,14 @@ def _extract_features(
 	if not os.path.exists(resolved_checkpoint):
 		raise FileNotFoundError(f"Checkpoint not found: {resolved_checkpoint}")
 
-	model.load_state_dict(torch.load(resolved_checkpoint, map_location="cpu"), strict=False)
+	model.load_state_dict(torch.load(resolved_checkpoint, map_location="cpu"), strict=True)
 	model.eval()
 
 	dataset = ShiftedSatelliteDroneDataset(
 		processor=processor,
 		processor_sat=processor_sat,
 		tokenizer=tokenizer,
-		split="test",
+		split="train",
 		subset_heights=list(subset_heights),
 		subset_angles=list(subset_angles),
 	)
@@ -259,17 +449,21 @@ def _extract_features(
 
 	query_feats: List[torch.Tensor] = []
 	query_labels: List[str] = []
+	query_drone_paths: List[str] = []
+	query_satellite_paths: List[str] = []
 	gallery_feat_dict: Dict[str, torch.Tensor] = {}
+	gallery_path_dict: Dict[str, str] = {}
 
 	with torch.inference_mode():
 		for batch in tqdm(loader, desc=f"Extract features [{model_type}]"):
 			query_inputs = batch["target_pixel_values"].to(device, non_blocking=True)
 			search_inputs = batch["search_pixel_values"].to(device, non_blocking=True)
 			input_ids = batch["input_ids"].to(device, non_blocking=True)
+			angles = batch["angle"].to(device, non_blocking=True)
 			satellite_paths = batch["satellite_path"]
 
 			if _is_encoder_abla(model_type):
-				_, _, _, _, grid_feats, fused_feats = model(query_inputs, search_inputs, input_ids)
+				_, _, _, _, grid_feats, fused_feats = model(query_inputs, search_inputs, input_ids, angles)
 				if fused_feats is None:
 					raise RuntimeError("Encoder_abla did not return fused query features.")
 				fused_query_feats = F.normalize(fused_feats, p=2, dim=1)
@@ -290,6 +484,8 @@ def _extract_features(
 				os.path.splitext(os.path.basename(path))[0] for path in satellite_paths
 			]
 			query_labels.extend(batch_labels)
+			query_drone_paths.extend([str(p) for p in batch["drone_path"]])
+			query_satellite_paths.extend([str(p) for p in satellite_paths])
 
 			unseen_indices = []
 			unseen_labels = []
@@ -302,13 +498,17 @@ def _extract_features(
 				if _is_encoder_abla(model_type):
 					gallery_grid = gallery_grid_batch[unseen_indices]
 				else:
-					gallery_batch = search_inputs[unseen_indices]
-					with torch.amp.autocast("cuda", enabled=False):
-						gallery_grid = model.ref_forward(gallery_batch)
-						gallery_grid = F.normalize(gallery_grid, p=2, dim=2)
+					if gallery_grid_batch is not None:
+						gallery_grid = gallery_grid_batch[unseen_indices]
+					else:
+						gallery_batch = search_inputs[unseen_indices]
+						with torch.amp.autocast("cuda", enabled=False):
+							gallery_grid = model.ref_forward(gallery_batch)
+							gallery_grid = F.normalize(gallery_grid, p=2, dim=2)
 				gallery_grid = gallery_grid.cpu()
 				for i, label in enumerate(unseen_labels):
 					gallery_feat_dict[label] = gallery_grid[i]
+					gallery_path_dict[label] = str(satellite_paths[unseen_indices[i]])
 
 	if not query_feats or not gallery_feat_dict:
 		raise RuntimeError("No valid query/gallery features extracted.")
@@ -316,18 +516,31 @@ def _extract_features(
 	query_tensor = torch.cat(query_feats, dim=0)
 	gallery_labels = sorted(gallery_feat_dict.keys())
 	gallery_tensor = torch.stack([gallery_feat_dict[label] for label in gallery_labels], dim=0)
+	gallery_satellite_paths = [gallery_path_dict.get(label, "") for label in gallery_labels]
 
-	return query_tensor, query_labels, gallery_tensor, gallery_labels
+	return (
+		query_tensor,
+		query_labels,
+		query_drone_paths,
+		query_satellite_paths,
+		gallery_tensor,
+		gallery_labels,
+		gallery_satellite_paths,
+	)
 
 
 def _score_recall(
 	query_feats: torch.Tensor,
 	query_labels: List[str],
+	query_drone_paths: List[str],
+	query_satellite_paths: List[str],
 	gallery_feats: torch.Tensor,
 	gallery_labels: List[str],
+	gallery_satellite_paths: List[str],
 	include_map: Dict[str, Set[str]],
 	device: str,
 	candidate_size: Optional[int] = None,
+	error_analysis: Optional[Dict[str, object]] = None,
 ) -> Dict[str, float]:
 	label_to_gallery_index = {label: idx for idx, label in enumerate(gallery_labels)}
 	norm_gallery_labels = [_normalize_label(label) for label in gallery_labels]
@@ -341,6 +554,10 @@ def _score_recall(
 	top10 = 0
 
 	all_indices = list(range(len(gallery_labels)))
+	error_enabled = bool((error_analysis or {}).get("run", False))
+	error_output_dir = str((error_analysis or {}).get("output_dir", "runs/visualizations/retrieval_top1_errors"))
+	error_saved = 0
+	error_records: List[Dict[str, object]] = []
 	if candidate_size is not None:
 		candidate_size = int(candidate_size)
 		if candidate_size <= 0:
@@ -364,9 +581,12 @@ def _score_recall(
 			# random.shuffle(candidate_indices)
 
 		candidate_gallery_feats = gallery_feats[candidate_indices]
-		score_vec = torch.einsum("d,knd->kn", query_feats[q_idx], candidate_gallery_feats).mean(dim=1)
+		score_vec = torch.einsum("d,knd->kn", query_feats[q_idx], candidate_gallery_feats).max(dim=1)[0]
 		k_max = min(10, score_vec.shape[0])
 		topk_local_indices = torch.topk(score_vec, k=k_max, dim=0).indices.tolist()
+		top1_local_idx = topk_local_indices[0]
+		top1_global_idx = candidate_indices[top1_local_idx]
+		top1_pred_label = gallery_labels[top1_global_idx]
 
 		positive_local_indices = [
 			local_idx
@@ -375,15 +595,61 @@ def _score_recall(
 		]
 
 		valid_queries += 1
-		if any(idx in topk_local_indices[:1] for idx in positive_local_indices):
+		top1_correct = any(idx in topk_local_indices[:1] for idx in positive_local_indices)
+		if top1_correct:
 			top1 += 1
 		if any(idx in topk_local_indices[: min(5, k_max)] for idx in positive_local_indices):
 			top5 += 1
 		if any(idx in topk_local_indices[: min(10, k_max)] for idx in positive_local_indices):
 			top10 += 1
 
+		if error_enabled and (not top1_correct):
+			drone_path = query_drone_paths[q_idx] if q_idx < len(query_drone_paths) else ""
+			gt_sat_path = query_satellite_paths[q_idx] if q_idx < len(query_satellite_paths) else ""
+			pred_sat_path = (
+				gallery_satellite_paths[top1_global_idx]
+				if top1_global_idx < len(gallery_satellite_paths)
+				else ""
+			)
+
+			out_file = os.path.join(
+				error_output_dir,
+				f"q{q_idx:06d}_gt_{gt_norm}_pred_{_normalize_label(top1_pred_label)}_errIdx_{top1_global_idx}.jpg",
+			)
+			_save_correct_pair_image(
+				drone_path=drone_path,
+				gt_satellite_path=gt_sat_path,
+				pred_satellite_index=top1_global_idx,
+				pred_satellite_path=pred_sat_path,
+				gt_label=gt_norm,
+				pred_label=_normalize_label(top1_pred_label),
+				output_path=out_file,
+			)
+
+			error_records.append(
+				{
+					"query_index": q_idx,
+					"gt_label": gt_norm,
+					"pred_label": _normalize_label(top1_pred_label),
+					"error_satellite_index": int(top1_global_idx),
+					"drone_path": drone_path,
+					"gt_satellite_path": gt_sat_path,
+					"pred_satellite_path": pred_sat_path,
+					"saved_image": out_file,
+				}
+			)
+			error_saved += 1
+
 	if valid_queries == 0:
 		raise RuntimeError("No valid queries matched gallery labels.")
+
+	if error_enabled and error_records:
+		os.makedirs(error_output_dir, exist_ok=True)
+		error_jsonl = os.path.join(error_output_dir, "top1_error_cases.jsonl")
+		with open(error_jsonl, "w", encoding="utf-8") as f:
+			for item in error_records:
+				f.write(json.dumps(item, ensure_ascii=False) + "\n")
+		print(f"Saved {len(error_records)} top1 error pair images and index log to: {error_output_dir}")
 
 	return {
 		"num_queries": valid_queries,
@@ -393,6 +659,7 @@ def _score_recall(
 		"top1_hits": top1,
 		"top5_hits": top5,
 		"top10_hits": top10,
+		"top1_errors": valid_queries - top1,
 	}
 
 
@@ -406,6 +673,7 @@ def eval(
 	batch_size: int = 16,
 	num_workers: int = 8,
 	device: Optional[str] = None,
+	error_analysis: Optional[Dict[str, object]] = None,
 ) -> Dict[str, float]:
 	if device is None:
 		device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -419,7 +687,15 @@ def eval(
 		f"angles={sorted(subset_angle_set)} candidate_size={candidate_size}"
 	)
 
-	query_feats, query_labels, gallery_feats, gallery_labels = _extract_features(
+	(
+		query_feats,
+		query_labels,
+		query_drone_paths,
+		query_satellite_paths,
+		gallery_feats,
+		gallery_labels,
+		gallery_satellite_paths,
+	) = _extract_features(
 		model_type=model_type,
 		checkpoint_path=checkpoint_path,
 		device=device,
@@ -432,11 +708,15 @@ def eval(
 	metrics = _score_recall(
 		query_feats=query_feats,
 		query_labels=query_labels,
+		query_drone_paths=query_drone_paths,
+		query_satellite_paths=query_satellite_paths,
 		gallery_feats=gallery_feats,
 		gallery_labels=gallery_labels,
+		gallery_satellite_paths=gallery_satellite_paths,
 		include_map=include_map,
 		device=device,
 		candidate_size=candidate_size,
+		error_analysis=error_analysis,
 	)
 
 	n = metrics["num_queries"]
@@ -468,4 +748,5 @@ if __name__ == "__main__":
             batch_size=EVAL_CONFIG["batch_size"],
             num_workers=EVAL_CONFIG["num_workers"],
             device=EVAL_CONFIG["device"],
+			error_analysis=EVAL_CONFIG.get("error_analysis", None),
         )

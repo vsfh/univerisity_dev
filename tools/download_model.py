@@ -80,6 +80,87 @@ def nvemb():
         trust_remote_code=True # CRITICAL for this model
     )
 
+
+def download_c_radio_v4_h(
+    cache_dir=custom_cache_path,
+    use_china_mirror=True,
+    mirror_endpoint="https://hf-mirror.com",
+    revision=None,
+    verify_load=False,
+):
+    """
+    Download nvidia/C-RADIOv4-H into the local Hugging Face cache.
+
+    Args:
+        cache_dir (str): Target HF cache directory.
+        use_china_mirror (bool): Whether to use a China mirror endpoint.
+        mirror_endpoint (str): Mirror endpoint, e.g. https://hf-mirror.com.
+        revision (str|None): Optional model revision.
+        verify_load (bool): If True, try to load model/processor after download.
+
+    Returns:
+        dict: Metadata including local snapshot directory.
+    """
+    from huggingface_hub import snapshot_download
+
+    model_id = "nvidia/C-RADIOv4-H"
+    os.makedirs(cache_dir, exist_ok=True)
+
+    previous_endpoint = os.environ.get("HF_ENDPOINT")
+    if use_china_mirror:
+        os.environ["HF_ENDPOINT"] = mirror_endpoint.rstrip("/")
+
+    try:
+        print(f"Downloading {model_id} to cache: {cache_dir}")
+        if use_china_mirror:
+            print(f"Using HF mirror endpoint: {os.environ['HF_ENDPOINT']}")
+
+        snapshot_dir = snapshot_download(
+            repo_id=model_id,
+            cache_dir=cache_dir,
+            revision=revision,
+            resume_download=True,
+        )
+
+        result = {
+            "model_id": model_id,
+            "cache_dir": cache_dir,
+            "snapshot_dir": snapshot_dir,
+            "hf_endpoint": os.environ.get("HF_ENDPOINT", "https://huggingface.co"),
+        }
+
+        if verify_load:
+            from transformers import AutoImageProcessor, AutoModel
+
+            _ = AutoModel.from_pretrained(
+                model_id,
+                cache_dir=cache_dir,
+                trust_remote_code=True,
+            )
+
+            processor_loaded = False
+            try:
+                _ = AutoImageProcessor.from_pretrained(
+                    model_id,
+                    cache_dir=cache_dir,
+                    trust_remote_code=True,
+                )
+                processor_loaded = True
+            except Exception:
+                processor_loaded = False
+
+            result["verify_load"] = True
+            result["processor_loaded"] = processor_loaded
+
+        print(f"Download completed: {snapshot_dir}")
+        return result
+    finally:
+        if use_china_mirror:
+            if previous_endpoint is None:
+                os.environ.pop("HF_ENDPOINT", None)
+            else:
+                os.environ["HF_ENDPOINT"] = previous_endpoint
+
 def download_vision_models(cache_dir=None, models_to_download=None):
     """
     下載多種視覺語言模型到本地緩存目錄
@@ -232,4 +313,4 @@ def download_vision_models(cache_dir=None, models_to_download=None):
     return downloaded_models
 
 if __name__=='__main__':
-    qwen()
+    download_c_radio_v4_h()

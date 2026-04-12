@@ -10,6 +10,7 @@ import time
 import random
 import json
 from pathlib import Path
+import sys
 import torch
 import torch.nn as nn
 import numpy as np
@@ -24,6 +25,10 @@ import os
 import argparse
 import timm
 import torch.nn.functional as F
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from dataset import ShiftedSatelliteDroneDataset
 

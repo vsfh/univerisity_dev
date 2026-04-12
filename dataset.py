@@ -12,14 +12,14 @@ from torch.utils.data import Dataset
 
 
 # --- Configuration ---
-TRAIN_SATELLITE_ROOT = "/data/feihong/image_1024"
-TEST_SATELLITE_ROOT = "/data/feihong/img_test_2"
+TRAIN_SATELLITE_ROOT = "/data/feihong/image_2048"
+TEST_SATELLITE_ROOT = "/data/feihong/img_test_1"
 DRONE_IMAGE_ROOT = "/data/feihong/drone_img"
-BBOX_FILE = "/data/feihong/ckpt/bbox_test_2.json"
+BBOX_FILE = "/data/feihong/ckpt/bbox_test_1.json"
 TRAIN_MAX_SATELLITE_ID = 1065
 TRAIN_SPLIT_FILE = "/data/feihong/ckpt/train.txt"
 VAL_SPLIT_FILE = "/data/feihong/ckpt/val.txt"
-TEST_SPLIT_FILE = "/data/feihong/ckpt/test.txt"
+TEST_SPLIT_FILE = "/data/feihong/ckpt/test_1.txt"
 VAL_SPLIT_COUNT = 20
 TEST_SPLIT_COUNT = 400
 MAX_TEXT_LENGTH = 64
@@ -32,10 +32,10 @@ DEFAULT_TIMING_LOG_INTERVAL = 200
 DEFAULT_MODEL_NAME = "google/siglip-base-patch16-224"
 DEFAULT_CACHE_DIR = "/data/feihong/hf_cache"
 TRAIN_HEIGHT_TO_BOX_SIZE = {
-	150: 330,
-	200: 414,
-	250: 527,
-	300: 678,
+	150: 330//2,
+	200: 414//2,
+	250: 527//2,
+	300: 678//2,
 }
 
 
@@ -291,7 +291,7 @@ def _augment_satellite_image_with_bbox(
 		3.0 * bbox_w / max(float(orig_w), 1.0),
 		3.0 * bbox_h / max(float(orig_h), 1.0),
 	)
-	ratio = random.uniform(min_ratio_context, 1.0)
+	ratio = random.uniform(min_ratio_context, min_ratio_context*3/4)
 
 	crop_w = max(1.0, min(float(orig_w), float(orig_w) * ratio))
 	crop_h = max(1.0, min(float(orig_h), float(orig_h) * ratio))
@@ -333,6 +333,105 @@ def _augment_satellite_image_with_bbox(
 		max(0.0, min(float(target_h), new_y1)),
 		max(0.0, min(float(target_w), new_x2)),
 		max(0.0, min(float(target_h), new_y2)),
+	]
+
+	return Image.fromarray(resized_np), new_bbox
+
+
+def _augment_satellite_image_with_bbox_640(
+	image: Image.Image,
+	bbox: Sequence[float],
+	mode: str,
+	target_size: Tuple[int, int] = (640, 640),
+	test_crop_ratio: float = DEFAULT_TEST_CROP_RATIO,
+) -> Tuple[Image.Image, List[float]]:
+	"""Aspect-ratio-aware crop path; keeps crop_w/crop_h aligned with target_w/target_h."""
+	target_h, target_w = int(target_size[0]), int(target_size[1])
+	orig_w, orig_h = image.size
+	x1, y1, x2, y2 = [float(v) for v in bbox]
+	bbox_w = max(1.0, x2 - x1)
+	bbox_h = max(1.0, y2 - y1)
+
+	target_aspect = float(target_w) / max(float(target_h), 1.0)
+
+	if float(orig_w) / max(float(orig_h), 1.0) >= target_aspect:
+		max_crop_h = float(orig_h)
+		max_crop_w = max_crop_h * target_aspect
+	else:
+		max_crop_w = float(orig_w)
+		max_crop_h = max_crop_w / max(target_aspect, 1e-6)
+
+	if mode == "train":
+		context_scale = 4.0
+		min_crop_w = max(bbox_w, bbox_h * target_aspect) * context_scale
+	else:
+		ratio = max(1e-3, min(1.0, float(test_crop_ratio)))
+		context_scale = 4.0
+		min_crop_w = max(bbox_w, bbox_h * target_aspect) * context_scale
+		# Keep ratio<1.0 as an optional lower bound; ratio>=1.0 should not force full-size crop.
+		if ratio < 1.0:
+			ratio_crop_w = max_crop_w * ratio
+			min_crop_w = max(min_crop_w, ratio_crop_w)
+
+	min_crop_w = min(max_crop_w, max(1.0, min_crop_w))
+	min_crop_h = min(max_crop_h, min_crop_w / max(target_aspect, 1e-6))
+	min_crop_w = min(max_crop_w, min_crop_h * target_aspect)
+
+	if mode == "train":
+		# scale_up = random.uniform(1.0, 1.25)
+		scale_up = 1
+		crop_w = min(max_crop_w, min_crop_w * scale_up)
+		crop_h = min(max_crop_h, crop_w / max(target_aspect, 1e-6))
+		crop_w = min(max_crop_w, crop_h * target_aspect)
+	else:
+		crop_w = min_crop_w
+		crop_h = min_crop_h
+
+	left_min = max(0.0, x2 - crop_w)
+	left_max = min(float(orig_w) - crop_w, x1)
+	top_min = max(0.0, y2 - crop_h)
+	top_max = min(float(orig_h) - crop_h, y1)
+
+	if left_max < left_min or top_max < top_min:
+		cx = 0.5 * (x1 + x2)
+		cy = 0.5 * (y1 + y2)
+		left = min(max(0.0, cx - 0.5 * crop_w), float(orig_w) - crop_w)
+		top = min(max(0.0, cy - 0.5 * crop_h), float(orig_h) - crop_h)
+	else:
+		if mode == "train":
+			left = _sample_edge_biased(left_min, left_max)
+			top = _sample_edge_biased(top_min, top_max)
+		else:
+			left = 0.5 * (left_min + left_max)
+			top = 0.5 * (top_min + top_max)
+
+	right = left + crop_w
+	bottom = top + crop_h
+
+	img_np = np.asarray(image, dtype=np.uint8)
+	left_i = int(max(0, min(orig_w - 1, round(left))))
+	top_i = int(max(0, min(orig_h - 1, round(top))))
+	right_i = int(max(left_i + 1, min(orig_w, round(right))))
+	bottom_i = int(max(top_i + 1, min(orig_h, round(bottom))))
+
+	cropped_np = img_np[top_i:bottom_i, left_i:right_i]
+	resized_np = cv2.resize(cropped_np, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+	actual_crop_w = float(max(1, right_i - left_i))
+	actual_crop_h = float(max(1, bottom_i - top_i))
+	scale_x = target_w / actual_crop_w
+	scale_y = target_h / actual_crop_h
+	new_bbox = [
+		(x1 - left_i) * scale_x,
+		(y1 - top_i) * scale_y,
+		(x2 - left_i) * scale_x,
+		(y2 - top_i) * scale_y,
+	]
+	new_bbox = [
+		max(0.0, min(float(target_w), new_bbox[0])),
+		max(0.0, min(float(target_h), new_bbox[1])),
+		max(0.0, min(float(target_w), new_bbox[2])),
+		max(0.0, min(float(target_h), new_bbox[3])),
 	]
 
 	return Image.fromarray(resized_np), new_bbox
@@ -663,7 +762,7 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		else:
 			base_bbox = [float(v) for v in sample["bbox"]]
 
-		augmented_search_image, augmented_bbox = _augment_satellite_image_with_bbox(
+		augmented_search_image, augmented_bbox = _augment_satellite_image_with_bbox_640(
 			image=search_image,
 			bbox=base_bbox,
 			mode=self.split,
@@ -816,10 +915,12 @@ def visualize_shifted_dataset_sample(
 		else:
 			base_bbox = [float(v) for v in sample["bbox"]]
 
-		augmented_image, augmented_bbox = _augment_satellite_image_with_bbox(
+		augmented_image, augmented_bbox = _augment_satellite_image_with_bbox_640(
 			image=satellite_image,
 			bbox=base_bbox,
 			mode=dataset.split,
+			target_size=dataset.sat_target_size,
+			test_crop_ratio=dataset.test_crop_ratio,
 		)
 		augmented_bbox = _sanitize_bbox_xyxy(
 			augmented_bbox,

@@ -24,7 +24,7 @@ from accelerate.utils import DistributedDataParallelKwargs
 from transformers import AutoImageProcessor, AutoModel, AutoTokenizer
 from clearml import Task, Logger
 
-from model import Encoder_heading, Encoder_abla
+from model import Encoder_dino, Encoder_abla
 from bbox.yolo_utils import (
     get_tensor_anchors,
     build_target,
@@ -54,15 +54,16 @@ class Config:
     SATELLITE_FOLDER = "/data/feihong/asian_univ"
 
     SAT_ORIG_SIZE = (3840, 2160)
-    UNIV_SAT_SIZE = (768, 432)
+    # UNIV_SAT_SIZE = (768, 432)
+    UNIV_SAT_SIZE = (640, 640)
     DRONE_SIZE = (256, 256)
 
-    NUM_EPOCHS = 20
-    BATCH_SIZE = 8
+    NUM_EPOCHS = 16
+    BATCH_SIZE = 4
     GRAD_ACCUMULATION_STEPS = 2
     LEARNING_RATE = 5e-5
     LR_MIN = 1e-10
-    COSINE_EPOCHS = 20
+    COSINE_EPOCHS = 16
     BBOX_LOSS_WEIGHT = 0.1
     HEADING_LOSS_WEIGHT = 0.01
     PROJECTION_DIM = 768
@@ -183,7 +184,7 @@ def resize_drone_image(
 
 
 def visualize_batch(
-    batch: Dict, save_dir: str = "runs/visualizations", max_samples: int = 6
+    batch: Dict, save_dir: str = "runs/visualizations", max_samples: int = 6, sat_size: Tuple[int, int] = Config.UNIV_SAT_SIZE
 ) -> None:
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
@@ -219,8 +220,8 @@ def visualize_batch(
             x1, y1, x2, y2 = bbox
 
             h, w = search_img.shape[0], search_img.shape[1]
-            sx = w / float(Config.UNIV_SAT_SIZE[0])
-            sy = h / float(Config.UNIV_SAT_SIZE[1])
+            sx = w / float(sat_size[0])
+            sy = h / float(sat_size[1])
 
             x1, x2 = x1 * sx, x2 * sx
             y1, y2 = y1 * sy, y2 * sy
@@ -294,6 +295,7 @@ def validate(
         ori_gt_bbox = batch["bbox"].to(accelerator.device, non_blocking=True)
         input_ids = batch["input_ids"].to(accelerator.device, non_blocking=True)
         local_indices = batch["index"].to(accelerator.device, non_blocking=True)
+        angles = batch["angle"].to(accelerator.device, non_blocking=True)
 
         with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
             (
@@ -303,7 +305,7 @@ def validate(
                 anchor_feats,
                 grid_feats,
                 fused_feats,
-            ) = model(query_imgs, rs_imgs, input_ids)
+            ) = model(query_imgs, rs_imgs, input_ids, angles)
 
         B = pred_anchor.shape[0]
         pred_anchor = pred_anchor.view(
@@ -404,6 +406,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     accelerator = Accelerator(
         mixed_precision="no",
         gradient_accumulation_steps=Config.GRAD_ACCUMULATION_STEPS,
+        step_scheduler_with_optimizer=False,
         kwargs_handlers=[ddp_kwargs],
     )
 
@@ -438,7 +441,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     processor_sat = AutoImageProcessor.from_pretrained(
         Config.MODEL_NAME,
         cache_dir=Config.CACHE_DIR,
-        size={"height": 432, "width": 768},
+        size={"height": 640, "width": 640},
     )
     tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
 
@@ -451,6 +454,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         usesg=True,
         useap=use_ap,
     )
+    # model = Encoder_dino()
 
     anchors_full = get_tensor_anchors(accelerator.device)
 
@@ -496,7 +500,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     )
 
     accelerator.print(f"Starting training for {Config.NUM_EPOCHS} epochs...")
-    soft_label = 0.5
+    soft_label = 0.3
     max_iou = 0
     min_info = 1000
     amp_enabled = Config.USE_AMP and accelerator.device.type == "cuda"
@@ -526,6 +530,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     accelerator.device, non_blocking=True
                 )
                 target_bbox = batch["bbox"].to(accelerator.device, non_blocking=True)
+                angles = batch["angle"].to(accelerator.device, non_blocking=True)
 
                 with torch.amp.autocast("cuda", enabled=amp_enabled):
                     (
@@ -535,7 +540,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                         anchor_feats,
                         grid_feats,
                         fused_feats,
-                    ) = model(target_pixel_values, search_pixel_values, input_ids)
+                    ) = model(target_pixel_values, search_pixel_values, input_ids, angles)
 
                     B = pred_anchor.shape[0]
                     pred_anchor = pred_anchor.view(
@@ -618,35 +623,41 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 
         scheduler.step()
 
-        if (epoch + 1) % 10 == 0:
-            accelerator.print(f"Running validation at epoch {epoch + 1}...")
-            accu50, accu25, iou, info_nce = validate(
-                test_dataloader,
-                model,
-                accelerator,
-                anchors_full,
-                (Config.UNIV_SAT_SIZE[0], Config.UNIV_SAT_SIZE[1]),
-                useap=use_ap,
-            )
-            if accelerator.is_main_process:
-                accelerator.print(
-                    f"Val Epoch {epoch + 1}: Accu@50={accu50:.4f}, Accu@25={accu25:.4f}, IoU={iou:.4f}, "
-                    f"InfoNCE={info_nce:.4f}"
-                )
+        if epoch % 2 == 0:
+            os.makedirs(save_path, exist_ok=True)
+            unwrapped_model = accelerator.unwrap_model(model)
+            save_filename = f"{save_path}/best_iou.pth"
 
-                if clearml_logger is not None:
-                    clearml_logger.report_scalar("validation", "accu50", accu50, epoch)
-                    clearml_logger.report_scalar("validation", "accu25", accu25, epoch)
-                    clearml_logger.report_scalar("validation", "iou", iou, epoch)
-                    clearml_logger.report_scalar("validation", "info_nce", info_nce, epoch)
+            accelerator.save(unwrapped_model.state_dict(), save_filename)
 
-                if iou > max_iou:
-                    max_iou = iou
-                    os.makedirs(save_path, exist_ok=True)
-                    unwrapped_model = accelerator.unwrap_model(model)
-                    save_filename = f"{save_path}/best_iou.pth"
-                    accelerator.save(unwrapped_model.state_dict(), save_filename)
-                    accelerator.print(f"Saved best IoU checkpoint: {save_filename}")
+            # accelerator.print(f"Running validation at epoch {epoch + 1}...")
+            # accu50, accu25, iou, info_nce = validate(
+            #     test_dataloader,
+            #     model,
+            #     accelerator,
+            #     anchors_full,
+            #     (Config.UNIV_SAT_SIZE[0], Config.UNIV_SAT_SIZE[1]),
+            #     useap=use_ap,
+            # )
+            # if accelerator.is_main_process:
+            #     accelerator.print(
+            #         f"Val Epoch {epoch + 1}: Accu@50={accu50:.4f}, Accu@25={accu25:.4f}, IoU={iou:.4f}, "
+            #         f"InfoNCE={info_nce:.4f}"
+            #     )
+
+            #     if clearml_logger is not None:
+            #         clearml_logger.report_scalar("validation", "accu50", accu50, epoch)
+            #         clearml_logger.report_scalar("validation", "accu25", accu25, epoch)
+            #         clearml_logger.report_scalar("validation", "iou", iou, epoch)
+            #         clearml_logger.report_scalar("validation", "info_nce", info_nce, epoch)
+
+            #     if iou > max_iou:
+            #         max_iou = iou
+            #         os.makedirs(save_path, exist_ok=True)
+            #         unwrapped_model = accelerator.unwrap_model(model)
+            #         save_filename = f"{save_path}/best_iou.pth"
+            #         accelerator.save(unwrapped_model.state_dict(), save_filename)
+            #         accelerator.print(f"Saved best IoU checkpoint: {save_filename}")
 
         if clearml_logger is not None:
             current_lr = optimizer.param_groups[0]["lr"]
@@ -669,7 +680,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 # --- Main ---
 if __name__ == "__main__":
     end_num = 0.1
-    exp_name = f"supp_{end_num}"
+    exp_name = f"rope_{end_num}"
     save_dir = f"/data/feihong/ckpt/{exp_name}"
 
     if os.path.exists(save_dir):
