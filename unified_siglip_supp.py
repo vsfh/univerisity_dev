@@ -78,6 +78,7 @@ class Config:
 
     USE_AMP = True
     ENABLE_TF32 = True
+    USE_ANGLE_INPUT = False
 
     HEADING_TO_TARGET = {
         0: [0.0, 0.0],
@@ -295,7 +296,11 @@ def validate(
         ori_gt_bbox = batch["bbox"].to(accelerator.device, non_blocking=True)
         input_ids = batch["input_ids"].to(accelerator.device, non_blocking=True)
         local_indices = batch["index"].to(accelerator.device, non_blocking=True)
-        angles = batch["angle"].to(accelerator.device, non_blocking=True)
+        angles = (
+            batch["angle"].to(accelerator.device, non_blocking=True)
+            if Config.USE_ANGLE_INPUT
+            else None
+        )
 
         with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
             (
@@ -530,7 +535,11 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     accelerator.device, non_blocking=True
                 )
                 target_bbox = batch["bbox"].to(accelerator.device, non_blocking=True)
-                angles = batch["angle"].to(accelerator.device, non_blocking=True)
+                angles = (
+                    batch["angle"].to(accelerator.device, non_blocking=True)
+                    if Config.USE_ANGLE_INPUT
+                    else None
+                )
 
                 with torch.amp.autocast("cuda", enabled=amp_enabled):
                     (
@@ -680,7 +689,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 # --- Main ---
 if __name__ == "__main__":
     end_num = 0.1
-    exp_name = f"rope_{end_num}"
+    exp_name = f"rope_{end_num}_wo_angle"
     save_dir = f"/data/feihong/ckpt/{exp_name}"
 
     if os.path.exists(save_dir):
