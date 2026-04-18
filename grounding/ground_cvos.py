@@ -30,7 +30,8 @@ import torchvision.models as torchvision_models
 from torch.autograd import Variable
 from model.TROGeo import SwinTransformer
 from model.attention import SpatialTransformer
-from model.loss import yolo_loss, build_target, adjust_learning_rate
+from bbox.yolo_utils import yolo_loss, build_target
+from model.loss import adjust_learning_rate
 from utils.utils import AverageMeter, eval_iou_acc
 from utils.checkpoint import save_checkpoint
 from model.darknet import *
@@ -41,7 +42,7 @@ from out_model import ResidualBlock
 
 DATA_ROOT = "/data/feihong/CVOGL"
 DATA_NAME = "CVOGL_DroneAerial"
-IMG_SIZE = 1024
+IMG_SIZE = (768, 432)  # (width, height)
 BATCH_SIZE = 4
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
@@ -373,7 +374,7 @@ class DetGeoLite(nn.Module):
 
         self.query_resnet = MyResnet()
 
-        self.reference_darknet = Darknet(config_path=config_path, img_size=640)
+        self.reference_darknet = Darknet(config_path=config_path, img_size=IMG_SIZE[0])
         if os.path.exists(weights_path):
             self.reference_darknet.load_weights(weights_path)
 
@@ -596,13 +597,16 @@ class CVOGLDataset(Dataset):
         data_name: str = "CVOGL_DroneAerial",
         split_name: str = "test",
         transform=None,
-        img_size: int = 1024,
+        img_size: Tuple[int, int] = IMG_SIZE,
     ):
         self.data_root = data_root
         self.data_name = data_name
         self.split_name = split_name
         self.transform = transform
-        self.img_size = img_size
+        if isinstance(img_size, (tuple, list)):
+            self.img_size = (int(img_size[0]), int(img_size[1]))
+        else:
+            self.img_size = (int(img_size), int(img_size))
 
         data_dir = os.path.join(data_root, data_name)
         data_path = os.path.join(data_dir, f"{data_name}_{split_name}.pth")
@@ -649,7 +653,7 @@ def eval_CVOGL(
     data_name: str = DATA_NAME,
     split_name: str = "test",
     batch_size: int = BATCH_SIZE,
-    img_size: int = IMG_SIZE,
+    img_size: Tuple[int, int] = IMG_SIZE,
     device: str = "cuda:0",
     vis_dir: str = None,
 ) -> Dict[str, float]:
@@ -711,8 +715,11 @@ def eval_CVOGL(
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
         )
 
+        image_wh = (rs_imgs.shape[-1], rs_imgs.shape[-2])
+        grid_wh = (pred_anchor.shape[4], pred_anchor.shape[3])
+
         _, best_anchor_gi_gj = build_target(
-            ori_gt_bbox, anchors_full, img_size, pred_anchor.shape[3]
+            ori_gt_bbox, anchors_full, image_wh, grid_wh
         )
 
         accu_list, accu_center, iou, _, pred_bbox, target_bbox = eval_iou_acc(
@@ -721,7 +728,7 @@ def eval_CVOGL(
             anchors_full,
             best_anchor_gi_gj[:, 1],
             best_anchor_gi_gj[:, 2],
-            img_size,
+            image_wh,
             iou_threshold_list=[0.5, 0.25],
         )
 
@@ -857,12 +864,15 @@ def train_epoch(
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
         )
 
+        image_wh = (rs_imgs.shape[-1], rs_imgs.shape[-2])
+        grid_wh = (pred_anchor.shape[4], pred_anchor.shape[3])
+
         new_gt_bbox, best_anchor_gi_gj = build_target(
-            ori_gt_bbox, anchors_full, img_size, pred_anchor.shape[3]
+            ori_gt_bbox, anchors_full, image_wh, grid_wh
         )
 
         loss_geo, loss_cls = yolo_loss(
-            pred_anchor, new_gt_bbox, anchors_full, best_anchor_gi_gj, img_size
+            pred_anchor, new_gt_bbox, anchors_full, best_anchor_gi_gj, image_wh
         )
         loss = loss_geo + loss_cls
 
@@ -919,8 +929,11 @@ def validate(loader, model, anchors_full, img_size):
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
         )
 
+        image_wh = (rs_imgs.shape[-1], rs_imgs.shape[-2])
+        grid_wh = (pred_anchor.shape[4], pred_anchor.shape[3])
+
         _, best_anchor_gi_gj = build_target(
-            ori_gt_bbox, anchors_full, img_size, pred_anchor.shape[3]
+            ori_gt_bbox, anchors_full, image_wh, grid_wh
         )
 
         accu_list, accu_center, iou, _, _, _ = eval_iou_acc(
@@ -929,7 +942,7 @@ def validate(loader, model, anchors_full, img_size):
             anchors_full,
             best_anchor_gi_gj[:, 1],
             best_anchor_gi_gj[:, 2],
-            img_size,
+            image_wh,
             iou_threshold_list=[0.5, 0.25],
         )
 
@@ -1257,8 +1270,11 @@ def eval_univ(
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
         )
 
+        image_wh = (rs_imgs.shape[-1], rs_imgs.shape[-2])
+        grid_wh = (pred_anchor.shape[4], pred_anchor.shape[3])
+
         _, best_anchor_gi_gj = build_target(
-            ori_gt_bbox, anchors_full, IMG_SIZE, pred_anchor.shape[3]
+            ori_gt_bbox, anchors_full, image_wh, grid_wh
         )
 
         accu_list, accu_center, iou, _, pred_bbox, target_bbox = eval_iou_acc(
@@ -1267,7 +1283,7 @@ def eval_univ(
             anchors_full,
             best_anchor_gi_gj[:, 1],
             best_anchor_gi_gj[:, 2],
-            IMG_SIZE,
+            image_wh,
             iou_threshold_list=[0.5, 0.25],
         )
 
@@ -1353,7 +1369,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="learning rate")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="batch size")
-    parser.add_argument("--img-size", type=int, default=IMG_SIZE, help="image size")
+    parser.add_argument(
+        "--img-size",
+        type=int,
+        nargs=2,
+        metavar=("WIDTH", "HEIGHT"),
+        default=list(IMG_SIZE),
+        help="image size as WIDTH HEIGHT",
+    )
     parser.add_argument(
         "--data-root", type=str, default=DATA_ROOT, help="CVOGL dataset root"
     )
@@ -1387,6 +1410,7 @@ if __name__ == "__main__":
         help="Directory to save visualizations (for evaluation)",
     )
     args = parser.parse_args()
+    args.img_size = (int(args.img_size[0]), int(args.img_size[1]))
 
     os.makedirs(args.checkpoint, exist_ok=True)
 
@@ -1402,6 +1426,7 @@ if __name__ == "__main__":
         args.data_name,
         args.split,
         args.batch_size,
+        args.img_size,
         vis_dir=args.vis_dir,
     )
     # eval_univ(

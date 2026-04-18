@@ -3,7 +3,7 @@
 
 cd /data/feihong/univerisity_dev
 
-export CUDA_VISIBLE_DEVICES=1,2
+export CUDA_VISIBLE_DEVICES=0,2
 
 accelerate launch \
     --multi_gpu \

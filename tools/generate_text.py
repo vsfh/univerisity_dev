@@ -16,7 +16,7 @@ NUM_PATCHES = 32
 ANGLE_ORDER = (0, 45, 90, 135, 180, 225, 270, 315)
 DEFAULT_IMAGE_ROOT = "/data/feihong/drone_img"
 CACHE_DIR = "/data/feihong/hf_cache"
-DEFAULT_GPU_ID = 2
+DEFAULT_GPU_ID = 1
 
 
 def _patch_sort_key(path_str: str) -> Tuple[int, int, str]:
@@ -319,7 +319,7 @@ def main() -> None:
 	parser.add_argument("--sample_id", type=str, default=None)
 	parser.add_argument("--one_image", type=str, default=None)
 	parser.add_argument("--default_image_root", type=str, default=DEFAULT_IMAGE_ROOT)
-	parser.add_argument("--output", type=str, default="unified_description.json")
+	parser.add_argument("--output", type=str, default="udes_version1.json")
 	parser.add_argument("--model_name", type=str, default=MODEL_NAME)
 	parser.add_argument("--cache_dir", type=str, default=CACHE_DIR)
 	parser.add_argument(
@@ -362,7 +362,7 @@ def main() -> None:
 		print(result["unified_description"])
 		return
 
-	sample_dirs = list_sample_dirs(args.default_image_root)[:1400][::-1]
+	sample_dirs = list_sample_dirs(args.default_image_root)[:1562][::-1]
 	if Path(args.output).is_absolute():
 		output_name = Path(args.output).name
 	else:
@@ -394,7 +394,7 @@ def main() -> None:
 		"num_failed": len(failed_samples),
 		"failed_samples": failed_samples,
 	}
-	summary_path = Path(args.default_image_root).resolve() / "unified_description_summary.json"
+	summary_path = Path(args.default_image_root).resolve() / "unified_description_version1.json"
 	with open(summary_path, "w", encoding="utf-8") as f:
 		json.dump(summary, f, indent=2, ensure_ascii=False)
 

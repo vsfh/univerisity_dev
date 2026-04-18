@@ -36,10 +36,10 @@ DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
 IMAGE_FOLDER = "/data/feihong/image_1024"
 HEADING_FOLDER = "/data/feihong/range_250"
 
-NUM_EPOCHS = 8
-BATCH_SIZE = 16
+NUM_EPOCHS = 4
+BATCH_SIZE = 8
 LEARNING_RATE = 1e-5
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 PROJECTION_DIM = 768
 NUM_WORKERS = min(16, os.cpu_count() or 8)
 PREFETCH_FACTOR = 4
@@ -367,7 +367,6 @@ def info_nce_loss(query_feats, candidate_feats, positive_indices, temperature=0.
 
 
 def main(save_path):
-    not_update = 0
     exp_name = save_path.split("/")[-1] if save_path else "default_exp"
     writer = SummaryWriter(f"runs/{exp_name}")
 
@@ -405,26 +404,8 @@ def main(save_path):
         drop_last=True,
     )
 
-    test_dataset = ShiftedSatelliteDroneDataset(
-        processor=processor_wrapper,
-        processor_sat=processor_wrapper,
-        tokenizer=tokenizer_wrapper,
-        split="val",
-        enable_timing_log=ENABLE_DATASET_TIMING_LOG,
-        timing_log_interval=DATASET_TIMING_LOG_INTERVAL,
-    )
-    test_dataloader = DataLoader(
-        test_dataset,
-        shuffle=False,
-        batch_size=BATCH_SIZE,
-        num_workers=NUM_WORKERS,
-        pin_memory=PIN_MEMORY and use_cuda,
-        persistent_workers=PERSISTENT_WORKERS and NUM_WORKERS > 0,
-        prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
-    )
-
     print(f"Starting training on {DEVICE} for {NUM_EPOCHS} epochs...")
-    min_loss = 100
+    min_loss = float("inf")
     for epoch in range(NUM_EPOCHS):
         encoder.train()
         total_loss = 0
@@ -532,26 +513,16 @@ def main(save_path):
             )
 
         avg_loss = total_loss / len(train_dataloader)
-
-        encoder.eval()
-        val_loss, txt_val_loss = validation(encoder, test_dataloader, epoch)
         writer.add_scalar("Loss/train_epoch", avg_loss, epoch)
-        writer.add_scalar("Loss/val_img_epoch", val_loss, epoch)
-        writer.add_scalar("Loss/val_txt_epoch", txt_val_loss, epoch)
-        print(
-            f"Epoch {epoch + 1} finished. Average train Loss: {avg_loss:.4f}. Average test Loss: {txt_val_loss:.4f}"
-        )
+        print(f"Epoch {epoch + 1} finished. Average train Loss: {avg_loss:.4f}")
 
-        if txt_val_loss < min_loss:
+        if avg_loss < min_loss:
             os.makedirs(save_path, exist_ok=True)
             torch.save(encoder.state_dict(), f"{save_path}/best.pth")
-            min_loss = txt_val_loss
-            not_update = 0
-        else:
-            not_update += 1
-        if not_update > 5:
-            print("Validation loss not improving. Stopping early.")
-            break
+            min_loss = avg_loss
+
+    os.makedirs(save_path, exist_ok=True)
+    torch.save(encoder.state_dict(), f"{save_path}/last.pth")
 
     print("Training complete.")
     writer.close()
@@ -868,17 +839,4 @@ if __name__ == "__main__":
         print(f"Created experiment directory: {save_dir}")
 
     # Run training
-    # main(save_dir)
-    eval(f"../ckpt/{exp_name}/best.pth", subset_height=250, subset_angle=0)
-
-    # Run evaluation
-    # eval(save_dir + '/best.pth', 250, 0)  # Extract features and score
-    # eval(
-    #     save_dir + '/best.pth',
-    #     subset_height=250,
-    #     subset_angle=0,
-    #     run_extract=False,
-    # )  # Reuse saved features and score only
-
-    # eval_denseuav(True)  # Extract features
-    # eval_denseuav(False)  # Extract features
+    main(save_dir)

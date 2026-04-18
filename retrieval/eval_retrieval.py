@@ -83,12 +83,13 @@ EncoderAbla = _load_encoder_abla_class()
 
 
 EVAL_CONFIG = {
-	"device": None,
-	"include_file": "/data/feihong/ckpt/include_train.json",
+	"device": "cuda:0",
+	# "include_file": "/data/feihong/ckpt/include_train.json",
+	"include_file": "/data/feihong/ckpt/include1.json",
 	"subset_heights": [250],
-	"subset_angles": [0],
+	"subset_angles": [180],
 	"candidate_size": 100,
-	"batch_size": 16,
+	"batch_size": 8,
 	"num_workers": 8,
 	"pca_visualization": {
 		"run": False,
@@ -102,7 +103,7 @@ EVAL_CONFIG = {
 	},
 	"models": {
 		"siglip": {"run": False, "checkpoint": '/data/feihong/ckpt/retrieval_siglip/best.pth'},
-		"encoder_abla": {"run": True, "checkpoint": '/data/feihong/ckpt/rope_0.1/last.pth'},
+		"encoder_abla": {"run": True, "checkpoint": '/data/feihong/ckpt/rope_0.1_wo_text/last.pth'},
 		"clip": {"run": False, "checkpoint": None},
 		"openclip": {"run": False, "checkpoint": None},
 		"evaclip": {"run": False, "checkpoint": None},
@@ -353,7 +354,8 @@ def _build_model_and_io(model_type: str, device: str):
 			SIGLIP_MODEL_NAME,
 			cache_dir=SIGLIP_CACHE_DIR,
 		)
-		set_siglip_processor_size(processor_sat, {"height": 640, "width": 640})
+		set_siglip_processor_size(processor_sat, PROCESSOR_IMAGE_SIZE)
+		# set_siglip_processor_size(processor_sat, {"height": 640, "width": 640})
 		tokenizer = AutoTokenizer.from_pretrained(SIGLIP_MODEL_NAME)
 		model = EncoderAbla(
 			model_name=SIGLIP_MODEL_NAME,
@@ -425,15 +427,16 @@ def _extract_features(
 	resolved_checkpoint = checkpoint_path or _default_checkpoint_for(model_type)
 	if not os.path.exists(resolved_checkpoint):
 		raise FileNotFoundError(f"Checkpoint not found: {resolved_checkpoint}")
-
-	model.load_state_dict(torch.load(resolved_checkpoint, map_location="cpu"), strict=True)
+	print(checkpoint_path)
+	model.load_state_dict(torch.load(resolved_checkpoint, map_location="cpu"), strict=False)
 	model.eval()
 
 	dataset = ShiftedSatelliteDroneDataset(
 		processor=processor,
 		processor_sat=processor_sat,
 		tokenizer=tokenizer,
-		split="train",
+		# split="train",
+		split="test",
 		subset_heights=list(subset_heights),
 		subset_angles=list(subset_angles),
 	)
@@ -458,14 +461,14 @@ def _extract_features(
 		for batch in tqdm(loader, desc=f"Extract features [{model_type}]"):
 			query_inputs = batch["target_pixel_values"].to(device, non_blocking=True)
 			search_inputs = batch["search_pixel_values"].to(device, non_blocking=True)
-			input_ids = batch["input_ids"].to(device, non_blocking=True)
-			angles = batch["angle"].to(device, non_blocking=True)
+			input_ids = batch["input_ids"].to(device, non_blocking=True) if not "wo_text" in checkpoint_path else None
+			angles = batch["angle"].to(device, non_blocking=True) if not "wo_angle" in checkpoint_path else None
 			satellite_paths = batch["satellite_path"]
 
 			if _is_encoder_abla(model_type):
-				_, _, _, _, grid_feats, fused_feats = model(query_inputs, search_inputs, input_ids, angles)
+				_, _, _, anchor_pooler, grid_feats, fused_feats = model(query_inputs, search_inputs, input_ids, angles)
 				if fused_feats is None:
-					raise RuntimeError("Encoder_abla did not return fused query features.")
+					fused_feats = anchor_pooler
 				fused_query_feats = F.normalize(fused_feats, p=2, dim=1)
 				gallery_grid_batch = F.normalize(grid_feats, p=2, dim=2)
 			else:
@@ -676,7 +679,7 @@ def eval(
 	error_analysis: Optional[Dict[str, object]] = None,
 ) -> Dict[str, float]:
 	if device is None:
-		device = "cuda" if torch.cuda.is_available() else "cpu"
+		device = "cuda:1" if torch.cuda.is_available() else "cpu"
 
 	subset_height_set = _normalize_subset(subset_heights, DEFAULT_SUBSET_HEIGHTS)
 	subset_angle_set = _normalize_subset(subset_angles, DEFAULT_SUBSET_ANGLES)

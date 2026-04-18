@@ -40,7 +40,7 @@ torch.cuda.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.benchmark = True
 
-IMG_SIZE = 640
+IMG_SIZE = (768, 432)  # (width, height)
 BATCH_SIZE = 4
 NUM_EPOCHS = 8
 LEARNING_RATE = 1e-4
@@ -71,9 +71,13 @@ DISTANCES_FILE = os.path.join(DATA_DIR, "ckpt/distances.json")
 
 
 class TransformProcessorWrapper:
-    def __init__(self, transform):
+    def __init__(self, transform, image_size=IMG_SIZE):
         self.transform = transform
-        self.size = {"height": 640, "width": 640}
+        if isinstance(image_size, (tuple, list)):
+            self.image_size = (int(image_size[0]), int(image_size[1]))
+        else:
+            self.image_size = (int(image_size), int(image_size))
+        self.size = {"height": self.image_size[1], "width": self.image_size[0]}
 
     def __call__(self, images, return_tensors="pt"):
         if isinstance(images, Image.Image):
@@ -304,7 +308,7 @@ def eval_model(run=False, checkpoint_path=None):
     use_amp = torch.cuda.is_available()
     if run:
         print("Loading test dataset...")
-        processor = TransformProcessorWrapper(CVOGL_TRANSFORM)
+        processor = TransformProcessorWrapper(CVOGL_TRANSFORM, args.img_size)
         tokenizer = DummyTokenizer()
         test_dataset = ShiftedSatelliteDroneDataset(
             processor=processor,
@@ -367,7 +371,7 @@ def eval_model(run=False, checkpoint_path=None):
             sat_path = os.path.join(SATELLITE_FOLDER, sat_file)
             try:
                 sat_image = Image.open(sat_path).convert("RGB")
-                sat_image = sat_image.crop((840, 0, 3000, 2160)).resize((640, 640))
+                sat_image = sat_image.crop((840, 0, 3000, 2160)).resize(args.img_size)
                 sat_img_np = np.array(sat_image)
                 sat_img = CVOGL_TRANSFORM(sat_img_np).unsqueeze(0).to(DEVICE)
 
@@ -457,7 +461,7 @@ def main(args):
     writer = SummaryWriter(f"runs/{exp_name}")
 
     print("Creating datasets from shared data source...")
-    processor = TransformProcessorWrapper(CVOGL_TRANSFORM)
+    processor = TransformProcessorWrapper(CVOGL_TRANSFORM, args.img_size)
     tokenizer = DummyTokenizer()
 
     train_dataset = ShiftedSatelliteDroneDataset(
@@ -553,7 +557,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="learning rate")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="batch size")
-    parser.add_argument("--img-size", type=int, default=IMG_SIZE, help="image size")
+    parser.add_argument(
+        "--img-size",
+        type=int,
+        nargs=2,
+        metavar=("WIDTH", "HEIGHT"),
+        default=list(IMG_SIZE),
+        help="image size as WIDTH HEIGHT",
+    )
     parser.add_argument(
         "--savename",
         type=str,
@@ -571,6 +582,7 @@ if __name__ == "__main__":
         help="Path to save model checkpoints",
     )
     args = parser.parse_args()
+    args.img_size = (int(args.img_size[0]), int(args.img_size[1]))
 
     os.makedirs(args.checkpoint, exist_ok=True)
 

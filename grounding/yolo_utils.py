@@ -149,7 +149,7 @@ class SpatialTransformer(nn.Module):
         return x + x_in
 
 
-IMG_SIZE = 640
+IMG_SIZE = (768, 432)  # (width, height)
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
 
@@ -167,9 +167,21 @@ def get_tensor_anchors(device):
 
 def generate_anchors_by_feature_size(predict_feature_size, img_size=IMG_SIZE):
     """Generate anchors for a specific feature size."""
-    stride = img_size // predict_feature_size
-    anchors = get_anchors()
-    anchors = anchors / stride
+    if isinstance(img_size, (tuple, list)):
+        image_w, image_h = float(img_size[0]), float(img_size[1])
+    else:
+        image_w = image_h = float(img_size)
+
+    if isinstance(predict_feature_size, (tuple, list)):
+        grid_w, grid_h = float(predict_feature_size[0]), float(predict_feature_size[1])
+    else:
+        grid_w = grid_h = float(predict_feature_size)
+
+    stride_x = image_w / grid_w
+    stride_y = image_h / grid_h
+    anchors = get_anchors().clone()
+    anchors[:, 0] = anchors[:, 0] / stride_x
+    anchors[:, 1] = anchors[:, 1] / stride_y
     return anchors
 
 def bbox_iou(box1, box2, x1y1x2y2=True):
@@ -212,16 +224,44 @@ def xyxy2xywh(x):  # Convert bounding box format from [x1, y1, x2, y2] to [x, y,
     return y
 
 def build_target(ori_gt_bboxes, anchors_full, image_wh, grid_wh):
-    #the default value of coord_dim is 5
-    batch_size, coord_dim, grid_stride, anchor_count = ori_gt_bboxes.shape[0], ori_gt_bboxes.shape[1], image_wh//grid_wh, anchors_full.shape[0]
-    
-    gt_bboxes = xyxy2xywh(ori_gt_bboxes)
-    gt_bboxes = (gt_bboxes/image_wh) * grid_wh
-    scaled_anchors = anchors_full/grid_stride
+    # Supports both scalar (square) and tuple (width, height) image/grid sizes.
+    if isinstance(image_wh, (tuple, list)):
+        image_w, image_h = float(image_wh[0]), float(image_wh[1])
+    else:
+        image_w = image_h = float(image_wh)
 
-    gxy = gt_bboxes[:, 0:2]
+    if isinstance(grid_wh, (tuple, list)):
+        grid_w, grid_h = float(grid_wh[0]), float(grid_wh[1])
+    else:
+        grid_w = grid_h = float(grid_wh)
+
+    # the default value of coord_dim is 5
+    batch_size, coord_dim, anchor_count = (
+        ori_gt_bboxes.shape[0],
+        ori_gt_bboxes.shape[1],
+        anchors_full.shape[0],
+    )
+
+    stride_x = image_w / grid_w
+    stride_y = image_h / grid_h
+
+    gt_bboxes = xyxy2xywh(ori_gt_bboxes)
+    gt_bboxes = gt_bboxes.clone()
+    gt_bboxes[:, 0] = (gt_bboxes[:, 0] / image_w) * grid_w
+    gt_bboxes[:, 1] = (gt_bboxes[:, 1] / image_h) * grid_h
+    gt_bboxes[:, 2] = (gt_bboxes[:, 2] / image_w) * grid_w
+    gt_bboxes[:, 3] = (gt_bboxes[:, 3] / image_h) * grid_h
+
+    scaled_anchors = anchors_full.clone()
+    scaled_anchors[:, 0] = scaled_anchors[:, 0] / stride_x
+    scaled_anchors[:, 1] = scaled_anchors[:, 1] / stride_y
+
+    # Keep center coordinates strictly inside the feature map to avoid out-of-bounds indices.
+    gxy = gt_bboxes[:, 0:2].clone()
+    gxy[:, 0] = gxy[:, 0].clamp(min=0.0, max=grid_w - 1e-6)
+    gxy[:, 1] = gxy[:, 1].clamp(min=0.0, max=grid_h - 1e-6)
     gwh = gt_bboxes[:, 2:4]
-    gij = gxy.long()
+    gij = gxy.floor().long()
 
     #get the best anchor for each target bbox
     gt_bboxes_tmp, scaled_anchors_tmp = torch.zeros_like(gt_bboxes), torch.zeros((anchor_count, coord_dim), device=gt_bboxes.device)
@@ -240,14 +280,29 @@ def build_target(ori_gt_bboxes, anchors_full, image_wh, grid_wh):
 
 
 def yolo_loss(predictions, gt_bboxes, anchors_full, best_anchor_gi_gj, image_wh):
-    batch_size, grid_stride = predictions.shape[0], image_wh // predictions.shape[3]
-    best_anchor, gi, gj = best_anchor_gi_gj[:, 0], best_anchor_gi_gj[:, 1], best_anchor_gi_gj[:, 2]
-    scaled_anchors = anchors_full / grid_stride
+    if isinstance(image_wh, (tuple, list)):
+        image_w, image_h = float(image_wh[0]), float(image_wh[1])
+    else:
+        image_w = image_h = float(image_wh)
+
+    batch_size = predictions.shape[0]
+    anchor_count = predictions.shape[1]
+    grid_h = predictions.shape[3]
+    grid_w = predictions.shape[4]
+    best_anchor = best_anchor_gi_gj[:, 0].long().clamp_(0, anchor_count - 1)
+    gi = best_anchor_gi_gj[:, 1].long().clamp_(0, grid_w - 1)
+    gj = best_anchor_gi_gj[:, 2].long().clamp_(0, grid_h - 1)
+    stride_x = image_w / float(grid_w)
+    stride_y = image_h / float(grid_h)
+    scaled_anchors = anchors_full.clone()
+    scaled_anchors[:, 0] = scaled_anchors[:, 0] / stride_x
+    scaled_anchors[:, 1] = scaled_anchors[:, 1] / stride_y
     mseloss = torch.nn.MSELoss(reduction='mean')
     celoss_confidence = torch.nn.CrossEntropyLoss(reduction='mean')
     #celoss_cls = torch.nn.CrossEntropyLoss(size_average=True)
 
-    selected_predictions = predictions[range(batch_size), best_anchor, :, gj, gi]
+    batch_indices = torch.arange(batch_size, device=predictions.device)
+    selected_predictions = predictions[batch_indices, best_anchor, :, gj, gi]
 
     #---bbox loss---
     pred_bboxes = torch.zeros_like(gt_bboxes)
@@ -264,7 +319,7 @@ def yolo_loss(predictions, gt_bboxes, anchors_full, best_anchor_gi_gj, image_wh)
     #---confidence loss---
     pred_confidences = predictions[:,:,4,:,:]
     gt_confidences = torch.zeros_like(pred_confidences)
-    gt_confidences[range(batch_size), best_anchor, gj, gi] = 1
+    gt_confidences[batch_indices, best_anchor, gj, gi] = 1
     pred_confidences, gt_confidences = pred_confidences.reshape(batch_size, -1), \
                     gt_confidences.reshape(batch_size, -1)
     loss_confidence = celoss_confidence(pred_confidences, gt_confidences.max(1)[1])
@@ -284,15 +339,25 @@ def xywh2xyxy(x):  # Convert bounding box format from [x, y, w, h] to [x1, y1, x
 def eval_iou_acc(pred_anchor, target_bbox, anchors_full, target_gi, target_gj, image_wh, iou_threshold_list=[0.5]):
     #print(pred_anchor)
 
-    batch_size, grid_stride = target_bbox.shape[0], image_wh // pred_anchor.shape[3]
+    if isinstance(image_wh, (tuple, list)):
+        image_w, image_h = float(image_wh[0]), float(image_wh[1])
+    else:
+        image_w = image_h = float(image_wh)
+
+    batch_size = target_bbox.shape[0]
+    grid_h = pred_anchor.shape[3]
+    grid_w = pred_anchor.shape[4]
+    stride_x = image_w / float(grid_w)
+    stride_y = image_h / float(grid_h)
     #batch_size, anchor_count, xywh+confidence, grid_height, grid_width
     assert(len(pred_anchor.shape) == 5)
-    assert(pred_anchor.shape[3] == pred_anchor.shape[4])
     
     ## eval: convert center+offset to box prediction
     ## calculate at rescaled image during validation for speed-up
     pred_confidence = pred_anchor[:,:,4,:,:]
-    scaled_anchors = anchors_full / grid_stride
+    scaled_anchors = anchors_full.clone()
+    scaled_anchors[:, 0] = scaled_anchors[:, 0] / stride_x
+    scaled_anchors[:, 1] = scaled_anchors[:, 1] / stride_y
     
     pred_gi, pred_gj = torch.zeros_like(target_gi), torch.zeros_like(target_gj)
     pred_bbox = torch.zeros_like(target_bbox)
@@ -306,7 +371,10 @@ def eval_iou_acc(pred_anchor, target_bbox, anchors_full, target_gi, target_gj, i
         pred_bbox[batch_idx, 1] = pred_anchor[batch_idx, best_n, 1, gj, gi].sigmoid() + gj
         pred_bbox[batch_idx, 2] = torch.exp(pred_anchor[batch_idx, best_n, 2, gj, gi]) * scaled_anchors[best_n][0]
         pred_bbox[batch_idx, 3] = torch.exp(pred_anchor[batch_idx, best_n, 3, gj, gi]) * scaled_anchors[best_n][1]
-    pred_bbox = pred_bbox * grid_stride
+    pred_bbox[:, 0] = pred_bbox[:, 0] * stride_x
+    pred_bbox[:, 1] = pred_bbox[:, 1] * stride_y
+    pred_bbox[:, 2] = pred_bbox[:, 2] * stride_x
+    pred_bbox[:, 3] = pred_bbox[:, 3] * stride_y
     pred_bbox = xywh2xyxy(pred_bbox)
     
     ## box iou

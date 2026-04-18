@@ -15,7 +15,7 @@ from transformers import AutoImageProcessor, AutoTokenizer
 
 from ground_cvos import DetGeoLite, LPNGeoLite, SampleGeoLite, TROGeoLite
 from ground_siglip import Encoder as SigLIPModel
-from model.loss import build_target
+from bbox.yolo_utils import build_target
 from utils.utils import bbox_iou, eval_iou_acc
 
 

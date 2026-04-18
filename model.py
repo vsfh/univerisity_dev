@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, AutoImageProcessor, AutoTokenizer
-
+import math
 from bbox.yolo_utils import SpatialTransformer
 from transformers.models.siglip.modeling_siglip import SiglipVisionConfig, SiglipMLP
 MODEL_NAME = "google/siglip-base-patch16-224"
@@ -97,6 +97,7 @@ class PoolingHead(nn.Module):
         super().__init__()
 
         self.probe = nn.Parameter(torch.randn(1, 9, config.hidden_size))
+        # self.probe = SiglipPoolingHead.probe
         self.head = SiglipPoolingHead
         # self.attention = torch.nn.MultiheadAttention(config.hidden_size, config.num_attention_heads, batch_first=True)
         # self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -105,6 +106,7 @@ class PoolingHead(nn.Module):
     def forward(self, hidden_state):
         batch_size = hidden_state.shape[0]
         probe = self.probe.repeat(batch_size, 1, 1)
+        # probe = self.probe.repeat(batch_size, 9, 1)
 
         hidden_state = self.head.attention(probe, hidden_state, hidden_state)[0]
 
@@ -575,53 +577,122 @@ class Encoder_heading(nn.Module):
         )
 
         return sat_feature_2d_pool
-        
-class Rotator(nn.Module):
-    def __init__(self, feature_dim):
+
+class PatchEmbedAndPos(nn.Module):
+    def __init__(self, in_channels=3, embed_dim=32, patch_size=16, img_size=256):
         super().__init__()
-        assert feature_dim % 2 == 0, "Feature dimension must be even for rotary operations."
-        
-        # Learnable frequencies: allows the model to scale the angle differently 
-        # for different feature pairs. 
-        # Shape updated to (1, 1, feature_dim // 2) for easy broadcasting over N.
-        self.freqs = nn.Parameter(torch.randn(1, 1, feature_dim // 2))
+        self.proj = nn.Conv2d(
+            in_channels,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+        if isinstance(img_size, (tuple, list)):
+            grid_h = int(img_size[0]) // patch_size
+            grid_w = int(img_size[1]) // patch_size
+        else:
+            grid_h = int(img_size) // patch_size
+            grid_w = int(img_size) // patch_size
+        self.base_grid_size = (grid_h, grid_w)
+        num_patches = grid_h * grid_w
+        self.pos_embed = nn.Parameter(torch.randn(1, num_patches, embed_dim) * 0.02)
 
-    def forward(self, x, angle):
-        """
-        x: sequence hidden states of shape (B, N, C)
-        angle: rotation angle in radians of shape (B,), (B, 1), or (B, 1, 1)
-        """
-        B, N, C = x.shape
-        
-        # Reshape angle to (B, 1, 1) so it broadcasts across the N and C dimensions
-        if angle.dim() == 1:
-            angle = angle.view(B, 1, 1)
-        elif angle.dim() == 2:
-            angle = angle.view(B, 1, 1)
-            
-        # Multiply angle by learned frequencies. Shape: (B, 1, C // 2)
-        # It will automatically broadcast across the N dimension during rotation
-        theta = angle * self.freqs
-        
-        # Split features into pairs. 
-        # Using ... handles the (B, N) dimensions automatically
-        x1 = x[..., 0::2]  # Shape: (B, N, C // 2)
-        x2 = x[..., 1::2]  # Shape: (B, N, C // 2)
-        
-        # Apply 2D rotation matrix to each pair
-        cos_theta = torch.cos(theta)
-        sin_theta = torch.sin(theta)
-        
-        x1_rot = x1 * cos_theta - x2 * sin_theta
-        x2_rot = x1 * sin_theta + x2 * cos_theta
-        
-        # Interleave the rotated pairs back together
-        out = torch.empty_like(x)
-        out[..., 0::2] = x1_rot
-        out[..., 1::2] = x2_rot
-        
-        return out
+    def forward(self, x):
+        # Support variable input sizes by interpolating positional embeddings
+        # from the base grid to the current projected patch grid.
+        x = self.proj(x)
+        b, c, h, w = x.shape
+        tokens = x.flatten(2).transpose(1, 2)
 
+        if tokens.shape[1] == self.pos_embed.shape[1]:
+            pos_embed = self.pos_embed
+        else:
+            base_h, base_w = self.base_grid_size
+            pos_embed_2d = self.pos_embed.reshape(1, base_h, base_w, c).permute(
+                0, 3, 1, 2
+            )
+            pos_embed_2d = F.interpolate(
+                pos_embed_2d,
+                size=(h, w),
+                mode="bicubic",
+                align_corners=False,
+            )
+            pos_embed = pos_embed_2d.permute(0, 2, 3, 1).reshape(1, h * w, c)
+
+        return tokens + pos_embed
+
+# --- 辅助模块 2: 序列的全局平均池化 ---
+class GlobalAvgPool1D(nn.Module):
+    def forward(self, x):
+        return x.mean(dim=1)
+    
+class STN(nn.Module):
+    def __init__(self):
+        super(STN, self).__init__()
+        
+        # 1. 定位网络 (特征提取)
+        self.localization = nn.Sequential(
+            PatchEmbedAndPos(in_channels=3, embed_dim=32, patch_size=16),
+            nn.TransformerEncoderLayer(d_model=32, nhead=4, dim_feedforward=64, batch_first=True),
+            GlobalAvgPool1D(),
+        )
+        
+        # 2. 回归器：注意这里只输出 4 个参数 (Sx, Sy, Tx, Ty)
+        self.fc_loc = nn.Sequential(
+            nn.Linear(32, 32),
+            nn.ReLU(True),
+            nn.Linear(32, 4)
+        )
+        
+        # 【关键初始化】：让网络初始状态不改变图像大小和位置
+        # 缩放因子初始化为 1，平移因子初始化为 0
+        self.fc_loc[2].weight.data.zero_()
+        self.fc_loc[2].bias.data.copy_(torch.tensor([1.0, 1.0, 0.0, 0.0], dtype=torch.float))
+
+    def forward(self, x, known_angles_deg):
+        """
+        参数:
+            x: 输入图像 Tensor, shape 为 [B, C, H, W]
+            known_angles_deg: 准确的旋转角度 (度数) Tensor, shape 为 [B]
+        """
+        B = x.size(0)
+        device = x.device
+        
+        # --- 步骤 1: 网络预测未知的缩放和平移参数 ---
+        xs = self.localization(x)
+        params = self.fc_loc(xs)  # shape: [B, 4]
+        
+        # 提取各个参数
+        sx = params[:, 0]
+        sy = params[:, 1]
+        tx = params[:, 2]
+        ty = params[:, 3]
+        
+        # --- 步骤 2: 将已知角度转换为弧度并计算正余弦 ---
+        angle_rad = known_angles_deg * math.pi / 180.0
+        cos_a = torch.cos(angle_rad)
+        sin_a = torch.sin(angle_rad)
+        
+        # --- 步骤 3: 融合已知角度和预测参数，构建 2x3 仿射矩阵 ---
+        # 矩阵形式:
+        # [ Sx * cos(a), -Sy * sin(a), Tx ]
+        # [ Sx * sin(a),  Sy * cos(a), Ty ]
+        theta = torch.zeros(B, 2, 3, device=device, dtype=x.dtype)
+        
+        theta[:, 0, 0] = sx * cos_a
+        theta[:, 0, 1] = -sy * sin_a
+        theta[:, 0, 2] = tx
+        
+        theta[:, 1, 0] = sx * sin_a
+        theta[:, 1, 1] = sy * cos_a
+        theta[:, 1, 2] = ty
+        
+        # --- 步骤 4: 网格生成与采样 ---
+        grid = F.affine_grid(theta, x.size(), align_corners=False)
+        x_transformed = F.grid_sample(x, grid, align_corners=False)
+        
+        return x_transformed
+    
 class Encoder_abla(nn.Module):
     """Enhanced encoder with GeM pooling, gated fusion, and residual connections.
 
@@ -653,7 +724,7 @@ class Encoder_abla(nn.Module):
         #     self.pool_info_sat = nn.AdaptiveAvgPool2d((3, 3))
         # else:
         self.attnPooling = PoolingHead(self.vision_model.head, SiglipVisionConfig())
-        self.pooler_rotator = Rotator(self.feature_dim)
+        # self.pooler_rotator = Rotator(self.feature_dim)
         self.gate_fc = nn.Linear(proj_dim * 2, 1)
         # self.fuse_fc = nn.Linear(proj_dim, proj_dim)
 
@@ -689,6 +760,7 @@ class Encoder_abla(nn.Module):
             nn.GELU(),
             nn.Linear(self.feature_dim, self.feature_dim),
         )
+        self.stn = STN()
         # self.bbox_heading = nn.Sequential(
         #     nn.ConvTranspose2d(
         #         in_channels=self.feature_dim,
@@ -721,16 +793,17 @@ class Encoder_abla(nn.Module):
 
     def forward(self, anchor_pixel_values, search_pixel_values, input_ids=None, angle=None):
         B = anchor_pixel_values.shape[0]
-
+        if angle is not None:
+            anchor_pixel_values = self.stn(anchor_pixel_values, angle)
         # with torch.no_grad():
         anchor_output = self.vision_model(anchor_pixel_values)
         anchor_feats = anchor_output.last_hidden_state
-        if angle is not None:
-            angle_rad = torch.deg2rad(angle)
-            anchor_feats_rotate = self.pooler_rotator(anchor_feats, angle_rad)
-            anchor_pooler = self.vision_model.head(anchor_feats_rotate)
-        else:
-            anchor_pooler = anchor_output.pooler_output
+
+        #     angle_rad = torch.deg2rad(angle)
+        #     anchor_feats_rotate = self.pooler_rotator(anchor_feats, angle_rad)
+        #     anchor_pooler = self.vision_model.head(anchor_feats_rotate)
+        # else:
+        anchor_pooler = anchor_output.pooler_output
 
 
         sat_output = self.vision_model(
@@ -747,7 +820,11 @@ class Encoder_abla(nn.Module):
             anchor_context = (
                 self.bbox_adapter(anchor_feats.detach()) + anchor_feats.detach()
             )
+            # anchor_context = anchor_feats.detach()
         else:
+            # anchor_context = (
+            #     self.bbox_adapter(anchor_feats.detach()) + anchor_feats.detach()
+            # )
             anchor_context = anchor_feats
 
         fused_features = self.bbox_transformer(

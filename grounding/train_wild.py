@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import argparse
 from ground_cvos import TROGeoLite
-from model.loss import yolo_loss, build_target, adjust_learning_rate
+from bbox.yolo_utils import yolo_loss, build_target
+from model.loss import adjust_learning_rate
 from utils.utils import AverageMeter, eval_iou_acc
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -33,7 +34,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from dataset import ShiftedSatelliteDroneDataset
 
-IMG_SIZE = 640
+IMG_SIZE = (768, 432)  # (width, height)
 BATCH_SIZE = 4
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
@@ -50,7 +51,7 @@ UNIV_TRAIN_FILE = "/data/feihong/ckpt/train.txt"
 UNIV_TEST_FILE = "/data/feihong/ckpt/test.txt"
 UNIV_CROP_SIZE = (640, 640)
 UNIV_DRONE_SIZE = (256, 256)
-UNIV_SAT_SIZE = (640, 640)
+UNIV_SAT_SIZE = IMG_SIZE
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 CVOGL_TRANSFORM = None
@@ -66,7 +67,7 @@ HEADING_TO_TARGET = {
 class TransformProcessorWrapper:
     def __init__(self):
         self.to_tensor = torch.nn.Identity()
-        self.size = {"height": 640, "width": 640}
+        self.size = {"height": IMG_SIZE[1], "width": IMG_SIZE[0]}
 
     def __call__(self, images, return_tensors="pt"):
         image_np = np.array(images, dtype=np.float32) / 255.0
@@ -224,12 +225,15 @@ def train_epoch(
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
         )
 
+        image_wh = (rs_imgs.shape[-1], rs_imgs.shape[-2])
+        grid_wh = (pred_anchor.shape[4], pred_anchor.shape[3])
+
         new_gt_bbox, best_anchor_gi_gj = build_target(
-            ori_gt_bbox, anchors_full, img_size, pred_anchor.shape[3]
+            ori_gt_bbox, anchors_full, image_wh, grid_wh
         )
 
         loss_geo, loss_cls = yolo_loss(
-            pred_anchor, new_gt_bbox, anchors_full, best_anchor_gi_gj, img_size
+            pred_anchor, new_gt_bbox, anchors_full, best_anchor_gi_gj, image_wh
         )
         bbox_loss = loss_geo + loss_cls
         heading_loss = F.mse_loss(pred_heading, heading_target)
@@ -282,8 +286,11 @@ def validate(loader, model, anchors_full, img_size):
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
         )
 
+        image_wh = (rs_imgs.shape[-1], rs_imgs.shape[-2])
+        grid_wh = (pred_anchor.shape[4], pred_anchor.shape[3])
+
         _, best_anchor_gi_gj = build_target(
-            ori_gt_bbox, anchors_full, img_size, pred_anchor.shape[3]
+            ori_gt_bbox, anchors_full, image_wh, grid_wh
         )
 
         accu_list, accu_center, iou, _, _, _ = eval_iou_acc(
@@ -292,7 +299,7 @@ def validate(loader, model, anchors_full, img_size):
             anchors_full,
             best_anchor_gi_gj[:, 1],
             best_anchor_gi_gj[:, 2],
-            img_size,
+            image_wh,
             iou_threshold_list=[0.5, 0.25],
         )
 
@@ -488,7 +495,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="learning rate")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="batch size")
-    parser.add_argument("--img-size", type=int, default=IMG_SIZE, help="image size")
+    parser.add_argument(
+        "--img-size",
+        type=int,
+        nargs=2,
+        metavar=("WIDTH", "HEIGHT"),
+        default=list(IMG_SIZE),
+        help="image size as WIDTH HEIGHT",
+    )
     parser.add_argument(
         "--heading-loss-weight",
         type=float,
@@ -532,6 +546,7 @@ if __name__ == "__main__":
         help="Subset test data by exact angle",
     )
     args = parser.parse_args()
+    args.img_size = (int(args.img_size[0]), int(args.img_size[1]))
 
     os.makedirs(args.checkpoint, exist_ok=True)
 

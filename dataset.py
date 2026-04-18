@@ -26,7 +26,7 @@ MAX_TEXT_LENGTH = 64
 DEFAULT_SAT_TARGET_SIZE = (432, 768)
 DEFAULT_TEST_CROP_RATIO = 1.0
 DEFAULT_SUBSET_HEIGHTS = [150, 200, 250, 300]
-DEFAULT_SUBSET_ANGLES = [0, 90, 180, 270]
+DEFAULT_SUBSET_ANGLES = [0, 45, 90, 135, 180, 225, 270, 315]
 DEFAULT_ENABLE_TIMING_LOG = False
 DEFAULT_TIMING_LOG_INTERVAL = 200
 DEFAULT_MODEL_NAME = "google/siglip-base-patch16-224"
@@ -362,11 +362,11 @@ def _augment_satellite_image_with_bbox_640(
 		max_crop_h = max_crop_w / max(target_aspect, 1e-6)
 
 	if mode == "train":
-		context_scale = 4.0
+		context_scale = 3.0
 		min_crop_w = max(bbox_w, bbox_h * target_aspect) * context_scale
 	else:
 		ratio = max(1e-3, min(1.0, float(test_crop_ratio)))
-		context_scale = 4.0
+		context_scale = 3.0
 		min_crop_w = max(bbox_w, bbox_h * target_aspect) * context_scale
 		# Keep ratio<1.0 as an optional lower bound; ratio>=1.0 should not force full-size crop.
 		if ratio < 1.0:

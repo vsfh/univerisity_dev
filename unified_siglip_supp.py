@@ -6,7 +6,7 @@ import time
 from contextlib import nullcontext
 from glob import glob
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -54,12 +54,12 @@ class Config:
     SATELLITE_FOLDER = "/data/feihong/asian_univ"
 
     SAT_ORIG_SIZE = (3840, 2160)
-    # UNIV_SAT_SIZE = (768, 432)
-    UNIV_SAT_SIZE = (640, 640)
+    UNIV_SAT_SIZE = (768, 432)
+    # UNIV_SAT_SIZE = (640, 640)
     DRONE_SIZE = (256, 256)
 
     NUM_EPOCHS = 16
-    BATCH_SIZE = 4
+    BATCH_SIZE = 8
     GRAD_ACCUMULATION_STEPS = 2
     LEARNING_RATE = 5e-5
     LR_MIN = 1e-10
@@ -78,21 +78,9 @@ class Config:
 
     USE_AMP = True
     ENABLE_TF32 = True
-    USE_ANGLE_INPUT = False
-
-    HEADING_TO_TARGET = {
-        0: [0.0, 0.0],
-        90: [0.0, 1.0],
-        180: [1.0, 0.0],
-        270: [1.0, 1.0],
-    }
-
-    TARGET_TO_HEADING = {
-        (0.0, 0.0): 0,
-        (0.0, 1.0): 90,
-        (1.0, 0.0): 180,
-        (1.0, 1.0): 270,
-    }
+    USE_ANGLE_INPUT = True
+    USE_TEXT_INPUT = True
+    OPTIMIZE_OBJECTIVE = "combined"  # combined | img_text_only | bbox_only
 
 
 # --- Utility Functions ---
@@ -108,6 +96,21 @@ class AverageMeter:
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+
+
+def _to_clearml_serializable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(k): _to_clearml_serializable(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_to_clearml_serializable(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 
 def build_dataloader_kwargs(num_workers: int, drop_last: bool = False) -> Dict:
@@ -294,7 +297,11 @@ def validate(
             accelerator.device, non_blocking=True
         )
         ori_gt_bbox = batch["bbox"].to(accelerator.device, non_blocking=True)
-        input_ids = batch["input_ids"].to(accelerator.device, non_blocking=True)
+        input_ids = (
+            batch["input_ids"].to(accelerator.device, non_blocking=True)
+            if Config.USE_TEXT_INPUT
+            else None
+        )
         local_indices = batch["index"].to(accelerator.device, non_blocking=True)
         angles = (
             batch["angle"].to(accelerator.device, non_blocking=True)
@@ -349,14 +356,21 @@ def validate(
         positive_indices[row_indices_flat, global_positive_indices] = 0.95
 
         if useap:
-            img_text_loss = 0.7 * info_nce_loss(
-                fused_feats, candidate_feats, positive_indices
-            )
-            img_text_loss += 0.3 * info_nce_loss(
-                anchor_feats, candidate_feats, positive_indices
-            )
+            if fused_feats is not None:
+                img_text_loss = 0.7 * info_nce_loss(
+                    fused_feats, candidate_feats, positive_indices
+                )
+                img_text_loss += 0.3 * info_nce_loss(
+                    anchor_feats, candidate_feats, positive_indices
+                )
+            else:
+                # No text branch: fall back to image-only retrieval objective.
+                img_text_loss = info_nce_loss(
+                    anchor_feats, candidate_feats, positive_indices
+                )
         else:
-            scores = model.scorer(fused_feats, candidate_feats)
+            scorer_input = fused_feats if fused_feats is not None else anchor_feats
+            scores = model.scorer(scorer_input, candidate_feats)
             img_text_loss = F.cross_entropy(scores, positive_indices)
 
         batch_n = torch.tensor(float(query_imgs.shape[0]), device=accelerator.device)
@@ -407,6 +421,13 @@ def load_data_splits() -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], se
 
 
 def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
+    valid_objectives = {"combined", "img_text_only", "bbox_only"}
+    if Config.OPTIMIZE_OBJECTIVE not in valid_objectives:
+        raise ValueError(
+            f"Invalid OPTIMIZE_OBJECTIVE={Config.OPTIMIZE_OBJECTIVE}. "
+            f"Choose from {sorted(valid_objectives)}."
+        )
+
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         mixed_precision="no",
@@ -433,10 +454,22 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
             project_name=Config.CLEARML_PROJECT,
             task_name=task_name,
         )
+
+        raw_config_dict = {
+            key: getattr(Config, key)
+            for key in dir(Config)
+            if key.isupper() and not key.startswith("__")
+        }
+        config_dict = _to_clearml_serializable(raw_config_dict)
+        clearml_task.connect(config_dict, name="config")
+
         clearml_logger = clearml_task.get_logger()
         clearml_logger.report_text(f"Experiment: {exp_name}")
         clearml_logger.report_text(
             f"Config: batch_size={Config.BATCH_SIZE}, lr={Config.LEARNING_RATE}, epochs={Config.NUM_EPOCHS}"
+        )
+        clearml_logger.report_text(
+            "Full Config:\n" + json.dumps(config_dict, indent=2, sort_keys=True, ensure_ascii=False)
         )
 
     accelerator.print("Loading models and processor...")
@@ -528,8 +561,10 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 search_pixel_values = batch["search_pixel_values"].to(
                     accelerator.device, non_blocking=True
                 )
-                input_ids = batch["input_ids"].to(
-                    accelerator.device, non_blocking=True
+                input_ids = (
+                    batch["input_ids"].to(accelerator.device, non_blocking=True)
+                    if Config.USE_TEXT_INPUT
+                    else None
                 )
                 local_indices = batch["index"].to(
                     accelerator.device, non_blocking=True
@@ -588,7 +623,8 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     row_indices_flat = torch.arange(B, device=accelerator.device)
                     positive_indices[row_indices_flat, global_positive_indices] = 0.95
 
-                    if use_ap:
+
+                    if fused_feats is not None:
                         img_text_loss = 0.7 * info_nce_loss(
                             fused_feats, candidate_feats, positive_indices
                         )
@@ -596,13 +632,27 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                             anchor_feats, candidate_feats, positive_indices
                         )
                     else:
-                        scores = model.scorer(fused_feats, candidate_feats)
-                        img_text_loss = F.cross_entropy(scores, positive_indices)
+                        # No text branch: fall back to image-only retrieval objective.
+                        img_text_loss = info_nce_loss(
+                            anchor_feats, candidate_feats, positive_indices
+                        )
 
-                    bbox_weight, retrieval_weight = get_loss_weights(
+
+                    scheduled_bbox_weight, scheduled_retrieval_weight = get_loss_weights(
                         epoch, Config.COSINE_EPOCHS, end_num
                     )
-                    loss = retrieval_weight * img_text_loss + bbox_weight * bbox_loss
+                    if Config.OPTIMIZE_OBJECTIVE == "combined":
+                        bbox_weight = scheduled_bbox_weight
+                        retrieval_weight = scheduled_retrieval_weight
+                        loss = retrieval_weight * img_text_loss + bbox_weight * bbox_loss
+                    elif Config.OPTIMIZE_OBJECTIVE == "img_text_only":
+                        bbox_weight = 0.0
+                        retrieval_weight = 1.0
+                        loss = img_text_loss
+                    else:  # bbox_only
+                        bbox_weight = 1.0
+                        retrieval_weight = 0.0
+                        loss = bbox_loss
 
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
@@ -689,7 +739,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 # --- Main ---
 if __name__ == "__main__":
     end_num = 0.1
-    exp_name = f"rope_{end_num}_wo_angle"
+    exp_name = f"rope_{end_num}_wo_text"
     save_dir = f"/data/feihong/ckpt/{exp_name}"
 
     if os.path.exists(save_dir):

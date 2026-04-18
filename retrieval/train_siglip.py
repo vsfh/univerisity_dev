@@ -36,7 +36,7 @@ DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
 IMAGE_FOLDER = "/data/feihong/image_1024"
 HEADING_FOLDER = "/data/feihong/range_250"
 
-NUM_EPOCHS = 20
+NUM_EPOCHS = 4
 BATCH_SIZE = 8
 LEARNING_RATE = 1e-5
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -47,8 +47,8 @@ PREFETCH_FACTOR = 4
 PIN_MEMORY = True
 PERSISTENT_WORKERS = True
 PROCESSOR_IMAGE_SIZE = {"height": 432, "width": 768}
-DEFAULT_SUBSET_HEIGHTS = [250, 300]
-DEFAULT_SUBSET_ANGLES = [0, 90, 180, 270]
+DEFAULT_SUBSET_HEIGHTS = [150, 200, 250, 300]
+DEFAULT_SUBSET_ANGLES = [0, 45, 90, 135, 180, 225, 270, 315]
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -300,7 +300,6 @@ def info_nce_loss(query_feats, candidate_feats, positive_indices, temperature=0.
 
 
 def main(save_path):
-    not_update = 0
     exp_name = save_path.split("/")[-1] if save_path else "default_exp"
     writer = SummaryWriter(f"runs/{exp_name}")
 
@@ -337,26 +336,8 @@ def main(save_path):
         drop_last=True,
     )
 
-    test_dataset = ShiftedSatelliteDroneDataset(
-        processor=processor,
-        processor_sat=processor_sat,
-        tokenizer=tokenizer,
-        split="val",
-        subset_heights=DEFAULT_SUBSET_HEIGHTS,
-        subset_angles=DEFAULT_SUBSET_ANGLES,
-    )
-    test_dataloader = DataLoader(
-        test_dataset,
-        shuffle=False,
-        batch_size=BATCH_SIZE,
-        num_workers=NUM_WORKERS,
-        pin_memory=PIN_MEMORY and use_cuda,
-        persistent_workers=PERSISTENT_WORKERS and NUM_WORKERS > 0,
-        prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
-    )
-
     print(f"Starting training on {DEVICE} for {NUM_EPOCHS} epochs...")
-    min_loss = 100
+    min_loss = float("inf")
     for epoch in range(NUM_EPOCHS):
         model.train()
         total_loss = 0
@@ -411,27 +392,17 @@ def main(save_path):
             )
 
         avg_loss = total_loss / len(train_dataloader)
-
-        model.eval()
-        val_loss, txt_val_loss = validation(model, test_dataloader, epoch)
         writer.add_scalar("Loss/train_epoch", avg_loss, epoch)
-        writer.add_scalar("Loss/val_img_epoch", val_loss, epoch)
-        writer.add_scalar("Loss/val_txt_epoch", txt_val_loss, epoch)
-        print(
-            f"Epoch {epoch + 1} finished. Average train Loss: {avg_loss:.4f}. Average test Loss: {txt_val_loss:.4f}"
-        )
+        print(f"Epoch {epoch + 1} finished. Average train Loss: {avg_loss:.4f}")
 
-        if txt_val_loss < min_loss:
+        if avg_loss < min_loss:
             os.makedirs(save_path, exist_ok=True)
             # Save full model state dict (including projection heads)
             torch.save(model.state_dict(), f"{save_path}/best.pth")
-            min_loss = txt_val_loss
-            not_update = 0
-        else:
-            not_update += 1
-        if not_update > 5:
-            print("Validation loss not improving. Stopping early.")
-            break
+            min_loss = avg_loss
+
+    os.makedirs(save_path, exist_ok=True)
+    torch.save(model.state_dict(), f"{save_path}/last.pth")
 
     print("Training complete.")
     writer.close()
