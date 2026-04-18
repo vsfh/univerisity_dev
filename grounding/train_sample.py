@@ -23,14 +23,15 @@ import os
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import argparse
-from ground_cvos import SampleGeoLite
-from bbox.yolo_utils import yolo_loss, build_target
-from model.loss import adjust_learning_rate
-from utils.utils import AverageMeter, eval_iou_acc
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+    sys.path.append(str(REPO_ROOT))
+
+from ground_cvos import SampleGeoLite
+from bbox.yolo_utils import yolo_loss, build_target
+from grounding.model.loss import adjust_learning_rate
+from utils.utils import AverageMeter, eval_iou_acc
 
 from dataset import ShiftedSatelliteDroneDataset
 

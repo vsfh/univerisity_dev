@@ -13,6 +13,10 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoImageProcessor, AutoTokenizer
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
 from ground_cvos import DetGeoLite, LPNGeoLite, SampleGeoLite, TROGeoLite
 from ground_siglip import Encoder as SigLIPModel
 from bbox.yolo_utils import build_target

@@ -22,14 +22,15 @@ import os
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import argparse
-from ground_cvos import DetGeoLite
-from bbox.yolo_utils import yolo_loss, build_target
-from model.loss import adjust_learning_rate
-from utils.utils import AverageMeter, bbox_iou, eval_iou_acc
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+    sys.path.append(str(REPO_ROOT))
+
+from ground_cvos import DetGeoLite
+from bbox.yolo_utils import yolo_loss, build_target
+from grounding.model.loss import adjust_learning_rate
+from utils.utils import AverageMeter, bbox_iou, eval_iou_acc
 
 from dataset import ShiftedSatelliteDroneDataset
 
@@ -334,7 +335,7 @@ def main(args):
         processor=processor,
         processor_sat=processor,
         tokenizer=tokenizer,
-        split="val",
+        split="test",
     )
 
     print(f"Found {len(train_dataset)} training samples, {len(val_dataset)} validation samples")
@@ -383,35 +384,36 @@ def main(args):
             args.print_freq,
         )
 
-        val_iou, val_ratio_50, val_center_distance = validate(
-            val_loader, model, anchors_full, args.img_size
-        )
+        # val_iou, val_ratio_50, val_center_distance = validate(
+        #     val_loader, model, anchors_full, args.img_size
+        # )
 
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/train_geo", train_geo, epoch)
         writer.add_scalar("Loss/train_cls", train_cls, epoch)
-        writer.add_scalar("Metrics/val_iou", val_iou, epoch)
-        writer.add_scalar("Metrics/val_ratio_iou_gt_0_5", val_ratio_50, epoch)
-        writer.add_scalar("Metrics/val_center_distance", val_center_distance, epoch)
+        # writer.add_scalar("Metrics/val_iou", val_iou, epoch)
+        # writer.add_scalar("Metrics/val_ratio_iou_gt_0_5", val_ratio_50, epoch)
+        # writer.add_scalar("Metrics/val_center_distance", val_center_distance, epoch)
 
         print(
             f"Epoch {epoch + 1}/{args.max_epoch}:\t"
             f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})\t"
-            f"Val Mean IoU: {val_iou:.4f}\t"
-            f"Val IoU>0.5 Ratio: {val_ratio_50:.4f}\t"
-            f"Val Center Dist: {val_center_distance:.4f}"
+            # f"Val Mean IoU: {val_iou:.4f}\t"
+            # f"Val IoU>0.5 Ratio: {val_ratio_50:.4f}\t"
+            # f"Val Center Dist: {val_center_distance:.4f}"
         )
+        torch.save(model.state_dict(), f"{args.checkpoint}/best.pth")
 
-        is_best = val_iou > best_iou
-        if val_iou > best_iou:
-            best_iou = val_iou
-            torch.save(model.state_dict(), f"{args.checkpoint}/best.pth")
-            update = 0
-        else:
-            update += 1
-        if update > 5:
-            print("No improvement for 6 epochs, stopping early.")
-            break
+        # is_best = val_iou > best_iou
+        # if val_iou > best_iou:
+        #     best_iou = val_iou
+        #     torch.save(model.state_dict(), f"{args.checkpoint}/best.pth")
+        #     update = 0
+        # else:
+        #     update += 1
+        # if update > 5:
+        #     print("No improvement for 6 epochs, stopping early.")
+        #     break
 
     print(f"\nTraining complete. Best Val IoU: {best_iou:.4f}")
     writer.close()

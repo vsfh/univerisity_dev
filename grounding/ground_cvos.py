@@ -28,17 +28,21 @@ from einops import rearrange
 import timm
 import torchvision.models as torchvision_models
 from torch.autograd import Variable
-from model.TROGeo import SwinTransformer
-from model.attention import SpatialTransformer
-from bbox.yolo_utils import yolo_loss, build_target
-from model.loss import adjust_learning_rate
-from utils.utils import AverageMeter, eval_iou_acc
-from utils.checkpoint import save_checkpoint
-from model.darknet import *
+from pathlib import Path
 import sys
 
-sys.path.insert(0, "/data/feihong/univerisity_dev")
-from out_model import ResidualBlock
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+from grounding.model.TROGeo import SwinTransformer
+from grounding.model.attention import SpatialTransformer
+from bbox.yolo_utils import yolo_loss, build_target
+from grounding.model.loss import adjust_learning_rate
+from grounding.utils.utils import AverageMeter, eval_iou_acc
+from grounding.utils.checkpoint import save_checkpoint
+from grounding.model.darknet import *
+from grounding.out_model import ResidualBlock
 
 DATA_ROOT = "/data/feihong/CVOGL"
 DATA_NAME = "CVOGL_DroneAerial"

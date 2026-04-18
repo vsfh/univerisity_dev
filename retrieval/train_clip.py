@@ -36,10 +36,10 @@ DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
 IMAGE_FOLDER = "/data/feihong/image_1024"
 HEADING_FOLDER = "/data/feihong/range_250"
 
-NUM_EPOCHS = 8
-BATCH_SIZE = 16
+NUM_EPOCHS = 4
+BATCH_SIZE = 8
 LEARNING_RATE = 1e-5
-DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
 PROJECTION_DIM = 768
 NUM_WORKERS = min(16, os.cpu_count() or 8)
 PREFETCH_FACTOR = 4
