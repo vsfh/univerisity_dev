@@ -24,7 +24,7 @@ from accelerate.utils import DistributedDataParallelKwargs
 from transformers import AutoImageProcessor, AutoModel, AutoTokenizer
 from clearml import Task, Logger
 
-from model import Encoder_text_angle, Encoder_abla
+from model import Encoder_dino
 from bbox.yolo_utils import (
     get_tensor_anchors,
     build_target,
@@ -58,7 +58,7 @@ class Config:
     # UNIV_SAT_SIZE = (640, 640)
     DRONE_SIZE = (256, 256)
 
-    NUM_EPOCHS = 8
+    NUM_EPOCHS = 16
     BATCH_SIZE = 8
     GRAD_ACCUMULATION_STEPS = 2
     LEARNING_RATE = 5e-5
@@ -66,7 +66,10 @@ class Config:
     COSINE_EPOCHS = 16
     BBOX_LOSS_WEIGHT = 0.1
     HEADING_LOSS_WEIGHT = 0.01
-    PROJECTION_DIM = 768
+    PROJECTION_DIM = 1280
+    FREEZE_VISION_BLOCKS = 15
+    FREEZE_PATCH_GENERATOR = True
+    FREEZE_CLS_TOKEN = True
 
     NUM_WORKERS_TRAIN = 8
     NUM_WORKERS_VAL = 4
@@ -78,7 +81,7 @@ class Config:
 
     USE_AMP = True
     ENABLE_TF32 = True
-    USE_ANGLE_INPUT = False
+    USE_ANGLE_INPUT = True
     USE_TEXT_INPUT = True
     OPTIMIZE_OBJECTIVE = "combined"  # combined | img_text_only | bbox_only
 
@@ -134,8 +137,61 @@ def get_loss_weights(
     return bbox_weight, retrieval_weight
 
 
+def format_satellite_img_bbox(
+    image: Image.Image,
+    bbox: Tuple[int, int, int, int],
+    mode: str = "train",
+    target_size: Tuple[int, int] = Config.UNIV_SAT_SIZE,
+) -> Tuple[Image.Image, List[float]]:
+    x1, y1, x2, y2 = bbox
+    width, height = image.size
+
+    min_crop = max(y2 - y1, x2 - x1) * 1.2
+    crop_size = random.uniform(min_crop, max(min_crop, height))
+    if mode == "test":
+        crop_size = height
+
+    min_left = max(0, x2 - crop_size)
+    max_left = min(width - crop_size, x1)
+    min_top = max(0, y2 - crop_size)
+    max_top = min(height - crop_size, y1)
+
+    if max_left < min_left:
+        max_left = min_left
+    if max_top < min_top:
+        max_top = min_top
+
+    if mode == "test":
+        left, top = 840, 0
+    else:
+        left = random.uniform(min_left, max_left)
+        top = random.uniform(min_top, max_top)
+
+    right = left + crop_size
+    bottom = top + crop_size
+
+    image = image.crop((left, top, right, bottom))
+    crop_w, crop_h = image.size
+    target_w, target_h = target_size
+    image = image.resize(target_size)
+
+    # x and y require separate scales when target width != target height.
+    new_x1 = (x1 - left) * (target_w / crop_w)
+    new_y1 = (y1 - top) * (target_h / crop_h)
+    new_x2 = (x2 - left) * (target_w / crop_w)
+    new_y2 = (y2 - top) * (target_h / crop_h)
+
+    return image, [new_x1, new_y1, new_x2, new_y2]
+
+
+def resize_drone_image(
+    image: Image.Image, target_size: Tuple[int, int] = Config.DRONE_SIZE
+) -> Image.Image:
+    return image.resize(target_size, Image.Resampling.BILINEAR)
+
+
 def visualize_batch(
-    batch: Dict, save_dir: str = "runs/visualizations", max_samples: int = 6, sat_size: Tuple[int, int] = (Config.UNIV_SAT_SIZE["width"], Config.UNIV_SAT_SIZE["height"])
+    batch: Dict, save_dir: str = "runs/visualizations", max_samples: int = 6, sat_size: Tuple[int, int] = Config.UNIV_SAT_SIZE
 ) -> None:
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
@@ -274,7 +330,7 @@ def validate(
         _, best_anchor_gi_gj = build_target(
             ori_gt_bbox,
             anchors_full,
-            (Config.UNIV_SAT_SIZE["width"], Config.UNIV_SAT_SIZE["height"]),
+            (Config.UNIV_SAT_SIZE[0], Config.UNIV_SAT_SIZE[1]),
             (pred_anchor.shape[4], pred_anchor.shape[3]),
         )
 
@@ -433,11 +489,13 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     # model = Encoder_heading(
     #     model_name=Config.MODEL_NAME, proj_dim=Config.PROJECTION_DIM
     # )
-    model = Encoder_text_angle(
-        model_name=Config.MODEL_NAME,
+    model = Encoder_dino(
         proj_dim=Config.PROJECTION_DIM,
         usesg=True,
         useap=use_ap,
+        freeze_vision_blocks=Config.FREEZE_VISION_BLOCKS,
+        freeze_patch_generator=Config.FREEZE_PATCH_GENERATOR,
+        freeze_cls_token=Config.FREEZE_CLS_TOKEN,
     )
     # model = Encoder_dino()
 
@@ -473,7 +531,10 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     )
     accelerator.print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")
 
-    optimizer = AdamW(model.parameters(), lr=Config.LEARNING_RATE)
+    optimizer = AdamW(
+        (p for p in model.parameters() if p.requires_grad),
+        lr=Config.LEARNING_RATE,
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=Config.COSINE_EPOCHS
     )
@@ -541,7 +602,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     new_gt_bbox, best_anchor_gi_gj = build_target(
                         target_bbox,
                         anchors_full,
-                        (Config.UNIV_SAT_SIZE["width"], Config.UNIV_SAT_SIZE["height"]),
+                        (Config.UNIV_SAT_SIZE['width'], Config.UNIV_SAT_SIZE['height']),
                         (pred_anchor.shape[4], pred_anchor.shape[3]),
                     )
 
@@ -550,7 +611,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                         new_gt_bbox,
                         anchors_full,
                         best_anchor_gi_gj,
-                        (Config.UNIV_SAT_SIZE["width"], Config.UNIV_SAT_SIZE["height"]),
+                        (Config.UNIV_SAT_SIZE['width'], Config.UNIV_SAT_SIZE['height']),
                     )
                     bbox_loss = loss_geo + loss_cls
 
@@ -571,23 +632,18 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     positive_indices[row_indices_flat, global_positive_indices] = 0.95
 
 
-                    # if fused_feats is not None:
-                    #     img_text_loss = 0.7 * info_nce_loss(
-                    #         fused_feats, candidate_feats, positive_indices
-                    #     )
-                    #     img_text_loss += 0.3 * info_nce_loss(
-                    #         anchor_feats, candidate_feats, positive_indices
-                    #     )
-                    # else:
-                        # No text branch: fall back to image-only retrieval objective.
-                    img_text_loss = info_nce_loss(
-                        anchor_feats, candidate_feats, positive_indices
-                    )
-                    if input_ids is not None and text_feats is not None:
-                        text_loss = info_nce_loss(
-                            text_feats, candidate_feats, positive_indices
+                    if fused_feats is not None:
+                        img_text_loss = 0.7 * info_nce_loss(
+                            fused_feats, candidate_feats, positive_indices
                         )
-                        img_text_loss += 0.2 * text_loss
+                        img_text_loss += 0.3 * info_nce_loss(
+                            anchor_feats, candidate_feats, positive_indices
+                        )
+                    else:
+                        # No text branch: fall back to image-only retrieval objective.
+                        img_text_loss = info_nce_loss(
+                            anchor_feats, candidate_feats, positive_indices
+                        )
 
 
                     scheduled_bbox_weight, scheduled_retrieval_weight = get_loss_weights(
@@ -691,7 +747,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 # --- Main ---
 if __name__ == "__main__":
     end_num = 0.1
-    exp_name = f"{end_num}_wo_angle"
+    exp_name = f"train_dino_"
     save_dir = f"/data/feihong/ckpt/{exp_name}"
 
     if os.path.exists(save_dir):

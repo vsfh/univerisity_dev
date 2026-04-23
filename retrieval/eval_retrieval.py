@@ -4,7 +4,7 @@ import random
 import importlib.util
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -65,7 +65,7 @@ if str(REPO_ROOT) not in sys.path:
 from dataset import ShiftedSatelliteDroneDataset
 from unified_siglip_supp import visualize_batch
 
-def _load_encoder_abla_class():
+def _load_encoder_classes():
 	"""Load root model.py explicitly to avoid import ambiguity."""
 	repo_root_str = str(REPO_ROOT)
 	if repo_root_str not in sys.path:
@@ -76,18 +76,18 @@ def _load_encoder_abla_class():
 		raise ImportError(f"Unable to load model module from: {model_path}")
 	module = importlib.util.module_from_spec(spec)
 	spec.loader.exec_module(module)
-	return module.Encoder_abla
+	return module.Encoder_abla, module.Encoder_text_angle
 
 
-EncoderAbla = _load_encoder_abla_class()
+EncoderAbla, EncoderDino = _load_encoder_classes()
 
 
 EVAL_CONFIG = {
 	"device": "cuda:0",
 	# "include_file": "/data/feihong/ckpt/include_train.json",
 	"include_file": "/data/feihong/ckpt/include1.json",
-	"subset_heights": [250],
-	"subset_angles": [180],
+	"subset_heights": [150, 200, 250, 300],
+	"subset_angles": [0, 45, 90, 135, 180, 225, 270, 315],
 	"candidate_size": 100,
 	"batch_size": 8,
 	"num_workers": 8,
@@ -98,12 +98,14 @@ EVAL_CONFIG = {
 		"max_images_per_batch": 8,
 	},
 	"error_analysis": {
-		"run": True,
+		"run": False,
 		"output_dir": "runs/visualizations/retrieval_top1_errors",
 	},
 	"models": {
 		"siglip": {"run": False, "checkpoint": '/data/feihong/ckpt/retrieval_siglip/best.pth'},
-		"encoder_abla": {"run": True, "checkpoint": '/data/feihong/ckpt/rope_0.1_wo_text/last.pth'},
+		"encoder_abla": {"run": False, "checkpoint": '/data/feihong/ckpt/0.1_wo_angle/last.pth'},
+		# "encoder_abla": {"run": True, "checkpoint": '/data/feihong/ckpt/0.1_wo_angle_wo_text/last.pth'},
+		"encoder_dino": {"run": True, "checkpoint": '/data/feihong/ckpt/0.1_wo_angle_wo_text/last.pth'},
 		"clip": {"run": False, "checkpoint": None},
 		"openclip": {"run": False, "checkpoint": None},
 		"evaclip": {"run": False, "checkpoint": None},
@@ -115,11 +117,22 @@ def _canonical_model_type(model_type: str) -> str:
 	name = model_type.lower()
 	if name in {"abla", "encoder_abla"}:
 		return "encoder_abla"
+	if name in {"dino", "encoder_dino"}:
+		return "encoder_dino"
 	return name
 
 
 def _is_encoder_abla(model_type: str) -> bool:
 	return _canonical_model_type(model_type) == "encoder_abla"
+
+
+def _is_encoder_dino(model_type: str) -> bool:
+	return _canonical_model_type(model_type) == "encoder_dino"
+
+
+def _is_grid_encoder(model_type: str) -> bool:
+	name = _canonical_model_type(model_type)
+	return name in {"encoder_abla", "encoder_dino"}
 
 
 def _normalize_subset(values: Optional[Sequence[int]], defaults: Sequence[int]) -> Set[int]:
@@ -365,6 +378,25 @@ def _build_model_and_io(model_type: str, device: str):
 		).to(device)
 		return model, processor, processor_sat, tokenizer
 
+	if model_type == "encoder_dino":
+		processor = AutoImageProcessor.from_pretrained(
+			SIGLIP_MODEL_NAME,
+			cache_dir=SIGLIP_CACHE_DIR,
+		)
+		processor_sat = AutoImageProcessor.from_pretrained(
+			SIGLIP_MODEL_NAME,
+			cache_dir=SIGLIP_CACHE_DIR,
+		)
+		set_siglip_processor_size(processor_sat, PROCESSOR_IMAGE_SIZE)
+		tokenizer = AutoTokenizer.from_pretrained(SIGLIP_MODEL_NAME)
+		model = EncoderDino(
+			model_name=SIGLIP_MODEL_NAME,
+			proj_dim=SIGLIP_PROJECTION_DIM,
+			usesg=True,
+			useap=True,
+		).to(device)
+		return model, processor, processor_sat, tokenizer
+
 	if model_type == "clip":
 		processor = CLIPProcessor.from_pretrained(
 			CLIP_MODEL_NAME,
@@ -428,8 +460,9 @@ def _extract_features(
 	if not os.path.exists(resolved_checkpoint):
 		raise FileNotFoundError(f"Checkpoint not found: {resolved_checkpoint}")
 	print(checkpoint_path)
-	model.load_state_dict(torch.load(resolved_checkpoint, map_location="cpu"), strict=False)
+	model.load_state_dict(torch.load(resolved_checkpoint, map_location="cpu"), strict=True)
 	model.eval()
+	checkpoint_for_flags = str(resolved_checkpoint)
 
 	dataset = ShiftedSatelliteDroneDataset(
 		processor=processor,
@@ -461,15 +494,15 @@ def _extract_features(
 		for batch in tqdm(loader, desc=f"Extract features [{model_type}]"):
 			query_inputs = batch["target_pixel_values"].to(device, non_blocking=True)
 			search_inputs = batch["search_pixel_values"].to(device, non_blocking=True)
-			input_ids = batch["input_ids"].to(device, non_blocking=True) if not "wo_text" in checkpoint_path else None
-			angles = batch["angle"].to(device, non_blocking=True) if not "wo_angle" in checkpoint_path else None
+			input_ids = batch["input_ids"].to(device, non_blocking=True) if "wo_text" not in checkpoint_for_flags else None
+			angles = batch["angle"].to(device, non_blocking=True) if "wo_angle" not in checkpoint_for_flags else None
 			satellite_paths = batch["satellite_path"]
 
-			if _is_encoder_abla(model_type):
+			if _is_grid_encoder(model_type):
 				_, _, _, anchor_pooler, grid_feats, fused_feats = model(query_inputs, search_inputs, input_ids, angles)
-				if fused_feats is None:
-					fused_feats = anchor_pooler
-				fused_query_feats = F.normalize(fused_feats, p=2, dim=1)
+				# if fused_feats is None:
+				# 	fused_feats = anchor_pooler
+				fused_query_feats = F.normalize(anchor_pooler, p=2, dim=1)
 				gallery_grid_batch = F.normalize(grid_feats, p=2, dim=2)
 			else:
 				attention_mask = (input_ids != 0).long()
@@ -498,7 +531,7 @@ def _extract_features(
 					unseen_labels.append(label)
 
 			if unseen_indices:
-				if _is_encoder_abla(model_type):
+				if _is_grid_encoder(model_type):
 					gallery_grid = gallery_grid_batch[unseen_indices]
 				else:
 					if gallery_grid_batch is not None:
@@ -731,25 +764,137 @@ def eval(
 	return metrics
 
 
+def eval_recall1_per_subset(
+	model_type: str,
+	checkpoint_path: Optional[str] = None,
+	subset_heights: Optional[Sequence[int]] = None,
+	subset_angles: Optional[Sequence[int]] = None,
+	candidate_size: Optional[int] = None,
+	include_file: str = "/data/feihong/ckpt/include.json",
+	batch_size: int = 16,
+	num_workers: int = 8,
+	device: Optional[str] = None,
+	extract_features_fn: Optional[Callable[..., Tuple[torch.Tensor, List[str], List[str], List[str], torch.Tensor, List[str], List[str]]]] = None,
+	score_recall_fn: Optional[Callable[..., Dict[str, float]]] = None,
+	print_numbers_only: bool = False,
+	output_json_path: Optional[str] = None,
+) -> List[float]:
+	"""Compute recall@1 for each (height, angle) subset and return flat values.
+
+	Order is row-major by sorted heights then sorted angles.
+	"""
+	if device is None:
+		device = "cuda:1" if torch.cuda.is_available() else "cpu"
+
+	height_list = sorted(_normalize_subset(subset_heights, DEFAULT_SUBSET_HEIGHTS))
+	angle_list = sorted(_normalize_subset(subset_angles, DEFAULT_SUBSET_ANGLES))
+	include_map = _load_include_map(include_file)
+
+	extract_impl = extract_features_fn or _extract_features
+	score_impl = score_recall_fn or _score_recall
+
+	recall1_values: List[float] = []
+	per_subset: List[Dict[str, float]] = []
+	for h in height_list:
+		for a in angle_list:
+			(
+				query_feats,
+				query_labels,
+				query_drone_paths,
+				query_satellite_paths,
+				gallery_feats,
+				gallery_labels,
+				gallery_satellite_paths,
+			) = extract_impl(
+				model_type=model_type,
+				checkpoint_path=checkpoint_path,
+				device=device,
+				batch_size=batch_size,
+				num_workers=num_workers,
+				subset_heights=[h],
+				subset_angles=[a],
+			)
+
+			metrics = score_impl(
+				query_feats=query_feats,
+				query_labels=query_labels,
+				query_drone_paths=query_drone_paths,
+				query_satellite_paths=query_satellite_paths,
+				gallery_feats=gallery_feats,
+				gallery_labels=gallery_labels,
+				gallery_satellite_paths=gallery_satellite_paths,
+				include_map=include_map,
+				device=device,
+				candidate_size=candidate_size,
+				error_analysis=None,
+			)
+
+			recall1_values.append(float(metrics["recall@1"]))
+			per_subset.append(
+				{
+					"height": int(h),
+					"angle": int(a),
+					"recall@1": float(metrics["recall@1"]),
+				}
+			)
+
+	if print_numbers_only:
+		for value in recall1_values:
+			print(f"{value:.6f}")
+
+	if output_json_path:
+		output_dir = os.path.dirname(output_json_path)
+		if output_dir:
+			os.makedirs(output_dir, exist_ok=True)
+
+		payload = {
+			"model_type": model_type,
+			"checkpoint_path": checkpoint_path,
+			"subset_heights": [int(h) for h in height_list],
+			"subset_angles": [int(a) for a in angle_list],
+			"num_subsets": len(per_subset),
+			"recall@1_values": recall1_values,
+			"per_subset": per_subset,
+		}
+
+		with open(output_json_path, "w", encoding="utf-8") as f:
+			json.dump(payload, f, ensure_ascii=False, indent=2)
+		print(f"Saved subset recall@1 to: {output_json_path}")
+
+	return recall1_values
+
+
 
 if __name__ == "__main__":
-    model_cfg = EVAL_CONFIG["models"]
-    selected_models = [name for name, cfg in model_cfg.items() if cfg.get("run", False)]
+	model_cfg = EVAL_CONFIG["models"]
+	selected_models = [name for name, cfg in model_cfg.items() if cfg.get("run", False)]
 
-    if not selected_models:
-        raise ValueError("No model selected. Set EVAL_CONFIG['models'][name]['run'] = True.")
+	if not selected_models:
+		raise ValueError("No model selected. Set EVAL_CONFIG['models'][name]['run'] = True.")
 
 
-    for model_type in selected_models:
-        eval(
-            model_type=model_type,
-            checkpoint_path=model_cfg[model_type].get("checkpoint"),
-            subset_heights=EVAL_CONFIG["subset_heights"],
-            subset_angles=EVAL_CONFIG["subset_angles"],
-            candidate_size=EVAL_CONFIG["candidate_size"],
-            include_file=EVAL_CONFIG["include_file"],
-            batch_size=EVAL_CONFIG["batch_size"],
-            num_workers=EVAL_CONFIG["num_workers"],
-            device=EVAL_CONFIG["device"],
-			error_analysis=EVAL_CONFIG.get("error_analysis", None),
-        )
+	for model_type in selected_models:
+		# eval(
+		#     model_type=model_type,
+		#     checkpoint_path=model_cfg[model_type].get("checkpoint"),
+		#     subset_heights=EVAL_CONFIG["subset_heights"],
+		#     subset_angles=EVAL_CONFIG["subset_angles"],
+		#     candidate_size=EVAL_CONFIG["candidate_size"],
+		#     include_file=EVAL_CONFIG["include_file"],
+		#     batch_size=EVAL_CONFIG["batch_size"],
+		#     num_workers=EVAL_CONFIG["num_workers"],
+		#     device=EVAL_CONFIG["device"],
+		# 	error_analysis=EVAL_CONFIG.get("error_analysis", None),
+		# )
+		eval_recall1_per_subset(
+			model_type=model_type,
+			checkpoint_path=model_cfg[model_type].get("checkpoint"),
+			subset_heights=EVAL_CONFIG["subset_heights"],
+			subset_angles=EVAL_CONFIG["subset_angles"],
+			candidate_size=EVAL_CONFIG["candidate_size"],
+			include_file=EVAL_CONFIG["include_file"],
+			batch_size=EVAL_CONFIG["batch_size"],
+			num_workers=EVAL_CONFIG["num_workers"],
+			device=EVAL_CONFIG["device"],
+			output_json_path=f"runs/recall1_per_subset_{model_type}.json",
+		)

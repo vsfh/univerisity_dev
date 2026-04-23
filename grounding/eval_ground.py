@@ -46,7 +46,7 @@ EVAL_CONFIG = {
     "models": {
         "det": {
             "run": True,
-            "checkpoint": "/data/feihong/ckpt/ground_det/best.pth",
+            "checkpoint": "/data/feihong/ckpt/ground_det/last.pth",
         },
         "siglip": {"run": False, "checkpoint": None},
         "encoder_abla": {"run": True, "checkpoint": '/data/feihong/ckpt/supp_0.1/best_iou.pth'},

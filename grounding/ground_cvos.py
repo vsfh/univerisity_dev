@@ -682,7 +682,7 @@ def eval_CVOGL(
     print(f"Loading checkpoint from {checkpoint_path}")
     model = TROGeoLite(emb_size=768)
     model = torch.nn.DataParallel(model).cuda()
-    checkpoint = torch.load(f"{checkpoint_path}/best.pth", map_location="cpu")
+    checkpoint = torch.load(f"{checkpoint_path}/last.pth", map_location="cpu")
     model.load_state_dict(checkpoint)
     model.eval()
 
@@ -1011,8 +1011,6 @@ def main(args):
     anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
     anchors_full = torch.tensor(anchors_full, dtype=torch.float32).cuda()
 
-    best_iou = -float("Inf")
-    update = 0
     print(f"Starting training for {args.max_epoch} epochs...")
     for epoch in range(args.max_epoch):
         adjust_learning_rate(args, optimizer, epoch)
@@ -1027,38 +1025,17 @@ def main(args):
             args.print_freq,
         )
 
-        accu50, accu25, val_iou = validate(
-            val_loader, model, anchors_full, args.img_size
-        )
-
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/train_geo", train_geo, epoch)
         writer.add_scalar("Loss/train_cls", train_cls, epoch)
-        writer.add_scalar("Metrics/val_accu50", accu50, epoch)
-        writer.add_scalar("Metrics/val_accu25", accu25, epoch)
-        writer.add_scalar("Metrics/val_iou", val_iou, epoch)
 
         print(
             f"Epoch {epoch + 1}/{args.max_epoch}:\t"
-            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})\t"
-            f"Val Accu50: {accu50:.4f}\t"
-            f"Val Accu25: {accu25:.4f}\t"
-            f"Val IoU: {val_iou:.4f}"
+            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})"
         )
+        torch.save(model.state_dict(), f"{args.checkpoint}/last.pth")
 
-        is_best = val_iou > best_iou
-        if val_iou > best_iou:
-            best_iou = val_iou
-
-            torch.save(model.state_dict(), f"{args.checkpoint}/best.pth")
-            updata = 0
-        else:
-            update += 1
-        if update > 5:
-            print("no update")
-            break
-
-    print(f"\nTraining complete. Best Val IoU: {best_iou:.4f}")
+    print("\nTraining complete. Saved checkpoint to last.pth")
     writer.close()
 
 
@@ -1225,7 +1202,7 @@ def eval_univ(
     print(f"Loading checkpoint from {checkpoint_path}")
     model = TROGeoLite(emb_size=768)
     model = torch.nn.DataParallel(model).cuda()
-    checkpoint = torch.load(f"{checkpoint_path}/best.pth", map_location="cpu")
+    checkpoint = torch.load(f"{checkpoint_path}/last.pth", map_location="cpu")
     model.load_state_dict(checkpoint)
     model.eval()
 

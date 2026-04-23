@@ -362,7 +362,7 @@ def main() -> None:
 		print(result["unified_description"])
 		return
 
-	sample_dirs = list_sample_dirs(args.default_image_root)[:1562][::-1]
+	sample_dirs = list_sample_dirs(args.default_image_root)[:1652][::-1]
 	if Path(args.output).is_absolute():
 		output_name = Path(args.output).name
 	else:

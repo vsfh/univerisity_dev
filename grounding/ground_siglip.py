@@ -574,7 +574,6 @@ def validate(loader, model, anchors_full, img_size):
 
 
 def main(save_path):
-    not_update = 0
     exp_name = save_path.split("/")[-1] if save_path else "default_exp"
     writer = SummaryWriter(f"runs/{exp_name}")
 
@@ -665,13 +664,8 @@ def main(save_path):
     )
 
     print(f"Starting training on {DEVICE} for {NUM_EPOCHS} epochs...")
-    max_iou = 0
 
     for epoch in range(NUM_EPOCHS):
-        accu50, accu25, val_iou, val_heading = validate(
-            val_loader, model, anchors_full, UNIV_SAT_SIZE[0]
-        )
-
         train_loss, train_geo, train_cls, train_heading = train_epoch(
             train_loader,
             model,
@@ -686,35 +680,15 @@ def main(save_path):
         writer.add_scalar("Loss/train_geo", train_geo, epoch)
         writer.add_scalar("Loss/train_cls", train_cls, epoch)
         writer.add_scalar("Loss/train_heading", train_heading, epoch)
-        writer.add_scalar("Metrics/val_accu50", accu50, epoch)
-        writer.add_scalar("Metrics/val_accu25", accu25, epoch)
-        writer.add_scalar("Metrics/val_iou", val_iou, epoch)
-        writer.add_scalar("Metrics/val_heading", val_heading, epoch)
 
         print(
             f"Epoch {epoch + 1}/{NUM_EPOCHS}:\t"
-            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f}, Heading: {train_heading:.4f})\t"
-            f"Val Accu50: {accu50:.4f}\t"
-            f"Val Accu25: {accu25:.4f}\t"
-            f"Val IoU: {val_iou:.4f}\t"
-            f"Val Heading: {val_heading:.4f}"
+            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f}, Heading: {train_heading:.4f})"
         )
+        os.makedirs(save_path, exist_ok=True)
+        torch.save(model.state_dict(), f"{save_path}/last.pth")
 
-        if val_iou > max_iou:
-            os.makedirs(save_path, exist_ok=True)
-            torch.save(model.state_dict(), f"{save_path}/best.pth")
-            max_iou = val_iou
-            not_update = 0
-        else:
-            not_update += 1
-
-        if not_update > 5:
-            print(f"Validation loss not improving for {not_update} epochs.")
-            torch.save(model.state_dict(), f"{save_path}/last.pth")
-
-            break
-
-    print(f"Training complete. Best Val IoU: {max_iou:.4f}")
+    print("Training complete. Saved checkpoint to last.pth")
     writer.close()
 
 

@@ -35,10 +35,10 @@ from utils.utils import AverageMeter, bbox_iou, eval_iou_acc
 from dataset import ShiftedSatelliteDroneDataset
 
 IMG_SIZE = (768, 432)  # (width, height)
-BATCH_SIZE = 2
+BATCH_SIZE = 8
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
-NUM_EPOCHS = 25
+NUM_EPOCHS = 8
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 PRINT_FREQ = 50
@@ -368,8 +368,6 @@ def main(args):
     anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
     anchors_full = torch.tensor(anchors_full, dtype=torch.float32).to(DEVICE)
 
-    best_iou = -float("Inf")
-    update = 0
     print(f"Starting training for {args.max_epoch} epochs...")
     for epoch in range(args.max_epoch):
         adjust_learning_rate(args, optimizer, epoch)
@@ -384,38 +382,17 @@ def main(args):
             args.print_freq,
         )
 
-        # val_iou, val_ratio_50, val_center_distance = validate(
-        #     val_loader, model, anchors_full, args.img_size
-        # )
-
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/train_geo", train_geo, epoch)
         writer.add_scalar("Loss/train_cls", train_cls, epoch)
-        # writer.add_scalar("Metrics/val_iou", val_iou, epoch)
-        # writer.add_scalar("Metrics/val_ratio_iou_gt_0_5", val_ratio_50, epoch)
-        # writer.add_scalar("Metrics/val_center_distance", val_center_distance, epoch)
 
         print(
             f"Epoch {epoch + 1}/{args.max_epoch}:\t"
-            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})\t"
-            # f"Val Mean IoU: {val_iou:.4f}\t"
-            # f"Val IoU>0.5 Ratio: {val_ratio_50:.4f}\t"
-            # f"Val Center Dist: {val_center_distance:.4f}"
+            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})"
         )
-        torch.save(model.state_dict(), f"{args.checkpoint}/best.pth")
+        torch.save(model.state_dict(), f"{args.checkpoint}/last.pth")
 
-        # is_best = val_iou > best_iou
-        # if val_iou > best_iou:
-        #     best_iou = val_iou
-        #     torch.save(model.state_dict(), f"{args.checkpoint}/best.pth")
-        #     update = 0
-        # else:
-        #     update += 1
-        # if update > 5:
-        #     print("No improvement for 6 epochs, stopping early.")
-        #     break
-
-    print(f"\nTraining complete. Best Val IoU: {best_iou:.4f}")
+    print("\nTraining complete. Saved checkpoint to last.pth")
     writer.close()
 
 

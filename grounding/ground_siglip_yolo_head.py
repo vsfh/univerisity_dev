@@ -472,7 +472,6 @@ def validation(loader, model, anchors_full, img_size):
 
 
 def main(save_path):
-    not_update = 0
     exp_name = save_path.split("/")[-1] if save_path else "default_exp"
     writer = SummaryWriter(f"runs/{exp_name}")
 
@@ -547,7 +546,6 @@ def main(save_path):
     )
 
     print(f"Starting training on {DEVICE} for {NUM_EPOCHS} epochs...")
-    max_iou = 0
     BBOX_LOSS_WEIGHT = 0.1
 
     for epoch in range(NUM_EPOCHS):
@@ -631,30 +629,13 @@ def main(save_path):
         avg_loss = total_loss / len(train_dataloader)
         avg_bbox_loss = total_bbox_loss / len(train_dataloader)
 
-        model.eval()
-        accu50, accu25, val_iou = validation(
-            test_dataloader, model, anchors_full, UNIV_SAT_SIZE[0]
-        )
         writer.add_scalar("Loss/train_epoch", avg_loss, epoch)
-        writer.add_scalar("Metrics/val_iou", val_iou, epoch)
-        writer.add_scalar("Metrics/val_accu50", accu50, epoch)
-        writer.add_scalar("Metrics/val_accu25", accu25, epoch)
         print(
             f"Epoch {epoch + 1} finished. "
-            f"Avg train Loss: {avg_loss:.4f} (bbox: {avg_bbox_loss:.4f}). "
-            f"IoU: {val_iou:.4f}, Accu50: {accu50:.4f}, Accu25: {accu25:.4f}"
+            f"Avg train Loss: {avg_loss:.4f} (bbox: {avg_bbox_loss:.4f})."
         )
-
-        if val_iou > max_iou:
-            os.makedirs(save_path, exist_ok=True)
-            torch.save(model.state_dict(), f"{save_path}/best.pth")
-            max_iou = val_iou
-            not_update = 0
-        else:
-            not_update += 1
-        if not_update > 5:
-            print(f"Validation loss not improving {not_update} epoch.")
-        #     break
+        os.makedirs(save_path, exist_ok=True)
+        torch.save(model.state_dict(), f"{save_path}/last.pth")
 
     print("Training complete.")
     writer.close()

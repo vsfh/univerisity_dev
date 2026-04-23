@@ -36,10 +36,10 @@ from utils.utils import AverageMeter, eval_iou_acc
 from dataset import ShiftedSatelliteDroneDataset
 
 IMG_SIZE = (768, 432)  # (width, height)
-BATCH_SIZE = 4
+BATCH_SIZE = 8
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
-NUM_EPOCHS = 25
+NUM_EPOCHS = 8
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 PRINT_FREQ = 50
@@ -337,7 +337,7 @@ def main(args):
         processor=processor,
         processor_sat=processor,
         tokenizer=tokenizer,
-        split="val",
+        split="test",
     )
 
     print(f"Found {len(train_dataset)} training samples, {len(val_dataset)} validation samples")
@@ -370,8 +370,6 @@ def main(args):
     anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
     anchors_full = torch.tensor(anchors_full, dtype=torch.float32).to(DEVICE)
 
-    best_iou = -float("Inf")
-    update = 0
     heading_loss_weight = args.heading_loss_weight
     print(f"Starting training for {args.max_epoch} epochs...")
     for epoch in range(args.max_epoch):
@@ -388,39 +386,18 @@ def main(args):
             args.print_freq,
         )
 
-        accu50, accu25, val_iou, val_heading = validate(
-            val_loader, model, anchors_full, args.img_size
-        )
-
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/train_geo", train_geo, epoch)
         writer.add_scalar("Loss/train_cls", train_cls, epoch)
         writer.add_scalar("Loss/train_heading", train_heading, epoch)
-        writer.add_scalar("Metrics/val_accu50", accu50, epoch)
-        writer.add_scalar("Metrics/val_accu25", accu25, epoch)
-        writer.add_scalar("Metrics/val_iou", val_iou, epoch)
-        writer.add_scalar("Metrics/val_heading", val_heading, epoch)
 
         print(
             f"Epoch {epoch + 1}/{args.max_epoch}:\t"
-            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f}, Heading: {train_heading:.4f})\t"
-            f"Val Accu50: {accu50:.4f}\t"
-            f"Val Accu25: {accu25:.4f}\t"
-            f"Val IoU: {val_iou:.4f}\t"
-            f"Val Heading: {val_heading:.4f}"
+            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f}, Heading: {train_heading:.4f})"
         )
+        torch.save(model.state_dict(), f"{args.checkpoint}/last.pth")
 
-        is_best = val_iou > best_iou
-        if val_iou > best_iou:
-            best_iou = val_iou
-            torch.save(model.state_dict(), f"{args.checkpoint}/best.pth")
-            update = 0
-        else:
-            update += 1
-        if update > 5:
-            print("No improvement for 6 epochs, stopping early.")
-
-    print(f"\nTraining complete. Best Val IoU: {best_iou:.4f}")
+    print("\nTraining complete. Saved checkpoint to last.pth")
     writer.close()
 
 
@@ -466,7 +443,7 @@ def eval(args):
     )
 
     model = TROGeoLite(emb_size=768).to(DEVICE)
-    checkpoint_path = args.checkpoint_path or f"{args.checkpoint}/best.pth"
+    checkpoint_path = args.checkpoint_path or f"{args.checkpoint}/last.pth"
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=False)

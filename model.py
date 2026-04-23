@@ -7,13 +7,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, AutoImageProcessor, AutoTokenizer
+from transformers.modeling_outputs import BaseModelOutputWithPooling
 import math
-from bbox.yolo_utils import SpatialTransformer
+import argparse
+from typing import Optional
+from bbox.yolo_utils import SpatialTransformer,CrossAttention
 from transformers.models.siglip.modeling_siglip import SiglipVisionConfig, SiglipMLP
 MODEL_NAME = "google/siglip-base-patch16-224"
 DINO_MODEL_NAME = "nvidia/C-RADIOv4-H"
 CACHE_DIR = "/data/feihong/hf_cache"
 PROJECTION_DIM = 768
+DINO_PROJECTION_DIM = 768
 
 
 def _infer_patch_grid(token_count, image_h, image_w):
@@ -89,24 +93,89 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x):
         return x + self.conv(x)
+    
+class CoordConv(nn.Module):
+    """
+    Optimized CoordConv for a fixed sequence shape of [B, 196, 768].
+    Pre-computes the 14x14 grid to save processing time.
+    """
+    def __init__(self, feature_dim=768, grid_size=14):
+        super().__init__()
+        
+        # Linear layer to project [B, 196, 768 + 2] back down to [B, 196, 768]
+        self.proj = nn.Linear(feature_dim + 2, feature_dim)
+        
+        # --- Pre-compute the static 14x14 coordinate grid ---
+        coords = torch.linspace(-1, 1, grid_size)
+        grid_y, grid_x = torch.meshgrid(coords, coords, indexing='ij')
+        
+        # Stack into [14, 14, 2] and flatten to sequence [1, 196, 2]
+        grid_flat = torch.stack([grid_x, grid_y], dim=-1).view(1, -1, 2)
+        
+        # Register as a buffer so it moves to GPU automatically but doesn't require gradients
+        self.register_buffer("base_grid", grid_flat)
 
+    def _grid_for_length(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Build a coordinate grid with exactly seq_len tokens."""
+        if seq_len == self.base_grid.shape[1]:
+            return self.base_grid.to(device=device, dtype=dtype)
+
+        if seq_len == 1:
+            return torch.zeros(1, 1, 2, device=device, dtype=dtype)
+
+        # Choose factors closest to square for stable spatial ordering.
+        h = int(seq_len ** 0.5)
+        while h > 1 and (seq_len % h != 0):
+            h -= 1
+        w = seq_len // h
+
+        coords_y = torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype)
+        coords_x = torch.linspace(-1.0, 1.0, w, device=device, dtype=dtype)
+        grid_y, grid_x = torch.meshgrid(coords_y, coords_x, indexing='ij')
+        return torch.stack([grid_x, grid_y], dim=-1).view(1, seq_len, 2)
+
+    def forward(self, x, angle=None):
+        B, L, _ = x.shape
+        
+        # Build a coordinate grid that matches the current token length L.
+        base_grid = self._grid_for_length(L, x.device, x.dtype)
+        grid = base_grid.expand(B, -1, -1)
+        
+        if angle is not None:
+            # Ensure angle is a tensor and convert to radians
+            if not isinstance(angle, torch.Tensor):
+                angle = torch.tensor(angle, device=x.device)
+            angle_rad = torch.deg2rad(angle).view(-1, 1)
+            
+            cos_a = torch.cos(angle_rad)
+            sin_a = torch.sin(angle_rad)
+            
+            # grid[..., 0] is X, grid[..., 1] is Y
+            rot_x = grid[..., 0] * cos_a - grid[..., 1] * sin_a
+            rot_y = grid[..., 0] * sin_a + grid[..., 1] * cos_a
+            
+            # Re-stack the rotated coordinates
+            grid = torch.stack([rot_x, rot_y], dim=-1)
+            
+        # Concatenate features (C) with coordinates (2) -> [B, L, C+2]
+        x_with_coords = torch.cat([x, grid], dim=-1)
+        
+        # Project back to feature dim -> [B, L, C]
+        return self.proj(x_with_coords)
 class PoolingHead(nn.Module):
     """Multihead Attention Pooling."""
 
     def __init__(self, SiglipPoolingHead, config: SiglipVisionConfig):
         super().__init__()
 
-        self.probe = nn.Parameter(torch.randn(1, 9, config.hidden_size))
-        # self.probe = SiglipPoolingHead.probe
+        # self.probe = nn.Parameter(torch.randn(1, 9, config.hidden_size))
+        self.probe = SiglipPoolingHead.probe
         self.head = SiglipPoolingHead
-        # self.attention = torch.nn.MultiheadAttention(config.hidden_size, config.num_attention_heads, batch_first=True)
-        # self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        # self.mlp = SiglipMLP(config)
 
-    def forward(self, hidden_state):
+    def forward(self, hidden_state, dim=None):
         batch_size = hidden_state.shape[0]
-        probe = self.probe.repeat(batch_size, 1, 1)
         # probe = self.probe.repeat(batch_size, 9, 1)
+        probe = self.probe.repeat(batch_size, dim, 1)
 
         hidden_state = self.head.attention(probe, hidden_state, hidden_state)[0]
 
@@ -116,468 +185,6 @@ class PoolingHead(nn.Module):
 
         return hidden_state
     
-
-class Encoder_gem(nn.Module):
-    """Enhanced encoder with GeM pooling, gated fusion, and residual connections.
-
-    Improvements over Encoder_attn:
-    - GeM pooling for learnable feature aggregation
-    - Gated fusion for adaptive text+image combination
-    - Residual connections in bbox decoder heads
-    """
-
-    def __init__(self, model_name=MODEL_NAME, proj_dim=PROJECTION_DIM):
-        super().__init__()
-
-        try:
-            model = AutoModel.from_pretrained(model_name, cache_dir=CACHE_DIR)
-            self.vision_model = model.vision_model
-            # self.ground_drone_vision_model = self.model.vision_model
-            self.text_model = model.text_model
-
-            self.feature_dim = self.vision_model.config.hidden_size
-            self.text_feature_dim = self.text_model.config.hidden_size
-        except Exception as e:
-            print(f"Error loading SIGLIP model: {e}")
-            raise
-
-        self.pool_info_sat = nn.AdaptiveAvgPool2d((3, 3))
-
-        self.gate_fc = nn.Linear(proj_dim * 2, 1)
-        # self.fuse_fc = nn.Linear(proj_dim, proj_dim)
-
-        self.text_projector = nn.Sequential(
-            nn.Linear(self.text_feature_dim, self.text_feature_dim * 2),
-            nn.ReLU(),
-            nn.Linear(self.text_feature_dim * 2, proj_dim),
-        )
-
-        self.bbox_transformer = SpatialTransformer(
-            in_channels=self.feature_dim,
-            n_heads=8,
-            d_head=64,
-            depth=1,
-            context_dim=self.feature_dim,
-        )
-
-        self.bbox_fcn_out = nn.Sequential(
-            nn.ConvTranspose2d(
-                in_channels=self.feature_dim,
-                out_channels=self.feature_dim // 2,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.ReLU(inplace=True),
-            ResidualBlock(self.feature_dim // 2),
-            nn.Conv2d(self.feature_dim // 2, 9 * 5, kernel_size=1),
-        )
-
-        self.bbox_adapter = nn.Sequential(
-            nn.Linear(self.feature_dim, self.feature_dim),
-            nn.GELU(),
-            nn.Linear(self.feature_dim, self.feature_dim),
-        )
-        # self.bbox_coords_out = nn.Sequential(
-        #     nn.ConvTranspose2d(
-        #         in_channels=self.feature_dim,
-        #         out_channels=self.feature_dim // 2,
-        #         kernel_size=4,
-        #         stride=2,
-        #         padding=1,
-        #     ),
-        #     nn.ReLU(inplace=True),
-        #     ResidualBlock(self.feature_dim // 2),
-        #     nn.Conv2d(self.feature_dim // 2, 1, kernel_size=1),
-        # )
-
-    def text_forward(self, input_ids, attention_mask=None):
-        text_outputs = self.text_model(
-            input_ids=input_ids, attention_mask=attention_mask
-        )
-        pooler_output = text_outputs.pooler_output
-        proj_feature = self.text_projector(pooler_output)
-        return proj_feature
-
-    def gated_fusion(self, text_feats, anchor_feats):
-        combined = torch.cat([text_feats, anchor_feats], dim=-1)
-        gate = 0.2 * torch.sigmoid(self.gate_fc(combined))
-        fused = gate * text_feats + (1 - gate) * anchor_feats
-        return fused
-
-    def forward(self, anchor_pixel_values, search_pixel_values, input_ids=None):
-        B = anchor_pixel_values.shape[0]
-
-        anchor_output = self.vision_model(anchor_pixel_values)
-        anchor_feats = anchor_output.last_hidden_state
-        anchor_pooler = anchor_output.pooler_output
-
-        # ground_drone_output = self.ground_drone_vision_model(anchor_pixel_values)
-        # anchor_feats = ground_drone_output.last_hidden_state
-
-        sat_output = self.vision_model(
-            search_pixel_values, interpolate_pos_encoding=True
-        )
-        sat_feats = sat_output.last_hidden_state
-        N = sat_feats.shape[1]
-        image_h, image_w = search_pixel_values.shape[-2:]
-        H, W = _infer_patch_grid(N, image_h, image_w)
-        sat_features_2d = sat_feats.permute(0, 2, 1).reshape(B, self.feature_dim, H, W)
-
-        anchor_context = (
-            self.bbox_adapter(anchor_feats.detach()) + anchor_feats.detach()
-        )
-        fused_features = self.bbox_transformer(
-            x=sat_features_2d, context=anchor_context
-        )
-
-        pred_anchor = self.bbox_fcn_out(fused_features)
-        # pred_coords = self.bbox_coords_out(fused_features)
-
-        sat_feature_2d_pool = (
-            self.pool_info_sat(sat_features_2d)
-            .reshape(B, self.feature_dim, -1)
-            .permute(0, 2, 1)
-        )
-
-        text_feats = None
-        if input_ids is not None:
-            text_outputs = self.text_model(input_ids=input_ids)
-            pooler_output = text_outputs.pooler_output
-            text_feats = self.text_projector(pooler_output)
-            fused_feats = self.gated_fusion(text_feats, anchor_pooler)
-
-        return (
-            pred_anchor,
-            text_feats,
-            anchor_pooler,
-            sat_feature_2d_pool,
-            fused_feats if input_ids is not None else None,
-        )
-
-    def preprocess(self, query_image, search_image):
-        if not isinstance(getattr(self, "processor", None)):
-            self.processor = AutoImageProcessor.from_pretrained(
-                MODEL_NAME, cache_dir=CACHE_DIR
-            )
-            self.processor_sat = AutoImageProcessor.from_pretrained(
-                MODEL_NAME, cache_dir=CACHE_DIR, size={"height": 640, "width": 640}
-            )
-        query_inputs = self.processor(images=query_image, return_tensors="pt")
-        search_inputs = self.processor_sat(images=search_image, return_tensors="pt")
-        return query_inputs["pixel_values"][0], search_inputs["pixel_values"][0]
-
-    def ref_forward(self, search_pixel_values, input_ids=None):
-
-
-        sat_output = self.vision_model(
-            search_pixel_values, interpolate_pos_encoding=True
-        )
-        sat_feats = sat_output.last_hidden_state
-        N = sat_feats.shape[1]
-        B = sat_feats.shape[0]
-        image_h, image_w = search_pixel_values.shape[-2:]
-        H, W = _infer_patch_grid(N, image_h, image_w)
-        sat_features_2d = sat_feats.permute(0, 2, 1).reshape(B, self.feature_dim, H, W)
-
-        sat_feature_2d_pool = (
-            self.pool_info_sat(sat_features_2d)
-            .reshape(B, self.feature_dim, -1)
-            .permute(0, 2, 1)
-        )
-
-        return sat_feature_2d_pool
-
-class Encoder_attn(nn.Module):
-    def __init__(self, model_name=MODEL_NAME, proj_dim=768):
-        super().__init__()
-
-        try:
-            self.model = AutoModel.from_pretrained(model_name, cache_dir=CACHE_DIR)
-            self.vision_model = self.model.vision_model
-            self.text_model = self.model.text_model
-
-            self.feature_dim = self.vision_model.config.hidden_size
-            self.text_feature_dim = self.text_model.config.hidden_size
-        except Exception as e:
-            print(f"Error loading SIGLIP model: {e}")
-            raise
-
-        self.pool_sat = nn.AdaptiveAvgPool2d((20, 20))
-        self.pool_dro = nn.AdaptiveAvgPool2d((8, 8))
-        self.pool_info_sat = nn.AdaptiveAvgPool2d((3, 3))
-        # self.position_embedding = nn.Embedding(400, PROJECTION_DIM)
-        # self.register_buffer(
-        #     "position_ids", torch.arange(400).expand((1, -1)), persistent=False
-        # )
-
-        self.text_projector = nn.Sequential(
-            nn.Linear(self.text_feature_dim, self.text_feature_dim * 2),
-            nn.ReLU(),
-            nn.Linear(self.text_feature_dim * 2, proj_dim),
-        )
-
-        self.bbox_transformer = SpatialTransformer(
-            in_channels=self.feature_dim,
-            n_heads=8,
-            d_head=64,
-            depth=1,
-            context_dim=self.feature_dim,
-        )
-
-        self.bbox_fcn_out = nn.Sequential(
-            nn.ConvTranspose2d(
-                in_channels=self.feature_dim,
-                out_channels=self.feature_dim // 2,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(self.feature_dim // 2, 9 * 5, kernel_size=1),
-        )
-
-        self.bbox_coords_out = nn.Sequential(
-            nn.ConvTranspose2d(
-                in_channels=self.feature_dim,
-                out_channels=self.feature_dim // 2,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(self.feature_dim // 2, 1, kernel_size=1),
-        )
-
-    def text_forward(self, input_ids, attention_mask=None):
-        text_outputs = self.text_model(
-            input_ids=input_ids, attention_mask=attention_mask
-        )
-        pooler_output = text_outputs.pooler_output
-        proj_feature = self.text_projector(pooler_output)
-        return proj_feature
-
-    def forward(self, anchor_pixel_values, search_pixel_values, input_ids=None):
-        B = anchor_pixel_values.shape[0]
-
-        anchor_output = self.vision_model(anchor_pixel_values)
-        anchor_feats = anchor_output.last_hidden_state
-        anchor_pooler = anchor_output.pooler_output
-
-        sat_output = self.vision_model(
-            search_pixel_values, interpolate_pos_encoding=True
-        )
-        sat_feats = sat_output.last_hidden_state
-        N = sat_feats.shape[1]
-        image_h, image_w = search_pixel_values.shape[-2:]
-        H, W = _infer_patch_grid(N, image_h, image_w)
-        sat_features_2d = sat_feats.permute(0, 2, 1).reshape(B, self.feature_dim, H, W)
-
-        fused_features = self.bbox_transformer(x=sat_features_2d, context=anchor_feats)
-
-        pred_anchor = self.bbox_fcn_out(fused_features)
-        pred_coords = self.bbox_coords_out(fused_features)
-
-        sat_feature_2d_pool = (
-            self.pool_info_sat(sat_features_2d)
-            .reshape(B, self.feature_dim, -1)
-            .permute(0, 2, 1)
-        )
-
-        text_feats = None
-        if input_ids is not None:
-            text_outputs = self.text_model(input_ids=input_ids)
-            pooler_output = text_outputs.pooler_output
-            text_feats = self.text_projector(pooler_output)
-
-        return (
-            pred_anchor,
-            pred_coords,
-            anchor_pooler,
-            sat_feature_2d_pool,
-            text_feats,
-        )
-
-    def _pool_grid_features(self, vision_features, layer):
-        B, N, D = vision_features.shape
-        H = W = int(N**0.5)
-        patch_tokens = vision_features.permute(0, 2, 1).reshape(B, D, H, W)
-        pooled_features = layer(patch_tokens)
-        return pooled_features
-
-    def preprocess(self, query_image, search_image):
-        if not isinstance(getattr(self, "processor", None)):
-            self.processor = AutoImageProcessor.from_pretrained(
-                MODEL_NAME, cache_dir=CACHE_DIR
-            )
-            self.processor_sat = AutoImageProcessor.from_pretrained(
-                MODEL_NAME, cache_dir=CACHE_DIR, size={"height": 640, "width": 640}
-            )
-        query_inputs = self.processor(images=query_image, return_tensors="pt")
-        search_inputs = self.processor_sat(images=search_image, return_tensors="pt")
-        return query_inputs["pixel_values"][0], search_inputs["pixel_values"][0]
-
-
-class Encoder_heading(nn.Module):
-    """Enhanced encoder with GeM pooling, gated fusion, and residual connections.
-
-    Improvements over Encoder_attn:
-    - GeM pooling for learnable feature aggregation
-    - Gated fusion for adaptive text+image combination
-    - Residual connections in bbox decoder heads
-    """
-
-    def __init__(self, model_name=MODEL_NAME, proj_dim=PROJECTION_DIM):
-        super().__init__()
-
-        try:
-            model = AutoModel.from_pretrained(model_name, cache_dir=CACHE_DIR)
-            self.vision_model = model.vision_model
-            # self.ground_drone_vision_model = self.model.vision_model
-            self.text_model = model.text_model
-
-            self.feature_dim = self.vision_model.config.hidden_size
-            self.text_feature_dim = self.text_model.config.hidden_size
-        except Exception as e:
-            print(f"Error loading SIGLIP model: {e}")
-            raise
-
-        self.pool_info_sat = nn.AdaptiveAvgPool2d((3, 3))
-        self.gate_fc = nn.Linear(proj_dim * 2, 1)
-        # self.fuse_fc = nn.Linear(proj_dim, proj_dim)
-
-        self.text_projector = nn.Sequential(
-            nn.Linear(self.text_feature_dim, self.text_feature_dim * 2),
-            nn.ReLU(),
-            nn.Linear(self.text_feature_dim * 2, proj_dim),
-        )
-
-        self.bbox_transformer = SpatialTransformer(
-            in_channels=self.feature_dim,
-            n_heads=8,
-            d_head=64,
-            depth=1,
-            context_dim=self.feature_dim,
-        )
-
-        self.bbox_fcn_out = nn.Sequential(
-            nn.ConvTranspose2d(
-                in_channels=self.feature_dim,
-                out_channels=self.feature_dim // 2,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.ReLU(inplace=True),
-            ResidualBlock(self.feature_dim // 2),
-            nn.Conv2d(self.feature_dim // 2, 9 * 5, kernel_size=1),
-        )
-
-        self.bbox_adapter = nn.Sequential(
-            nn.Linear(self.feature_dim, self.feature_dim),
-            nn.GELU(),
-            nn.Linear(self.feature_dim, self.feature_dim),
-        )
-        self.bbox_heading = nn.Sequential(
-            nn.ConvTranspose2d(
-                in_channels=self.feature_dim,
-                out_channels=self.feature_dim // 2,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.ReLU(inplace=True),
-            ResidualBlock(self.feature_dim // 2),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(self.feature_dim // 2, 2),
-        )
-
-    def text_forward(self, input_ids, attention_mask=None):
-        text_outputs = self.text_model(
-            input_ids=input_ids, attention_mask=attention_mask
-        )
-        pooler_output = text_outputs.pooler_output
-        proj_feature = self.text_projector(pooler_output)
-        return proj_feature
-
-    def gated_fusion(self, text_feats, anchor_feats):
-        combined = torch.cat([text_feats, anchor_feats], dim=-1)
-        gate = 0.2 * torch.sigmoid(self.gate_fc(combined))
-        fused = gate * text_feats + (1 - gate) * anchor_feats
-        return fused
-
-    def forward(self, anchor_pixel_values, search_pixel_values, input_ids=None):
-        B = anchor_pixel_values.shape[0]
-
-        anchor_output = self.vision_model(anchor_pixel_values)
-        anchor_feats = anchor_output.last_hidden_state
-        anchor_pooler = anchor_output.pooler_output
-
-        # ground_drone_output = self.ground_drone_vision_model(anchor_pixel_values)
-        # anchor_feats = ground_drone_output.last_hidden_state
-
-        sat_output = self.vision_model(
-            search_pixel_values, interpolate_pos_encoding=True
-        )
-        sat_feats = sat_output.last_hidden_state
-        N = sat_feats.shape[1]
-        image_h, image_w = search_pixel_values.shape[-2:]
-        H, W = _infer_patch_grid(N, image_h, image_w)
-        sat_features_2d = sat_feats.permute(0, 2, 1).reshape(B, self.feature_dim, H, W)
-
-        anchor_context = (
-            self.bbox_adapter(anchor_feats.detach()) + anchor_feats.detach()
-        )
-        fused_features = self.bbox_transformer(
-            x=sat_features_2d, context=anchor_context
-        )
-
-        pred_anchor = self.bbox_fcn_out(fused_features)
-        pred_heading = torch.sigmoid(self.bbox_heading(fused_features))
-
-        sat_feature_2d_pool = (
-            self.pool_info_sat(sat_features_2d)
-            .reshape(B, self.feature_dim, -1)
-            .permute(0, 2, 1)
-        )
-
-        text_feats = None
-        if input_ids is not None:
-            text_outputs = self.text_model(input_ids=input_ids)
-            pooler_output = text_outputs.pooler_output
-            text_feats = self.text_projector(pooler_output)
-            fused_feats = self.gated_fusion(text_feats, anchor_pooler)
-
-        return (
-            pred_anchor,
-            pred_heading,
-            text_feats,
-            anchor_pooler,
-            sat_feature_2d_pool,
-            fused_feats if input_ids is not None else None,
-        )
-    def ref_forward(self, search_pixel_values, input_ids=None):
-
-
-        sat_output = self.vision_model(
-            search_pixel_values, interpolate_pos_encoding=True
-        )
-        sat_feats = sat_output.last_hidden_state
-        B = sat_feats.shape[0]
-        N = sat_feats.shape[1]
-        image_h, image_w = search_pixel_values.shape[-2:]
-        H, W = _infer_patch_grid(N, image_h, image_w)
-        sat_features_2d = sat_feats.permute(0, 2, 1).reshape(B, self.feature_dim, H, W)
-
-        sat_feature_2d_pool = (
-            self.pool_info_sat(sat_features_2d)
-            .reshape(B, self.feature_dim, -1)
-            .permute(0, 2, 1)
-        )
-
-        return sat_feature_2d_pool
-
 class PatchEmbedAndPos(nn.Module):
     def __init__(self, in_channels=3, embed_dim=32, patch_size=16, img_size=256):
         super().__init__()
@@ -625,74 +232,7 @@ class PatchEmbedAndPos(nn.Module):
 class GlobalAvgPool1D(nn.Module):
     def forward(self, x):
         return x.mean(dim=1)
-    
-class STN(nn.Module):
-    def __init__(self):
-        super(STN, self).__init__()
-        
-        # 1. 定位网络 (特征提取)
-        self.localization = nn.Sequential(
-            PatchEmbedAndPos(in_channels=3, embed_dim=32, patch_size=16),
-            nn.TransformerEncoderLayer(d_model=32, nhead=4, dim_feedforward=64, batch_first=True),
-            GlobalAvgPool1D(),
-        )
-        
-        # 2. 回归器：注意这里只输出 4 个参数 (Sx, Sy, Tx, Ty)
-        self.fc_loc = nn.Sequential(
-            nn.Linear(32, 32),
-            nn.ReLU(True),
-            nn.Linear(32, 4)
-        )
-        
-        # 【关键初始化】：让网络初始状态不改变图像大小和位置
-        # 缩放因子初始化为 1，平移因子初始化为 0
-        self.fc_loc[2].weight.data.zero_()
-        self.fc_loc[2].bias.data.copy_(torch.tensor([1.0, 1.0, 0.0, 0.0], dtype=torch.float))
 
-    def forward(self, x, known_angles_deg):
-        """
-        参数:
-            x: 输入图像 Tensor, shape 为 [B, C, H, W]
-            known_angles_deg: 准确的旋转角度 (度数) Tensor, shape 为 [B]
-        """
-        B = x.size(0)
-        device = x.device
-        
-        # --- 步骤 1: 网络预测未知的缩放和平移参数 ---
-        xs = self.localization(x)
-        params = self.fc_loc(xs)  # shape: [B, 4]
-        
-        # 提取各个参数
-        sx = params[:, 0]
-        sy = params[:, 1]
-        tx = params[:, 2]
-        ty = params[:, 3]
-        
-        # --- 步骤 2: 将已知角度转换为弧度并计算正余弦 ---
-        angle_rad = known_angles_deg * math.pi / 180.0
-        cos_a = torch.cos(angle_rad)
-        sin_a = torch.sin(angle_rad)
-        
-        # --- 步骤 3: 融合已知角度和预测参数，构建 2x3 仿射矩阵 ---
-        # 矩阵形式:
-        # [ Sx * cos(a), -Sy * sin(a), Tx ]
-        # [ Sx * sin(a),  Sy * cos(a), Ty ]
-        theta = torch.zeros(B, 2, 3, device=device, dtype=x.dtype)
-        
-        theta[:, 0, 0] = sx * cos_a
-        theta[:, 0, 1] = -sy * sin_a
-        theta[:, 0, 2] = tx
-        
-        theta[:, 1, 0] = sx * sin_a
-        theta[:, 1, 1] = sy * cos_a
-        theta[:, 1, 2] = ty
-        
-        # --- 步骤 4: 网格生成与采样 ---
-        grid = F.affine_grid(theta, x.size(), align_corners=False)
-        x_transformed = F.grid_sample(x, grid, align_corners=False)
-        
-        return x_transformed
-    
 class Encoder_abla(nn.Module):
     """Enhanced encoder with GeM pooling, gated fusion, and residual connections.
 
@@ -720,20 +260,14 @@ class Encoder_abla(nn.Module):
         self.usesg = usesg
         self.useap = useap
 
-        # if self.useap:
-        #     self.pool_info_sat = nn.AdaptiveAvgPool2d((3, 3))
-        # else:
         self.attnPooling = PoolingHead(self.vision_model.head, SiglipVisionConfig())
-        # self.pooler_rotator = Rotator(self.feature_dim)
         self.gate_fc = nn.Linear(proj_dim * 2, 1)
-        # self.fuse_fc = nn.Linear(proj_dim, proj_dim)
 
         self.text_projector = nn.Sequential(
             nn.Linear(self.text_feature_dim, self.text_feature_dim * 2),
             nn.ReLU(),
             nn.Linear(self.text_feature_dim * 2, proj_dim),
         )
-
         self.bbox_transformer = SpatialTransformer(
             in_channels=self.feature_dim,
             n_heads=8,
@@ -741,7 +275,6 @@ class Encoder_abla(nn.Module):
             depth=1,
             context_dim=self.feature_dim,
         )
-
         self.bbox_fcn_out = nn.Sequential(
             nn.ConvTranspose2d(
                 in_channels=self.feature_dim,
@@ -754,13 +287,11 @@ class Encoder_abla(nn.Module):
             ResidualBlock(self.feature_dim // 2),
             nn.Conv2d(self.feature_dim // 2, 9 * 5, kernel_size=1),
         )
-
         self.bbox_adapter = nn.Sequential(
             nn.Linear(self.feature_dim, self.feature_dim),
             nn.GELU(),
             nn.Linear(self.feature_dim, self.feature_dim),
         )
-        self.stn = STN()
         # self.bbox_heading = nn.Sequential(
         #     nn.ConvTranspose2d(
         #         in_channels=self.feature_dim,
@@ -793,18 +324,17 @@ class Encoder_abla(nn.Module):
 
     def forward(self, anchor_pixel_values, search_pixel_values, input_ids=None, angle=None):
         B = anchor_pixel_values.shape[0]
-        if angle is not None:
-            anchor_pixel_values = self.stn(anchor_pixel_values, angle)
         # with torch.no_grad():
         anchor_output = self.vision_model(anchor_pixel_values)
         anchor_feats = anchor_output.last_hidden_state
-
-        #     angle_rad = torch.deg2rad(angle)
-        #     anchor_feats_rotate = self.pooler_rotator(anchor_feats, angle_rad)
-        #     anchor_pooler = self.vision_model.head(anchor_feats_rotate)
-        # else:
+    
         anchor_pooler = anchor_output.pooler_output
-
+        text_feats = None
+        if input_ids is not None:
+            text_outputs = self.text_model(input_ids=input_ids)
+            text_feats = text_outputs.pooler_output
+            # fused_feats = self.gated_fusion(text_feats, anchor_pooler)
+            fused_feats = None
 
         sat_output = self.vision_model(
             search_pixel_values, interpolate_pos_encoding=True
@@ -820,11 +350,7 @@ class Encoder_abla(nn.Module):
             anchor_context = (
                 self.bbox_adapter(anchor_feats.detach()) + anchor_feats.detach()
             )
-            # anchor_context = anchor_feats.detach()
         else:
-            # anchor_context = (
-            #     self.bbox_adapter(anchor_feats.detach()) + anchor_feats.detach()
-            # )
             anchor_context = anchor_feats
 
         fused_features = self.bbox_transformer(
@@ -841,14 +367,9 @@ class Encoder_abla(nn.Module):
         #         .permute(0, 2, 1)
         #     )
         # else:
-        sat_feature_2d_pool = self.attnPooling(sat_feats)
+        sat_feature_2d_pool = self.attnPooling(sat_feats, 9)
 
-        text_feats = None
-        if input_ids is not None:
-            text_outputs = self.text_model(input_ids=input_ids)
-            pooler_output = text_outputs.pooler_output
-            text_feats = self.text_projector(pooler_output)
-            fused_feats = self.gated_fusion(text_feats, anchor_pooler)
+
 
         return (
             pred_anchor,
@@ -857,6 +378,224 @@ class Encoder_abla(nn.Module):
             anchor_pooler,
             sat_feature_2d_pool,
             fused_feats if input_ids is not None else None,
+        )
+
+    def ref_forward(self, search_pixel_values, input_ids=None):
+        sat_output = self.vision_model(
+            search_pixel_values, interpolate_pos_encoding=True
+        )
+        sat_feats = sat_output.last_hidden_state
+        B = sat_feats.shape[0]
+        N = sat_feats.shape[1]
+        image_h, image_w = search_pixel_values.shape[-2:]
+        H, W = _infer_patch_grid(N, image_h, image_w)
+        # sat_features_2d = sat_feats.permute(0, 2, 1).reshape(B, self.feature_dim, H, W)
+
+        # sat_feature_2d_pool = (
+        #     self.pool_info_sat(sat_features_2d)
+        #     .reshape(B, self.feature_dim, -1)
+        #     .permute(0, 2, 1)
+        # )
+        sat_feature_2d_pool = self.attnPooling(sat_feats)
+        return sat_feature_2d_pool
+
+
+class Encoder_text_angle(nn.Module):
+    """Enhanced encoder with GeM pooling, gated fusion, and residual connections.
+
+    Improvements over Encoder_attn:
+    - GeM pooling for learnable feature aggregation
+    - Gated fusion for adaptive text+image combination
+    - Residual connections in bbox decoder heads
+    """
+
+    def __init__(self, model_name=MODEL_NAME, proj_dim=PROJECTION_DIM, usesg=False, useap=False):
+        super().__init__()
+
+        try:
+            model = AutoModel.from_pretrained(model_name, cache_dir=CACHE_DIR)
+            self.vision_model = model.vision_model
+            # self.ground_drone_vision_model = self.model.vision_model
+            self.text_model = model.text_model
+
+            self.feature_dim = self.vision_model.config.hidden_size
+            self.text_feature_dim = self.text_model.config.hidden_size
+        except Exception as e:
+            print(f"Error loading SIGLIP model: {e}")
+            raise
+
+        self.usesg = usesg
+        self.useap = useap
+
+        self.attnPooling = PoolingHead(self.vision_model.head, SiglipVisionConfig())
+        self.gate_fc = nn.Linear(proj_dim * 2, 1)
+
+        self.text_projector = nn.Sequential(
+            nn.Linear(self.text_feature_dim, self.text_feature_dim * 2),
+            nn.ReLU(),
+            nn.Linear(self.text_feature_dim * 2, proj_dim),
+        )
+        self.bbox_transformer = SpatialTransformer(
+            in_channels=self.feature_dim,
+            n_heads=8,
+            d_head=64,
+            depth=1,
+            context_dim=self.feature_dim,
+        )
+        self.bbox_fcn_out = nn.Sequential(
+            nn.ConvTranspose2d(
+                in_channels=self.feature_dim,
+                out_channels=self.feature_dim // 2,
+                kernel_size=4,
+                stride=2,
+                padding=1,
+            ),
+            nn.ReLU(inplace=True),
+            ResidualBlock(self.feature_dim // 2),
+            nn.Conv2d(self.feature_dim // 2, 9 * 5, kernel_size=1),
+        )
+        self.bbox_adapter = nn.Sequential(
+            nn.Linear(self.feature_dim, self.feature_dim),
+            nn.GELU(),
+            nn.Linear(self.feature_dim, self.feature_dim),
+        )
+        self.text_attn = CrossAttention(
+            query_dim=self.feature_dim,
+            context_dim=self.feature_dim,
+            heads=8,
+            dim_head=64,
+            dropout=0.0,
+        )
+
+        self.angle_mlp = nn.Sequential(
+            nn.Linear(2, self.feature_dim*2),
+        )
+        self.text_weight = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+
+    def vision_forward(
+        self,
+        pixel_values,
+        angle_feat_1, 
+        angle_feat_2,
+        interpolate_pos_encoding: bool = False,
+    ):
+        """Run vision encoder manually and inject hidden state offset at one layer."""
+
+        hidden_states = self.vision_model.embeddings(
+            pixel_values,
+            interpolate_pos_encoding=interpolate_pos_encoding,
+        )
+
+        layers = self.vision_model.encoder.layers
+        mid_idx = len(layers) // 2
+
+        for idx, encoder_layer in enumerate(layers):
+            hidden_states = encoder_layer(hidden_states, attention_mask=None)
+            if idx == mid_idx:
+                hidden_states = hidden_states * angle_feat_1 + angle_feat_2
+
+        last_hidden_state = self.vision_model.post_layernorm(hidden_states)
+        pooler_output = None
+        if getattr(self.vision_model, "use_head", True):
+            pooler_output = self.vision_model.head(last_hidden_state)
+
+        return BaseModelOutputWithPooling(
+            last_hidden_state=last_hidden_state,
+            pooler_output=pooler_output,
+        )
+
+    def text_forward(self, input_ids, attention_mask=None):
+        text_outputs = self.text_model(
+            input_ids=input_ids, attention_mask=attention_mask
+        )
+        pooler_output = text_outputs.pooler_output
+        proj_feature = self.text_projector(pooler_output)
+        return proj_feature
+
+    def gated_fusion(self, text_feats, anchor_feats):
+        combined = torch.cat([text_feats, anchor_feats], dim=-1)
+        gate = 0.2 * torch.sigmoid(self.gate_fc(combined))
+        fused = gate * text_feats + (1 - gate) * anchor_feats
+        return fused
+
+    def _build_angle_features(self, angle, batch_size, device, dtype):
+        """Build two angle features with shape (B, 1, self.feature_dim) from input angle (B)."""
+        angle = angle.reshape(-1)
+
+        angle_rad = torch.deg2rad(angle)
+        angle_input = torch.stack([torch.sin(angle_rad), torch.cos(angle_rad)], dim=-1)
+        angle_proj = self.angle_mlp(angle_input).to(dtype=dtype)
+        angle_feat_1, angle_feat_2 = torch.chunk(angle_proj, chunks=2, dim=-1)
+        return angle_feat_1.unsqueeze(1), angle_feat_2.unsqueeze(1)
+
+    def _build_text_embedding(self, text_feats, batch_size, device, dtype):
+
+
+        return text_feats
+
+    def forward(self, anchor_pixel_values, search_pixel_values, input_ids=None, angle=None):
+        B = anchor_pixel_values.shape[0]
+        # with torch.no_grad():
+        if angle is not None:
+            angle_feat_1, angle_feat_2 = self._build_angle_features(
+                angle,
+                batch_size=B,
+                device=anchor_pixel_values.device,
+                dtype=anchor_pixel_values.dtype,
+            )
+            anchor_output = self.vision_forward(anchor_pixel_values, angle_feat_1, angle_feat_2)
+        else:
+            anchor_output = self.vision_model(anchor_pixel_values)
+        anchor_feats = anchor_output.last_hidden_state
+
+
+        anchor_pooler = self.attnPooling(anchor_feats,1)[:,0,:]
+        text_feats = torch.ones(B, self.feature_dim, device=anchor_feats.device, dtype=anchor_feats.dtype)
+        
+        if input_ids is not None:
+            text_outputs = self.text_model(input_ids=input_ids)
+            text_feats = self.text_attn(
+                text_outputs.pooler_output.unsqueeze(1),
+                context=anchor_feats.detach(),
+            )[:,0,:]
+            anchor_pooler = anchor_pooler + self.text_weight * text_feats
+
+        fused_feats = None
+
+
+        sat_output = self.vision_model(
+            search_pixel_values, interpolate_pos_encoding=True
+        )
+        sat_feats = sat_output.last_hidden_state
+        
+
+        sat_feature_2d_pool = self.attnPooling(sat_feats, 9)
+           
+        N = sat_feats.shape[1]
+        image_h, image_w = search_pixel_values.shape[-2:]
+        H, W = _infer_patch_grid(N, image_h, image_w)
+        sat_features_2d = sat_feats.permute(0, 2, 1).reshape(B, self.feature_dim, H, W)
+
+        anchor_context = (
+            self.bbox_adapter(anchor_feats.detach()) + anchor_feats.detach()
+        )
+
+        fused_features = self.bbox_transformer(
+            x=sat_features_2d, context=anchor_context
+        )
+
+        pred_anchor = self.bbox_fcn_out(fused_features)
+
+
+
+
+        return (
+            pred_anchor,
+            None,
+            text_feats,
+            anchor_pooler,
+            sat_feature_2d_pool,
+            fused_feats,
         )
 
     def ref_forward(self, search_pixel_values, input_ids=None):
@@ -890,35 +629,28 @@ class Encoder_dino(nn.Module):
         self,
         model_name=DINO_MODEL_NAME,
         text_model_name=DINO_MODEL_NAME,
-        proj_dim=PROJECTION_DIM,
+        proj_dim=DINO_PROJECTION_DIM,
         usesg=False,
         useap=True,
+        freeze_vision_blocks=15,
+        freeze_patch_generator=True,
+        freeze_cls_token=True,
     ):
         super().__init__()
+        _ = text_model_name
 
-        try:
-            vision_backbone = AutoModel.from_pretrained(
-                model_name,
-                cache_dir=CACHE_DIR,
-                trust_remote_code=True,
-            )
-            self.vision_model = vision_backbone
+        self.vision_model = AutoModel.from_pretrained(
+            model_name,
+            cache_dir=CACHE_DIR,
+            trust_remote_code=True,
+        )
+        self.radio_model = self.vision_model.radio_model
+        self.vision_core = self.radio_model.model
+        self.summary_pool = DinoSummaryPoolingHead(self.radio_model.summary_idxs)
 
-            text_backbone = AutoModel.from_pretrained(
-                text_model_name,
-                cache_dir=CACHE_DIR,
-                trust_remote_code=True,
-            )
-            self.text_model = getattr(text_backbone, "text_model", None)
-
-            self.feature_dim = int(getattr(self.vision_model.config, "hidden_size", proj_dim))
-            if self.text_model is not None:
-                self.text_feature_dim = self.text_model.config.hidden_size
-            else:
-                self.text_feature_dim = proj_dim
-        except Exception as e:
-            print(f"Error loading C-RADIOv4-H model: {e}")
-            raise
+        self.text_model = None
+        self.feature_dim = int(self.vision_core.embed_dim)
+        self.text_feature_dim = proj_dim
 
         self.usesg = usesg
         self.useap = useap
@@ -963,20 +695,51 @@ class Encoder_dino(nn.Module):
             nn.Linear(self.feature_dim, self.feature_dim),
         )
 
+        self.freeze_first_vision_blocks(
+            num_blocks=freeze_vision_blocks,
+            freeze_patch_generator=freeze_patch_generator,
+            freeze_cls_token=freeze_cls_token,
+        )
+
+    def freeze_first_vision_blocks(
+        self,
+        num_blocks,
+        freeze_patch_generator=True,
+        freeze_cls_token=True,
+    ):
+        if num_blocks <= 0:
+            return
+
+        core = self.vision_core
+        blocks = core.blocks
+        n = min(int(num_blocks), len(blocks))
+
+        for i in range(n):
+            for p in blocks[i].parameters():
+                p.requires_grad = False
+
+        if freeze_patch_generator and hasattr(core, "patch_generator"):
+            for p in core.patch_generator.parameters():
+                p.requires_grad = False
+
+        if freeze_cls_token and hasattr(core, "patch_generator"):
+            cls_tok = getattr(core.patch_generator, "cls_token", None)
+            if cls_tok is not None:
+                for p in cls_tok.parameters():
+                    p.requires_grad = False
+
     def _vision_forward(self, pixel_values):
-        try:
-            return self.vision_model(pixel_values, interpolate_pos_encoding=True)
-        except TypeError:
-            try:
-                return self.vision_model(
-                    pixel_values=pixel_values,
-                    interpolate_pos_encoding=True,
-                )
-            except TypeError:
-                try:
-                    return self.vision_model(pixel_values)
-                except TypeError:
-                    return self.vision_model(pixel_values=pixel_values)
+        conditioned = self.radio_model.input_conditioner(pixel_values)
+        tokens = self.vision_core.forward_features(conditioned)
+        patch_generator = getattr(self.vision_core, "patch_generator", None)
+        if patch_generator is None:
+            raise RuntimeError("C-RADIO model missing patch_generator; cannot pool summary tokens.")
+        return self.summary_pool(
+            tokens=tokens,
+            num_cls_tokens=patch_generator.num_cls_tokens,
+            num_skip=patch_generator.num_skip,
+            feature_normalizer=self.radio_model.feature_normalizer,
+        )
 
     def _split_tokens(self, hidden_state, image_h=None, image_w=None):
         # DINO-style outputs commonly include a CLS token. We support both
@@ -1038,24 +801,20 @@ class Encoder_dino(nn.Module):
         fused = gate * text_feats + (1 - gate) * anchor_feats
         return fused
 
-    def forward(self, anchor_pixel_values, search_pixel_values, input_ids=None):
+    def forward(self, anchor_pixel_values, search_pixel_values, input_ids=None, angle=None):
         B = anchor_pixel_values.shape[0]
 
         anchor_output = self._vision_forward(anchor_pixel_values)
-        anchor_hidden = anchor_output.last_hidden_state
-        anchor_h, anchor_w = anchor_pixel_values.shape[-2:]
-        anchor_pooler_raw, anchor_patch_tokens = self._split_tokens(
-            anchor_hidden, anchor_h, anchor_w
-        )
+        anchor_pooler = anchor_output.summary[:,:self.feature_dim]
+        anchor_patch_tokens = anchor_output.features
 
         sat_output = self._vision_forward(search_pixel_values)
-        sat_hidden = sat_output.last_hidden_state
+        sat_hidden = sat_output.features
         image_h, image_w = search_pixel_values.shape[-2:]
-        _, sat_patch_tokens = self._split_tokens(sat_hidden, image_h, image_w)
 
-        N = sat_patch_tokens.shape[1]
+        N = sat_hidden.shape[1]
         H, W = _infer_patch_grid(N, image_h, image_w)
-        sat_features_2d = sat_patch_tokens.permute(0, 2, 1).reshape(
+        sat_features_2d = sat_hidden.permute(0, 2, 1).reshape(
             B, self.feature_dim, H, W
         )
 
@@ -1080,7 +839,6 @@ class Encoder_dino(nn.Module):
             .permute(0, 2, 1)
         )
 
-        anchor_pooler = self.anchor_projector(anchor_pooler_raw)
         text_feats = None
         if input_ids is not None:
             if self.text_model is None:
@@ -1103,14 +861,13 @@ class Encoder_dino(nn.Module):
 
     def ref_forward(self, search_pixel_values, input_ids=None):
         sat_output = self._vision_forward(search_pixel_values)
-        sat_hidden = sat_output.last_hidden_state
+        sat_hidden = sat_output.features
         image_h, image_w = search_pixel_values.shape[-2:]
-        _, sat_patch_tokens = self._split_tokens(sat_hidden, image_h, image_w)
 
-        B = sat_patch_tokens.shape[0]
-        N = sat_patch_tokens.shape[1]
+        B = sat_hidden.shape[0]
+        N = sat_hidden.shape[1]
         H, W = _infer_patch_grid(N, image_h, image_w)
-        sat_features_2d = sat_patch_tokens.permute(0, 2, 1).reshape(
+        sat_features_2d = sat_hidden.permute(0, 2, 1).reshape(
             B, self.feature_dim, H, W
         )
 
@@ -1122,17 +879,79 @@ class Encoder_dino(nn.Module):
 
         return sat_feature_2d_pool
 
+
+class DinoVisionOutput:
+    def __init__(self, summary, features):
+        self.summary = summary
+        self.features = features
+
+
+class DinoSummaryPoolingHead(nn.Module):
+    """Reproduces C-RADIO summary/features extraction for VisionTransformer outputs."""
+
+    def __init__(self, summary_idxs):
+        super().__init__()
+        if summary_idxs is None:
+            self.register_buffer("summary_idxs", None, persistent=False)
+        else:
+            self.register_buffer("summary_idxs", summary_idxs.clone().to(torch.int64), persistent=False)
+
+    def forward(self, tokens, num_cls_tokens, num_skip, feature_normalizer):
+        all_summary = tokens[:, :num_cls_tokens]
+        if self.summary_idxs is not None and all_summary.shape[1] > 1:
+            summary_tokens = all_summary[:, self.summary_idxs]
+        else:
+            summary_tokens = all_summary
+
+        summary = summary_tokens.flatten(1)
+        features = tokens[:, num_skip:]
+        features = feature_normalizer(features)
+        return DinoVisionOutput(summary=summary, features=features)
+
+
+def _unit_test_dino_pooling_head():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[unit-test] device={device}")
+
+    model = Encoder_dino(proj_dim=1280, freeze_vision_blocks=0).to(device).eval()
+    x = torch.randn(2, 3, 432, 768, device=device)
+
+    with torch.no_grad():
+        native = model.vision_model(x)
+        custom = model._vision_forward(x)
+
+    summary_diff = (native.summary - custom.summary).abs().max().item()
+    feature_diff = (native.features - custom.features).abs().max().item()
+
+    print(f"[unit-test] native.summary shape={tuple(native.summary.shape)}")
+    print(f"[unit-test] custom.summary shape={tuple(custom.summary.shape)}")
+    print(f"[unit-test] native.features shape={tuple(native.features.shape)}")
+    print(f"[unit-test] custom.features shape={tuple(custom.features.shape)}")
+    print(f"[unit-test] max_abs_summary_diff={summary_diff:.8f}")
+    print(f"[unit-test] max_abs_feature_diff={feature_diff:.8f}")
+
+    assert summary_diff < 1e-6, f"summary mismatch: {summary_diff}"
+    assert feature_diff < 1e-6, f"feature mismatch: {feature_diff}"
+    print("[unit-test] PASS")
+
 if __name__ == "__main__":
-    model = Encoder_gem()
-    print(f"Model loaded successfully")
-    print(f"Feature dim: {model.feature_dim}")
-    print(f"Text feature dim: {model.text_feature_dim}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--unit-test-dino-pooling", action="store_true")
+    args = parser.parse_args()
 
-    dummy_feat = torch.randn(2, 768, 20, 20)
-    gem_out = model.pool_sat(dummy_feat)
-    print(f"GeM output shape: {gem_out.shape}")
+    if args.unit_test_dino_pooling:
+        _unit_test_dino_pooling_head()
+    else:
+        model = Encoder_gem()
+        print("Model loaded successfully")
+        print(f"Feature dim: {model.feature_dim}")
+        print(f"Text feature dim: {model.text_feature_dim}")
 
-    text = torch.randn(2, 768)
-    anchor = torch.randn(2, 768)
-    fused = model.gated_fusion(text, anchor)
-    print(f"Fused output shape: {fused.shape}")
+        dummy_feat = torch.randn(2, 768, 20, 20)
+        gem_out = model.pool_info_sat(dummy_feat)
+        print(f"Pool output shape: {gem_out.shape}")
+
+        text = torch.randn(2, 768)
+        anchor = torch.randn(2, 768)
+        fused = model.gated_fusion(text, anchor)
+        print(f"Fused output shape: {fused.shape}")

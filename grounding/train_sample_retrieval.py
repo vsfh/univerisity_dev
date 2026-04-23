@@ -41,8 +41,8 @@ torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.benchmark = True
 
 IMG_SIZE = (768, 432)  # (width, height)
-BATCH_SIZE = 4
-NUM_EPOCHS = 8
+BATCH_SIZE = 8
+NUM_EPOCHS = 4
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 PRINT_FREQ = 50
@@ -53,9 +53,9 @@ TRAIN_BBOX_FILE = "/data/feihong/univerisity_dev/runs/train.json"
 TEST_BBOX_FILE = "/data/feihong/univerisity_dev/runs/test.json"
 TRAIN_FILE = "/data/feihong/ckpt/train.txt"
 TEST_FILE = "/data/feihong/ckpt/test.txt"
-UNIV_CROP_SIZE = (640, 640)
+# UNIV_CROP_SIZE = (640, 640)
 UNIV_DRONE_SIZE = (256, 256)
-DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
 
 CVOGL_TRANSFORM = Compose(
     [
@@ -474,7 +474,7 @@ def main(args):
         processor=processor,
         processor_sat=processor,
         tokenizer=tokenizer,
-        split="val",
+        split="test",
     )
 
     print(f"Found {len(train_dataset)} training pairs, {len(val_dataset)} validation pairs")
@@ -505,7 +505,6 @@ def main(args):
 
     optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
 
-    best_loss = float("inf")
     print(f"Starting training for {args.max_epoch} epochs...")
     for epoch in range(args.max_epoch):
         train_loss = train_epoch(
@@ -518,11 +517,7 @@ def main(args):
             print_freq=args.print_freq,
         )
 
-        val_loss = validate(val_loader, model, epoch, use_amp=use_amp)
-        # top1, top5, top10 = evaluate(model, val_loader)
-
         writer.add_scalar("Loss/train", train_loss, epoch)
-        writer.add_scalar("Loss/val", val_loss, epoch)
         # writer.add_scalar("Metrics/top1_acc", top1, epoch)
         # writer.add_scalar("Metrics/top5_acc", top5, epoch)
         # writer.add_scalar("Metrics/top10_acc", top10, epoch)
@@ -530,19 +525,14 @@ def main(args):
         print(
             f"Epoch {epoch + 1}/{args.max_epoch}:\t"
             f"Train Loss: {train_loss:.4f}\t"
-            f"Val Loss: {val_loss:.4f}\t"
             # f"Top1: {top1:.4f}\t"
             # f"Top5: {top5:.4f}\t"
             # f"Top10: {top10:.4f}"
         )
+        os.makedirs(args.checkpoint, exist_ok=True)
+        torch.save(model.state_dict(), f"{args.checkpoint}/last.pth")
 
-        if val_loss < best_loss:
-            best_loss = val_loss
-            os.makedirs(args.checkpoint, exist_ok=True)
-            torch.save(model.state_dict(), f"{args.checkpoint}/best.pth")
-            print(f"Saved best model with val_loss: {val_loss:.4f}")
-
-    print(f"\nTraining complete. Best Val Loss: {best_loss:.4f}")
+    print("\nTraining complete. Saved checkpoint to last.pth")
     writer.close()
 
 
