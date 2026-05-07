@@ -29,9 +29,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from ground_cvos import TROGeoLite
-from bbox.yolo_utils import yolo_loss, build_target
+from bbox.yolo_utils import build_target, eval_iou_acc, yolo_loss
 from grounding.model.loss import adjust_learning_rate
-from utils.utils import AverageMeter, eval_iou_acc
+from utils.utils import AverageMeter
 
 from dataset import ShiftedSatelliteDroneDataset
 
@@ -39,7 +39,7 @@ IMG_SIZE = (768, 432)  # (width, height)
 BATCH_SIZE = 8
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
-NUM_EPOCHS = 8
+NUM_EPOCHS = 4
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 PRINT_FREQ = 50
@@ -53,7 +53,7 @@ UNIV_TEST_FILE = "/data/feihong/ckpt/test.txt"
 UNIV_CROP_SIZE = (640, 640)
 UNIV_DRONE_SIZE = (256, 256)
 UNIV_SAT_SIZE = IMG_SIZE
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
 
 CVOGL_TRANSFORM = None
 

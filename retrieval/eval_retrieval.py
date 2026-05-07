@@ -76,17 +76,45 @@ def _load_encoder_classes():
 		raise ImportError(f"Unable to load model module from: {model_path}")
 	module = importlib.util.module_from_spec(spec)
 	spec.loader.exec_module(module)
-	return module.Encoder_abla, module.Encoder_text_angle
+	return module.Encoder_abla, module.Encoder_text_angle, module.Encoder_heat
 
 
-EncoderAbla, EncoderDino = _load_encoder_classes()
+def _load_sample_retrieval_classes():
+	"""Load the retrieval-only SampleGeoLite training module."""
+	module_path = REPO_ROOT / "grounding" / "train_sample_retrieval.py"
+	spec = importlib.util.spec_from_file_location("sample_retrieval_module", str(module_path))
+	if spec is None or spec.loader is None:
+		raise ImportError(f"Unable to load SampleGeoLite module from: {module_path}")
+	module = importlib.util.module_from_spec(spec)
+	spec.loader.exec_module(module)
+	return (
+		module.SampleGeoLite,
+		module.TransformProcessorWrapper,
+		module.DummyTokenizer,
+		module.CVOGL_TRANSFORM,
+		module.IMG_SIZE,
+		module.EMB_SIZE,
+	)
+
+
+EncoderAbla, EncoderDino, EncoderHeat = _load_encoder_classes()
+(
+	SampleRetrievalModel,
+	SampleRetrievalProcessor,
+	SampleRetrievalTokenizer,
+	SAMPLE_RETRIEVAL_TRANSFORM,
+	SAMPLE_RETRIEVAL_IMAGE_SIZE,
+	SAMPLE_RETRIEVAL_EMB_SIZE,
+) = _load_sample_retrieval_classes()
 
 
 EVAL_CONFIG = {
-	"device": "cuda:0",
+	"device": "cuda:1",
 	# "include_file": "/data/feihong/ckpt/include_train.json",
 	"include_file": "/data/feihong/ckpt/include1.json",
+	# "subset_heights": [300],
 	"subset_heights": [150, 200, 250, 300],
+	# "subset_angles": [270],
 	"subset_angles": [0, 45, 90, 135, 180, 225, 270, 315],
 	"candidate_size": 100,
 	"batch_size": 8,
@@ -101,14 +129,15 @@ EVAL_CONFIG = {
 		"run": False,
 		"output_dir": "runs/visualizations/retrieval_top1_errors",
 	},
-	"models": {
-		"siglip": {"run": False, "checkpoint": '/data/feihong/ckpt/retrieval_siglip/best.pth'},
-		"encoder_abla": {"run": False, "checkpoint": '/data/feihong/ckpt/0.1_wo_angle/last.pth'},
-		# "encoder_abla": {"run": True, "checkpoint": '/data/feihong/ckpt/0.1_wo_angle_wo_text/last.pth'},
-		"encoder_dino": {"run": True, "checkpoint": '/data/feihong/ckpt/0.1_wo_angle_wo_text/last.pth'},
-		"clip": {"run": False, "checkpoint": None},
-		"openclip": {"run": False, "checkpoint": None},
-		"evaclip": {"run": False, "checkpoint": None},
+		"models": {
+			# "siglip": {"run": True, "checkpoint": '/data/feihong/ckpt/retrieval_siglip/last.pth'},
+			# "encoder_abla": {"run": False, "checkpoint": '/data/feihong/ckpt/0.1_wo_angle/last.pth'},
+			# "encoder_dino": {"run": True, "checkpoint": '/data/feihong/ckpt/0.1_full_model/last.pth'},
+			# "encoder_heat": {"run": False, "checkpoint": '/data/feihong/ckpt/0.5_mix_model_heat/last.pth'},
+			"sample_retrieval": {"run": True, "checkpoint": "/data/feihong/ckpt/retrieval_sample4geo/last.pth"},
+			# "clip": {"run": True, "checkpoint": '/data/feihong/ckpt/retrieval_clip/last.pth'},
+		# "openclip": {"run": True, "checkpoint": '/data/feihong/ckpt/retrieval_openclip/last.pth'},
+		# "evaclip": {"run": True, "checkpoint": '/data/feihong/ckpt/retrieval_evaclip/last.pth'},
 	},
 }
 
@@ -119,20 +148,19 @@ def _canonical_model_type(model_type: str) -> str:
 		return "encoder_abla"
 	if name in {"dino", "encoder_dino"}:
 		return "encoder_dino"
+	if name in {"heat", "encoder_heat"}:
+		return "encoder_heat"
+	if name in {"sample", "sample4geo", "sample_retrieval", "retrieval_sample4geo"}:
+		return "sample_retrieval"
 	return name
-
-
-def _is_encoder_abla(model_type: str) -> bool:
-	return _canonical_model_type(model_type) == "encoder_abla"
-
-
-def _is_encoder_dino(model_type: str) -> bool:
-	return _canonical_model_type(model_type) == "encoder_dino"
-
 
 def _is_grid_encoder(model_type: str) -> bool:
 	name = _canonical_model_type(model_type)
-	return name in {"encoder_abla", "encoder_dino"}
+	return name in {"encoder_abla", "encoder_dino", "encoder_heat"}
+
+
+def _is_sample_retrieval(model_type: str) -> bool:
+	return _canonical_model_type(model_type) == "sample_retrieval"
 
 
 def _normalize_subset(values: Optional[Sequence[int]], defaults: Sequence[int]) -> Set[int]:
@@ -143,6 +171,10 @@ def _normalize_subset(values: Optional[Sequence[int]], defaults: Sequence[int]) 
 
 def _normalize_label(label: str) -> str:
 	return str(label).strip().split(".")[0]
+
+
+def _drone_image_name(path: str) -> str:
+	return Path(str(path)).name
 
 
 def _load_include_map(include_file: Optional[str]) -> Dict[str, Set[str]]:
@@ -168,7 +200,284 @@ def _load_include_map(include_file: Optional[str]) -> Dict[str, Set[str]]:
 
 def _default_checkpoint_for(model_type: str) -> str:
 	model_type = _canonical_model_type(model_type)
+	if model_type == "sample_retrieval":
+		return "/data/feihong/ckpt/retrieval_sample4geo/last.pth"
 	return str(REPO_ROOT / "ckpt" / f"retrieval_{model_type}" / "best.pth")
+
+
+def _checkpoint_parent_name(checkpoint_path: Optional[str], model_type: str) -> str:
+	resolved_checkpoint = checkpoint_path or _default_checkpoint_for(model_type)
+	return Path(str(resolved_checkpoint)).resolve().parent.name
+
+
+def _summarize_recall1_by_axis(per_subset: List[Dict[str, object]]) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+	height_groups: Dict[int, List[Dict[str, object]]] = {}
+	angle_groups: Dict[int, List[Dict[str, object]]] = {}
+
+	for item in per_subset:
+		height_groups.setdefault(int(item["height"]), []).append(item)
+		angle_groups.setdefault(int(item["angle"]), []).append(item)
+
+	per_height: List[Dict[str, object]] = []
+	for height in sorted(height_groups.keys()):
+		items = height_groups[height]
+		total_queries = int(sum(int(entry.get("num_queries", 0)) for entry in items))
+		total_hits = int(sum(int(entry.get("top1_hits", 0)) for entry in items))
+		per_height.append(
+			{
+				"height": int(height),
+				"num_subsets": int(len(items)),
+				"num_queries": total_queries,
+				"top1_hits": total_hits,
+				"recall@1": float(total_hits / total_queries) if total_queries > 0 else 0.0,
+			}
+		)
+
+	per_angle: List[Dict[str, object]] = []
+	for angle in sorted(angle_groups.keys()):
+		items = angle_groups[angle]
+		total_queries = int(sum(int(entry.get("num_queries", 0)) for entry in items))
+		total_hits = int(sum(int(entry.get("top1_hits", 0)) for entry in items))
+		per_angle.append(
+			{
+				"angle": int(angle),
+				"num_subsets": int(len(items)),
+				"num_queries": total_queries,
+				"top1_hits": total_hits,
+				"recall@1": float(total_hits / total_queries) if total_queries > 0 else 0.0,
+			}
+		)
+
+	return per_height, per_angle
+
+
+def _summarize_recall_metrics_by_axis(
+	per_subset: List[Dict[str, object]],
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+	height_groups: Dict[int, List[Dict[str, object]]] = {}
+	angle_groups: Dict[int, List[Dict[str, object]]] = {}
+
+	for item in per_subset:
+		height_groups.setdefault(int(item["height"]), []).append(item)
+		angle_groups.setdefault(int(item["angle"]), []).append(item)
+
+	def _aggregate(items: List[Dict[str, object]]) -> Dict[str, object]:
+		total_queries = int(sum(int(entry.get("num_samples", 0)) for entry in items))
+		total_top1 = int(sum(int(entry.get("top1_hits", 0)) for entry in items))
+		total_top5 = int(sum(int(entry.get("top5_hits", 0)) for entry in items))
+		total_top10 = int(sum(int(entry.get("top10_hits", 0)) for entry in items))
+		return {
+			"num_samples": total_queries,
+			"top1_hits": total_top1,
+			"top5_hits": total_top5,
+			"top10_hits": total_top10,
+			"recall@1": float(total_top1 / total_queries) if total_queries > 0 else 0.0,
+			"recall@5": float(total_top5 / total_queries) if total_queries > 0 else 0.0,
+			"recall@10": float(total_top10 / total_queries) if total_queries > 0 else 0.0,
+		}
+
+	per_height: List[Dict[str, object]] = []
+	for height in sorted(height_groups.keys()):
+		per_height.append({"height": int(height), **_aggregate(height_groups[height])})
+
+	per_angle: List[Dict[str, object]] = []
+	for angle in sorted(angle_groups.keys()):
+		per_angle.append({"angle": int(angle), **_aggregate(angle_groups[angle])})
+
+	return per_height, per_angle
+
+
+def _aggregate_recall_metrics(per_subset: List[Dict[str, object]]) -> Dict[str, object]:
+	total_queries = int(sum(int(entry.get("num_samples", 0)) for entry in per_subset))
+	total_top1 = int(sum(int(entry.get("top1_hits", 0)) for entry in per_subset))
+	total_top5 = int(sum(int(entry.get("top5_hits", 0)) for entry in per_subset))
+	total_top10 = int(sum(int(entry.get("top10_hits", 0)) for entry in per_subset))
+	return {
+		"num_samples": total_queries,
+		"top1_hits": total_top1,
+		"top5_hits": total_top5,
+		"top10_hits": total_top10,
+		"recall@1": float(total_top1 / total_queries) if total_queries > 0 else 0.0,
+		"recall@5": float(total_top5 / total_queries) if total_queries > 0 else 0.0,
+		"recall@10": float(total_top10 / total_queries) if total_queries > 0 else 0.0,
+	}
+
+
+def _collect_recall1_per_subset_details(
+	model_type: str,
+	checkpoint_path: Optional[str] = None,
+	subset_heights: Optional[Sequence[int]] = None,
+	subset_angles: Optional[Sequence[int]] = None,
+	candidate_size: Optional[int] = None,
+	include_file: str = "/data/feihong/ckpt/include.json",
+	batch_size: int = 16,
+	num_workers: int = 8,
+	device: Optional[str] = None,
+	extract_features_fn: Optional[Callable[..., Tuple[torch.Tensor, List[str], List[str], List[str], torch.Tensor, List[str], List[str]]]] = None,
+	score_recall_fn: Optional[Callable[..., Dict[str, float]]] = None,
+) -> Dict[str, object]:
+	if device is None:
+		device = "cuda:1" if torch.cuda.is_available() else "cpu"
+
+	height_list = sorted(_normalize_subset(subset_heights, DEFAULT_SUBSET_HEIGHTS))
+	angle_list = sorted(_normalize_subset(subset_angles, DEFAULT_SUBSET_ANGLES))
+	include_map = _load_include_map(include_file)
+
+	extract_impl = extract_features_fn or _extract_features
+	score_impl = score_recall_fn or _score_recall
+
+	recall1_values: List[float] = []
+	per_subset: List[Dict[str, object]] = []
+	for h in height_list:
+		for a in angle_list:
+			(
+				query_feats,
+				query_labels,
+				query_drone_paths,
+				query_satellite_paths,
+				gallery_feats,
+				gallery_labels,
+				gallery_satellite_paths,
+			) = extract_impl(
+				model_type=model_type,
+				checkpoint_path=checkpoint_path,
+				device=device,
+				batch_size=batch_size,
+				num_workers=num_workers,
+				subset_heights=[h],
+				subset_angles=[a],
+			)
+
+			metrics = score_impl(
+				query_feats=query_feats,
+				query_labels=query_labels,
+				query_drone_paths=query_drone_paths,
+				query_satellite_paths=query_satellite_paths,
+				gallery_feats=gallery_feats,
+				gallery_labels=gallery_labels,
+				gallery_satellite_paths=gallery_satellite_paths,
+				include_map=include_map,
+				device=device,
+				candidate_size=candidate_size,
+				error_analysis=None,
+			)
+
+			recall1 = float(metrics["recall@1"])
+			num_queries = int(metrics["num_queries"])
+			top1_hits = int(metrics["top1_hits"])
+			print(recall1)
+			recall1_values.append(recall1)
+			per_subset.append(
+				{
+					"height": int(h),
+					"angle": int(a),
+					"num_queries": num_queries,
+					"top1_hits": top1_hits,
+					"recall@1": recall1,
+				}
+			)
+
+	per_height, per_angle = _summarize_recall1_by_axis(per_subset)
+
+	return {
+		"model_type": model_type,
+		"checkpoint_path": checkpoint_path,
+		"subset_heights": [int(h) for h in height_list],
+		"subset_angles": [int(a) for a in angle_list],
+		"num_subsets": len(per_subset),
+		"recall@1_values": recall1_values,
+		"per_subset": per_subset,
+		"per_height": per_height,
+		"per_angle": per_angle,
+	}
+
+
+def _collect_recall_metrics_per_subset_details(
+	model_type: str,
+	checkpoint_path: Optional[str] = None,
+	subset_heights: Optional[Sequence[int]] = None,
+	subset_angles: Optional[Sequence[int]] = None,
+	candidate_size: Optional[int] = None,
+	include_file: str = "/data/feihong/ckpt/include.json",
+	batch_size: int = 16,
+	num_workers: int = 8,
+	device: Optional[str] = None,
+	extract_features_fn: Optional[Callable[..., Tuple[torch.Tensor, List[str], List[str], List[str], torch.Tensor, List[str], List[str]]]] = None,
+	score_recall_fn: Optional[Callable[..., Dict[str, float]]] = None,
+) -> Dict[str, object]:
+	if device is None:
+		device = "cuda:1" if torch.cuda.is_available() else "cpu"
+
+	height_list = sorted(_normalize_subset(subset_heights, DEFAULT_SUBSET_HEIGHTS))
+	angle_list = sorted(_normalize_subset(subset_angles, DEFAULT_SUBSET_ANGLES))
+	include_map = _load_include_map(include_file)
+
+	extract_impl = extract_features_fn or _extract_features
+	score_impl = score_recall_fn or _score_recall
+
+	per_subset: List[Dict[str, object]] = []
+	for h in height_list:
+		for a in angle_list:
+			(
+				query_feats,
+				query_labels,
+				query_drone_paths,
+				query_satellite_paths,
+				gallery_feats,
+				gallery_labels,
+				gallery_satellite_paths,
+			) = extract_impl(
+				model_type=model_type,
+				checkpoint_path=checkpoint_path,
+				device=device,
+				batch_size=batch_size,
+				num_workers=num_workers,
+				subset_heights=[h],
+				subset_angles=[a],
+			)
+
+			metrics = score_impl(
+				query_feats=query_feats,
+				query_labels=query_labels,
+				query_drone_paths=query_drone_paths,
+				query_satellite_paths=query_satellite_paths,
+				gallery_feats=gallery_feats,
+				gallery_labels=gallery_labels,
+				gallery_satellite_paths=gallery_satellite_paths,
+				include_map=include_map,
+				device=device,
+				candidate_size=candidate_size,
+				error_analysis=None,
+			)
+
+			per_subset.append(
+				{
+					"height": int(h),
+					"angle": int(a),
+					"num_samples": int(metrics["num_queries"]),
+					"top1_hits": int(metrics["top1_hits"]),
+					"top5_hits": int(metrics["top5_hits"]),
+					"top10_hits": int(metrics["top10_hits"]),
+					"recall@1": float(metrics["recall@1"]),
+					"recall@5": float(metrics["recall@5"]),
+					"recall@10": float(metrics["recall@10"]),
+				}
+			)
+
+	overall = _aggregate_recall_metrics(per_subset)
+	per_height, per_angle = _summarize_recall_metrics_by_axis(per_subset)
+
+	return {
+		"model_type": model_type,
+		"checkpoint_path": checkpoint_path,
+		"subset_heights": [int(h) for h in height_list],
+		"subset_angles": [int(a) for a in angle_list],
+		"num_subsets": len(per_subset),
+		"overall": overall,
+		"per_subset": per_subset,
+		"per_height": per_height,
+		"per_angle": per_angle,
+	}
 
 
 def _infer_token_grid_hw(n_tokens: int, input_h: int, input_w: int) -> Tuple[int, int]:
@@ -397,6 +706,37 @@ def _build_model_and_io(model_type: str, device: str):
 		).to(device)
 		return model, processor, processor_sat, tokenizer
 
+	if model_type == "encoder_heat":
+		processor = AutoImageProcessor.from_pretrained(
+			SIGLIP_MODEL_NAME,
+			cache_dir=SIGLIP_CACHE_DIR,
+		)
+		processor_sat = AutoImageProcessor.from_pretrained(
+			SIGLIP_MODEL_NAME,
+			cache_dir=SIGLIP_CACHE_DIR,
+		)
+		set_siglip_processor_size(processor_sat, PROCESSOR_IMAGE_SIZE)
+		tokenizer = AutoTokenizer.from_pretrained(SIGLIP_MODEL_NAME)
+		model = EncoderHeat(
+			model_name=SIGLIP_MODEL_NAME,
+			proj_dim=SIGLIP_PROJECTION_DIM,
+			usesg=True,
+			useap=True,
+		).to(device)
+		return model, processor, processor_sat, tokenizer
+
+	if model_type == "sample_retrieval":
+		processor = SampleRetrievalProcessor(
+			SAMPLE_RETRIEVAL_TRANSFORM,
+			SAMPLE_RETRIEVAL_IMAGE_SIZE,
+		)
+		tokenizer = SampleRetrievalTokenizer()
+		model = SampleRetrievalModel(
+			emb_size=SAMPLE_RETRIEVAL_EMB_SIZE,
+			pretrained=False,
+		).to(device)
+		return model, processor, processor, tokenizer
+
 	if model_type == "clip":
 		processor = CLIPProcessor.from_pretrained(
 			CLIP_MODEL_NAME,
@@ -459,8 +799,18 @@ def _extract_features(
 	resolved_checkpoint = checkpoint_path or _default_checkpoint_for(model_type)
 	if not os.path.exists(resolved_checkpoint):
 		raise FileNotFoundError(f"Checkpoint not found: {resolved_checkpoint}")
-	print(checkpoint_path)
-	model.load_state_dict(torch.load(resolved_checkpoint, map_location="cpu"), strict=True)
+	print(resolved_checkpoint)
+	state_dict = torch.load(resolved_checkpoint, map_location="cpu")
+	if _is_sample_retrieval(model_type):
+		load_result = model.load_state_dict(state_dict, strict=False)
+		if load_result.missing_keys or load_result.unexpected_keys:
+			print(
+				"Loaded sample_retrieval checkpoint with "
+				f"missing_keys={load_result.missing_keys}, "
+				f"unexpected_keys={load_result.unexpected_keys}"
+			)
+	else:
+		model.load_state_dict(state_dict, strict=True)
 	model.eval()
 	checkpoint_for_flags = str(resolved_checkpoint)
 
@@ -495,11 +845,22 @@ def _extract_features(
 			query_inputs = batch["target_pixel_values"].to(device, non_blocking=True)
 			search_inputs = batch["search_pixel_values"].to(device, non_blocking=True)
 			input_ids = batch["input_ids"].to(device, non_blocking=True) if "wo_text" not in checkpoint_for_flags else None
-			angles = batch["angle"].to(device, non_blocking=True) if "wo_angle" not in checkpoint_for_flags else None
+			if "wo_angle" not in checkpoint_for_flags:
+				angles = batch["angle"].to(device, non_blocking=True)
+				angles_rad = torch.deg2rad(angles)
+				height = batch["height"].to(device, non_blocking=True)
+				geo = torch.cat([torch.cos(angles_rad)[..., None], torch.sin(angles_rad)[..., None], height[..., None] / 300], dim=1)
+			else:
+				geo = None
 			satellite_paths = batch["satellite_path"]
 
-			if _is_grid_encoder(model_type):
-				_, _, _, anchor_pooler, grid_feats, fused_feats = model(query_inputs, search_inputs, input_ids, angles)
+			if _is_sample_retrieval(model_type):
+				anchor_pooler, grid_feats = model(query_inputs, search_inputs)
+				fused_query_feats = F.normalize(anchor_pooler, p=2, dim=1)
+				gallery_grid_batch = F.normalize(grid_feats, p=2, dim=2)
+			elif _is_grid_encoder(model_type):
+				outputs = model(query_inputs, search_inputs, input_ids, geo)
+				_, _, _, anchor_pooler, grid_feats, fused_feats = outputs[:6]
 				# if fused_feats is None:
 				# 	fused_feats = anchor_pooler
 				fused_query_feats = F.normalize(anchor_pooler, p=2, dim=1)
@@ -588,6 +949,7 @@ def _score_recall(
 	top1 = 0
 	top5 = 0
 	top10 = 0
+	top1_success_drone_names: List[str] = []
 
 	all_indices = list(range(len(gallery_labels)))
 	error_enabled = bool((error_analysis or {}).get("run", False))
@@ -632,14 +994,17 @@ def _score_recall(
 
 		valid_queries += 1
 		top1_correct = any(idx in topk_local_indices[:1] for idx in positive_local_indices)
+		top10_correct = any(idx in topk_local_indices[:10] for idx in positive_local_indices)
 		if top1_correct:
 			top1 += 1
+			if q_idx < len(query_drone_paths):
+				top1_success_drone_names.append(_drone_image_name(query_drone_paths[q_idx]))
 		if any(idx in topk_local_indices[: min(5, k_max)] for idx in positive_local_indices):
 			top5 += 1
 		if any(idx in topk_local_indices[: min(10, k_max)] for idx in positive_local_indices):
 			top10 += 1
 
-		if error_enabled and (not top1_correct):
+		if error_enabled and (not top10_correct):
 			drone_path = query_drone_paths[q_idx] if q_idx < len(query_drone_paths) else ""
 			gt_sat_path = query_satellite_paths[q_idx] if q_idx < len(query_satellite_paths) else ""
 			pred_sat_path = (
@@ -696,6 +1061,7 @@ def _score_recall(
 		"top5_hits": top5,
 		"top10_hits": top10,
 		"top1_errors": valid_queries - top1,
+		"top1_success_drone_names": top1_success_drone_names,
 	}
 
 
@@ -710,13 +1076,17 @@ def eval(
 	num_workers: int = 8,
 	device: Optional[str] = None,
 	error_analysis: Optional[Dict[str, object]] = None,
+	output_dir: str = "/data/feihong/univerisity_dev/eval_results",
 ) -> Dict[str, float]:
 	if device is None:
 		device = "cuda:1" if torch.cuda.is_available() else "cpu"
 
+	model_type = _canonical_model_type(model_type)
 	subset_height_set = _normalize_subset(subset_heights, DEFAULT_SUBSET_HEIGHTS)
 	subset_angle_set = _normalize_subset(subset_angles, DEFAULT_SUBSET_ANGLES)
 	include_map = _load_include_map(include_file)
+	resolved_checkpoint = checkpoint_path or _default_checkpoint_for(model_type)
+	checkpoint_name = _checkpoint_parent_name(resolved_checkpoint, model_type)
 
 	print(
 		f"Evaluating {model_type} with heights={sorted(subset_height_set)} "
@@ -761,6 +1131,37 @@ def eval(
 		f"Recall@5: {metrics['top5_hits']} / {n} ({metrics['recall@5'] * 100:.2f}%)\n"
 		f"Recall@10: {metrics['top10_hits']} / {n} ({metrics['recall@10'] * 100:.2f}%)"
 	)
+
+	if output_dir:
+		result_dir = os.path.join(output_dir, f"retrieval_{checkpoint_name}")
+		os.makedirs(result_dir, exist_ok=True)
+		output_json_path = os.path.join(
+			result_dir,
+			f"eval_retrieval_{checkpoint_name}.json",
+		)
+		payload = {
+			"model_type": model_type,
+			"checkpoint_path": str(resolved_checkpoint),
+			"checkpoint_name": checkpoint_name,
+			"subset_heights": [int(h) for h in sorted(subset_height_set)],
+			"subset_angles": [int(a) for a in sorted(subset_angle_set)],
+			"candidate_size": None if candidate_size is None else int(candidate_size),
+			"include_file": include_file,
+			"metrics": metrics,
+		}
+		with open(output_json_path, "w", encoding="utf-8") as f:
+			json.dump(payload, f, ensure_ascii=False, indent=2)
+		print(f"Saved retrieval eval result to: {output_json_path}")
+
+		top1_success_txt_path = os.path.join(
+			result_dir,
+			f"eval_retrieval_{checkpoint_name}_top1_success_drone_names.txt",
+		)
+		with open(top1_success_txt_path, "w", encoding="utf-8") as f:
+			for name in metrics.get("top1_success_drone_names", []):
+				f.write(f"{name}\n")
+		print(f"Saved top1-success drone names to: {top1_success_txt_path}")
+
 	return metrics
 
 
@@ -783,60 +1184,21 @@ def eval_recall1_per_subset(
 
 	Order is row-major by sorted heights then sorted angles.
 	"""
-	if device is None:
-		device = "cuda:1" if torch.cuda.is_available() else "cpu"
+	details = _collect_recall1_per_subset_details(
+		model_type=model_type,
+		checkpoint_path=checkpoint_path,
+		subset_heights=subset_heights,
+		subset_angles=subset_angles,
+		candidate_size=candidate_size,
+		include_file=include_file,
+		batch_size=batch_size,
+		num_workers=num_workers,
+		device=device,
+		extract_features_fn=extract_features_fn,
+		score_recall_fn=score_recall_fn,
+	)
 
-	height_list = sorted(_normalize_subset(subset_heights, DEFAULT_SUBSET_HEIGHTS))
-	angle_list = sorted(_normalize_subset(subset_angles, DEFAULT_SUBSET_ANGLES))
-	include_map = _load_include_map(include_file)
-
-	extract_impl = extract_features_fn or _extract_features
-	score_impl = score_recall_fn or _score_recall
-
-	recall1_values: List[float] = []
-	per_subset: List[Dict[str, float]] = []
-	for h in height_list:
-		for a in angle_list:
-			(
-				query_feats,
-				query_labels,
-				query_drone_paths,
-				query_satellite_paths,
-				gallery_feats,
-				gallery_labels,
-				gallery_satellite_paths,
-			) = extract_impl(
-				model_type=model_type,
-				checkpoint_path=checkpoint_path,
-				device=device,
-				batch_size=batch_size,
-				num_workers=num_workers,
-				subset_heights=[h],
-				subset_angles=[a],
-			)
-
-			metrics = score_impl(
-				query_feats=query_feats,
-				query_labels=query_labels,
-				query_drone_paths=query_drone_paths,
-				query_satellite_paths=query_satellite_paths,
-				gallery_feats=gallery_feats,
-				gallery_labels=gallery_labels,
-				gallery_satellite_paths=gallery_satellite_paths,
-				include_map=include_map,
-				device=device,
-				candidate_size=candidate_size,
-				error_analysis=None,
-			)
-
-			recall1_values.append(float(metrics["recall@1"]))
-			per_subset.append(
-				{
-					"height": int(h),
-					"angle": int(a),
-					"recall@1": float(metrics["recall@1"]),
-				}
-			)
+	recall1_values = details["recall@1_values"]
 
 	if print_numbers_only:
 		for value in recall1_values:
@@ -848,13 +1210,15 @@ def eval_recall1_per_subset(
 			os.makedirs(output_dir, exist_ok=True)
 
 		payload = {
-			"model_type": model_type,
-			"checkpoint_path": checkpoint_path,
-			"subset_heights": [int(h) for h in height_list],
-			"subset_angles": [int(a) for a in angle_list],
-			"num_subsets": len(per_subset),
-			"recall@1_values": recall1_values,
-			"per_subset": per_subset,
+			"model_type": details["model_type"],
+			"checkpoint_path": details["checkpoint_path"],
+			"subset_heights": details["subset_heights"],
+			"subset_angles": details["subset_angles"],
+			"num_subsets": details["num_subsets"],
+			"recall@1_values": details["recall@1_values"],
+			"per_subset": details["per_subset"],
+			"per_height": details["per_height"],
+			"per_angle": details["per_angle"],
 		}
 
 		with open(output_json_path, "w", encoding="utf-8") as f:
@@ -864,37 +1228,170 @@ def eval_recall1_per_subset(
 	return recall1_values
 
 
+def eval_encoder_heat(
+	subset_heights: Optional[Sequence[int]] = None,
+	subset_angles: Optional[Sequence[int]] = None,
+	candidate_size: Optional[int] = None,
+	include_file: str = "/data/feihong/ckpt/include1.json",
+	batch_size: int = 16,
+	num_workers: int = 8,
+	device: Optional[str] = None,
+	output_dir: str = "/data/feihong/univerisity_dev/eval_results",
+	output_json_path: Optional[str] = None,
+	include_per_subset_recall1: bool = False,
+) -> List[Dict[str, object]]:
+	"""Evaluate Encoder_heat across multiple checkpoints.
+
+	Each checkpoint is evaluated one height at a time, while using the full
+	configured angle subset for that height.
+	"""
+	checkpoint_paths = [
+		"/data/feihong/ckpt/0.5_mix_model_heat_2/last.pth",
+		# "/data/feihong/ckpt/0.5_mix_model_wo_angle/last.pth",
+		# "/data/feihong/ckpt/0.5_mix_model_wo_text/last.pth",
+		# "/data/feihong/ckpt/0_mix_model_retrieval_only/last.pth",
+		
+	]
+
+	if device is None:
+		device = "cuda:1" if torch.cuda.is_available() else "cpu"
+
+	model_type = "encoder_heat"
+	result_model_type = "encoder_heat"
+	height_list = sorted(_normalize_subset(subset_heights, DEFAULT_SUBSET_HEIGHTS))
+	angle_list = sorted(_normalize_subset(subset_angles, DEFAULT_SUBSET_ANGLES))
+
+	results: List[Dict[str, object]] = []
+	for checkpoint_path in checkpoint_paths:
+		checkpoint_name = Path(str(checkpoint_path)).resolve().parent.name
+		per_checkpoint_output_dir = os.path.join(output_dir, f"retrieval_encoder_heat_{checkpoint_name}")
+		checkpoint_per_subset: List[Dict[str, object]] = []
+		height_results: List[Dict[str, object]] = []
+		for height in height_list:
+			recall_details = _collect_recall_metrics_per_subset_details(
+				model_type=model_type,
+				checkpoint_path=str(checkpoint_path),
+				subset_heights=[height],
+				subset_angles=angle_list,
+				candidate_size=candidate_size,
+				include_file=include_file,
+				batch_size=batch_size,
+				num_workers=num_workers,
+				device=device,
+			)
+
+			checkpoint_per_subset.extend(recall_details["per_subset"])
+
+			height_item: Dict[str, object] = {
+				"height": int(height),
+				"subset_angles": [int(a) for a in angle_list],
+				"num_subsets": int(recall_details["num_subsets"]),
+				"overall": recall_details["overall"],
+				"per_angle": recall_details["per_angle"],
+			}
+
+			if include_per_subset_recall1:
+				height_item["recall1_per_subset"] = recall_details["per_subset"]
+
+			height_results.append(height_item)
+
+		checkpoint_overall = _aggregate_recall_metrics(checkpoint_per_subset)
+		checkpoint_per_height, checkpoint_per_angle = _summarize_recall_metrics_by_axis(checkpoint_per_subset)
+
+		checkpoint_payload: Dict[str, object] = {
+			"model_type": result_model_type,
+			"checkpoint": str(checkpoint_path),
+			"checkpoint_name": checkpoint_name,
+			"subset_heights": [int(h) for h in height_list],
+			"subset_angles": [int(a) for a in angle_list],
+			"num_samples": int(checkpoint_overall["num_samples"]),
+			"overall": checkpoint_overall,
+			"per_height": height_results,
+			"per_angle": checkpoint_per_angle,
+		}
+
+		if include_per_subset_recall1:
+			checkpoint_payload["per_subset"] = checkpoint_per_subset
+
+		os.makedirs(per_checkpoint_output_dir, exist_ok=True)
+		checkpoint_json_path = os.path.join(
+			per_checkpoint_output_dir,
+			f"eval_retrieval_{checkpoint_name}_test_split.json",
+		)
+		with open(checkpoint_json_path, "w", encoding="utf-8") as f:
+			json.dump(checkpoint_payload, f, ensure_ascii=False, indent=2)
+		print(f"Saved retrieval checkpoint result to: {checkpoint_json_path}")
+
+		results.append(
+			{
+				"model_type": result_model_type,
+				"checkpoint": str(checkpoint_path),
+				"checkpoint_name": checkpoint_name,
+				"overall": checkpoint_overall,
+				"height_results": height_results,
+			}
+		)
+
+	if output_json_path:
+		output_dir = os.path.dirname(output_json_path)
+		if output_dir:
+			os.makedirs(output_dir, exist_ok=True)
+
+		payload = {
+			"model_type": result_model_type,
+			"subset_heights": [int(h) for h in height_list],
+			"subset_angles": [int(a) for a in angle_list],
+			"candidate_size": None if candidate_size is None else int(candidate_size),
+			"num_checkpoints": len(results),
+			"results": results,
+		}
+
+		with open(output_json_path, "w", encoding="utf-8") as f:
+			json.dump(payload, f, ensure_ascii=False, indent=2)
+		print(f"Saved Encoder_heat checkpoint sweep to: {output_json_path}")
+
+	return results
+
+
 
 if __name__ == "__main__":
-	model_cfg = EVAL_CONFIG["models"]
-	selected_models = [name for name, cfg in model_cfg.items() if cfg.get("run", False)]
+	other_model = False
+	if other_model:
+		model_cfg = EVAL_CONFIG["models"]
+		selected_models = [name for name, cfg in model_cfg.items() if cfg.get("run", False)]
 
-	if not selected_models:
-		raise ValueError("No model selected. Set EVAL_CONFIG['models'][name]['run'] = True.")
+		if not selected_models:
+			raise ValueError("No model selected. Set EVAL_CONFIG['models'][name]['run'] = True.")
 
 
-	for model_type in selected_models:
-		# eval(
-		#     model_type=model_type,
-		#     checkpoint_path=model_cfg[model_type].get("checkpoint"),
-		#     subset_heights=EVAL_CONFIG["subset_heights"],
-		#     subset_angles=EVAL_CONFIG["subset_angles"],
-		#     candidate_size=EVAL_CONFIG["candidate_size"],
-		#     include_file=EVAL_CONFIG["include_file"],
-		#     batch_size=EVAL_CONFIG["batch_size"],
-		#     num_workers=EVAL_CONFIG["num_workers"],
-		#     device=EVAL_CONFIG["device"],
-		# 	error_analysis=EVAL_CONFIG.get("error_analysis", None),
-		# )
-		eval_recall1_per_subset(
-			model_type=model_type,
-			checkpoint_path=model_cfg[model_type].get("checkpoint"),
-			subset_heights=EVAL_CONFIG["subset_heights"],
-			subset_angles=EVAL_CONFIG["subset_angles"],
-			candidate_size=EVAL_CONFIG["candidate_size"],
-			include_file=EVAL_CONFIG["include_file"],
-			batch_size=EVAL_CONFIG["batch_size"],
-			num_workers=EVAL_CONFIG["num_workers"],
-			device=EVAL_CONFIG["device"],
-			output_json_path=f"runs/recall1_per_subset_{model_type}.json",
-		)
+		for model_type in selected_models:
+			if other_model:
+				eval(
+					model_type=model_type,
+					checkpoint_path=model_cfg[model_type].get("checkpoint"),
+					subset_heights=EVAL_CONFIG["subset_heights"],
+					subset_angles=EVAL_CONFIG["subset_angles"],
+					candidate_size=EVAL_CONFIG["candidate_size"],
+					include_file=EVAL_CONFIG["include_file"],
+					batch_size=EVAL_CONFIG["batch_size"],
+					num_workers=EVAL_CONFIG["num_workers"],
+					device=EVAL_CONFIG["device"],
+					error_analysis=EVAL_CONFIG.get("error_analysis", None),
+				)
+			else:
+				ckp = model_cfg[model_type].get("checkpoint")
+				name = ckp.split("/")[-2]
+				eval_recall1_per_subset(
+					model_type=model_type,
+					checkpoint_path=model_cfg[model_type].get("checkpoint"),
+					subset_heights=EVAL_CONFIG["subset_heights"],
+					subset_angles=EVAL_CONFIG["subset_angles"],
+					candidate_size=EVAL_CONFIG["candidate_size"],
+					include_file=EVAL_CONFIG["include_file"],
+					batch_size=EVAL_CONFIG["batch_size"],
+					num_workers=EVAL_CONFIG["num_workers"],
+					device=EVAL_CONFIG["device"],
+					output_json_path=f"runs/recall1_per_subset_{name}.json",
+				)
+	else:
+		eval_encoder_heat(candidate_size=100)

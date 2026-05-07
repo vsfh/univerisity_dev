@@ -211,3 +211,4 @@ runs/
 *.png
 *.npz
 *.pt
+.codex

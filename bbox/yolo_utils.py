@@ -109,6 +109,104 @@ class BasicTransformerBlock(nn.Module):
         x = self.ff(self.norm3(x)) + x
         return x
 
+class MixedAttention(nn.Module):
+    """
+    Jointly calculates attention over the concatenated sequence of Context + Image.
+    """
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
+        super().__init__()
+        inner_dim = dim_head * heads
+        self.heads = heads
+        self.scale = dim_head**-0.5
+
+        # Single projection for the mixed sequence
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim), 
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x, context=None, mask=None):
+        b, n, d = x.shape
+        
+        # 1. Concatenate context and x into a single mixed sequence
+        if exists(context):
+            m = context.shape[1]
+            tokens = torch.cat([context, x], dim=1)  # Shape: [b, m+n, d]
+        else:
+            m = 0
+            tokens = x
+
+        h = self.heads
+
+        # 2. Joint QKV projection
+        qkv = self.to_qkv(tokens).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> (b h) n d", h=h), qkv)
+
+        # 3. Calculate Mixed Attention
+        sim = einsum("b i d, b j d -> b i j", q, k) * self.scale
+
+        if exists(mask):
+            # Pad the context mask with True for the 'x' tokens (image tokens shouldn't be masked)
+            mask = rearrange(mask, "b ... -> b (...)")
+            mask_x = torch.ones((b, n), device=mask.device, dtype=torch.bool)
+            mixed_mask = torch.cat([mask, mask_x], dim=1)
+            
+            max_neg_value = -torch.finfo(sim.dtype).max
+            mixed_mask = repeat(mixed_mask, "b j -> (b h) () j", h=h)
+            sim.masked_fill_(~mixed_mask, max_neg_value)
+
+        attn = sim.softmax(dim=-1)
+
+        # 4. Gather and project out
+        out = einsum("b i j, b j d -> b i d", attn, v)
+        out = rearrange(out, "(b h) n d -> b n (h d)", h=h)
+        out = self.to_out(out)
+
+        # 5. Split them back up so both context and x can be updated residually
+        if exists(context):
+            context_out, x_out = out[:, :m], out[:, m:]
+            return x_out, context_out
+        
+        return out, None
+
+
+class MixFormerBlock(nn.Module):
+    def __init__(self, dim, n_heads, d_head, dropout=0.0):
+        super().__init__()
+        self.mixed_attn = MixedAttention(
+            dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout
+        )
+        
+        # LayerNorms and FFNs for both image tokens (x) and context tokens
+        self.norm1_x = nn.LayerNorm(dim)
+        self.norm1_c = nn.LayerNorm(dim)
+        
+        self.ff_x = FeedForward(dim, dropout=dropout)
+        self.ff_c = FeedForward(dim, dropout=dropout)
+        
+        self.norm2_x = nn.LayerNorm(dim)
+        self.norm2_c = nn.LayerNorm(dim)
+
+    def forward(self, x, context=None, mask=None):
+        # 1. Joint Attention Phase
+        norm_x = self.norm1_x(x)
+        norm_c = self.norm1_c(context) if exists(context) else None
+
+        attn_x, attn_c = self.mixed_attn(norm_x, context=norm_c, mask=mask)
+        
+        # Residual connections
+        x = x + attn_x
+        if exists(context):
+            context = context + attn_c
+
+        # 2. Independent FeedForward Phase
+        x = self.ff_x(self.norm2_x(x)) + x
+        if exists(context):
+            context = self.ff_c(self.norm2_c(context)) + context
+
+        return x, context
 
 class SpatialTransformer(nn.Module):
     def __init__(
@@ -122,11 +220,15 @@ class SpatialTransformer(nn.Module):
         self.proj_in = nn.Conv2d(
             in_channels, inner_dim, kernel_size=1, stride=1, padding=0
         )
+        self.context_proj = nn.Linear(context_dim, inner_dim)
 
         self.transformer_blocks = nn.ModuleList(
             [
-                BasicTransformerBlock(
-                    inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim
+                # BasicTransformerBlock(
+                #     inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim
+                # )
+                MixFormerBlock(
+                    inner_dim, n_heads, d_head, dropout=dropout
                 )
                 for _ in range(depth)
             ]
@@ -136,14 +238,26 @@ class SpatialTransformer(nn.Module):
             nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0)
         )
 
+    # def forward(self, x, context=None):
+    #     b, c, h, w = x.shape
+    #     x_in = x
+    #     x = self.norm(x)
+    #     x = self.proj_in(x)
+    #     x = rearrange(x, "b c h w -> b (h w) c").contiguous()
+    #     for block in self.transformer_blocks:
+    #         x = block(x, context=context)
+    #     x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w).contiguous()
+    #     x = self.proj_out(x)
+    #     return x + x_in
     def forward(self, x, context=None):
         b, c, h, w = x.shape
         x_in = x
         x = self.norm(x)
         x = self.proj_in(x)
+        context = self.context_proj(context)
         x = rearrange(x, "b c h w -> b (h w) c").contiguous()
         for block in self.transformer_blocks:
-            x = block(x, context=context)
+            x, context = block(x, context=context)
         x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w).contiguous()
         x = self.proj_out(x)
         return x + x_in
@@ -267,7 +381,14 @@ def build_target(ori_gt_bboxes, anchors_full, image_wh, grid_wh):
     return torch.cat((gxy - gij, twh), 1), torch.cat((best_anchor.unsqueeze(1), gij), 1)
 
 
-def yolo_loss(predictions, gt_bboxes, anchors_full, best_anchor_gi_gj, image_wh):
+def yolo_loss(
+    predictions,
+    gt_bboxes,
+    anchors_full,
+    best_anchor_gi_gj,
+    image_wh,
+    confidence_loss_type="legacy_ce",
+):
     if isinstance(image_wh, (tuple, list)):
         image_w, image_h = float(image_wh[0]), float(image_wh[1])
     else:
@@ -286,7 +407,6 @@ def yolo_loss(predictions, gt_bboxes, anchors_full, best_anchor_gi_gj, image_wh)
     scaled_anchors[:, 0] = scaled_anchors[:, 0] / stride_x
     scaled_anchors[:, 1] = scaled_anchors[:, 1] / stride_y
     mseloss = torch.nn.MSELoss(reduction='mean')
-    celoss_confidence = torch.nn.CrossEntropyLoss(reduction='mean')
     #celoss_cls = torch.nn.CrossEntropyLoss(size_average=True)
 
     batch_indices = torch.arange(batch_size, device=predictions.device)
@@ -308,9 +428,26 @@ def yolo_loss(predictions, gt_bboxes, anchors_full, best_anchor_gi_gj, image_wh)
     pred_confidences = predictions[:,:,4,:,:]
     gt_confidences = torch.zeros_like(pred_confidences)
     gt_confidences[batch_indices, best_anchor, gj, gi] = 1
-    pred_confidences, gt_confidences = pred_confidences.reshape(batch_size, -1), \
-                    gt_confidences.reshape(batch_size, -1)
-    loss_confidence = celoss_confidence(pred_confidences, gt_confidences.max(1)[1])
+    if confidence_loss_type == "legacy_ce":
+        pred_confidences, gt_confidences = pred_confidences.reshape(batch_size, -1), \
+                        gt_confidences.reshape(batch_size, -1)
+        loss_confidence = F.cross_entropy(pred_confidences, gt_confidences.max(1)[1])
+    elif confidence_loss_type == "balanced_bce":
+        # A single positive cell is otherwise diluted by all anchors/cells. Train
+        # objectness as separate positive/negative BCE terms so the target cell
+        # receives a strong gradient.
+        pos_mask = gt_confidences.bool()
+        neg_mask = ~pos_mask
+        confidence_bce = F.binary_cross_entropy_with_logits(
+            pred_confidences,
+            gt_confidences,
+            reduction="none",
+        )
+        loss_confidence_pos = confidence_bce[pos_mask].mean()
+        loss_confidence_neg = confidence_bce[neg_mask].mean()
+        loss_confidence = loss_confidence_pos + 0.25 * loss_confidence_neg
+    else:
+        raise ValueError(f"Unknown confidence_loss_type: {confidence_loss_type}")
 
     return loss_bbox, loss_confidence
 

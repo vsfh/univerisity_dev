@@ -1,4 +1,5 @@
 # --- Configuration ---
+import argparse
 import os
 import json
 import random
@@ -22,9 +23,9 @@ from tqdm import tqdm
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 from transformers import AutoImageProcessor, AutoModel, AutoTokenizer
-from clearml import Task, Logger
+import yaml
 
-from model import Encoder_text_angle, Encoder_abla
+from model import Encoder_text_angle, Encoder_abla, Encoder_heat
 from bbox.yolo_utils import (
     get_tensor_anchors,
     build_target,
@@ -40,7 +41,7 @@ torch.backends.cudnn.allow_tf32 = True
 
 # --- Configuration ---
 class Config:
-    CLEARML_ENABLED = True
+    CLEARML_ENABLED = False
     CLEARML_PROJECT = "unified_siglip"
     CLEARML_TASK_NAME = None
     MODEL_NAME = "google/siglip-base-patch16-224"
@@ -58,13 +59,13 @@ class Config:
     # UNIV_SAT_SIZE = (640, 640)
     DRONE_SIZE = (256, 256)
 
-    NUM_EPOCHS = 8
-    BATCH_SIZE = 8
+    NUM_EPOCHS = 16
+    BATCH_SIZE = 16
     GRAD_ACCUMULATION_STEPS = 2
     LEARNING_RATE = 5e-5
     LR_MIN = 1e-10
-    COSINE_EPOCHS = 16
-    BBOX_LOSS_WEIGHT = 0.1
+    COSINE_EPOCHS = NUM_EPOCHS
+    BBOX_LOSS_WEIGHT = 0.5
     HEADING_LOSS_WEIGHT = 0.01
     PROJECTION_DIM = 768
 
@@ -78,9 +79,103 @@ class Config:
 
     USE_AMP = True
     ENABLE_TF32 = True
-    USE_ANGLE_INPUT = False
+    USE_ANGLE_INPUT = True
     USE_TEXT_INPUT = True
+    ENCODER_TYPE = "heat"  # text_angle | heat
     OPTIMIZE_OBJECTIVE = "combined"  # combined | img_text_only | bbox_only
+    USE_HEATMAP_LOSS = True
+    HEATMAP_LOSS_WEIGHT = 0.2
+    HEATMAP_LOSS_TYPE = "spatial_ce"  # spatial_ce | weighted_bce
+    HEATMAP_SIGMA = 1.5
+    HEATMAP_POS_WEIGHT = 8.0
+    HEATMAP_CONFIDENCE_WEIGHT = 0.5
+    HEATMAP_VIS_MAX_SAMPLES = 10
+
+
+def config_to_dict() -> Dict[str, Any]:
+    return {
+        key: getattr(Config, key)
+        for key in dir(Config)
+        if key.isupper() and not key.startswith("__")
+    }
+
+
+def apply_config_overrides(overrides: Optional[Dict[str, Any]]) -> None:
+    if not overrides:
+        return
+
+    unknown_keys = [key for key in overrides if not hasattr(Config, key)]
+    if unknown_keys:
+        raise KeyError(
+            "Unknown Config override(s): "
+            + ", ".join(sorted(str(key) for key in unknown_keys))
+        )
+
+    for key, value in overrides.items():
+        current_value = getattr(Config, key)
+        if isinstance(current_value, tuple) and isinstance(value, list):
+            value = tuple(value)
+        setattr(Config, key, value)
+
+    if "NUM_EPOCHS" in overrides and "COSINE_EPOCHS" not in overrides:
+        Config.COSINE_EPOCHS = Config.NUM_EPOCHS
+
+
+def load_experiment_from_yaml(
+    yaml_path: Optional[str],
+    experiment_name: Optional[str],
+) -> Dict[str, Any]:
+    if not yaml_path:
+        return {}
+
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        payload = yaml.safe_load(f) or {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"YAML root must be a mapping: {yaml_path}")
+
+    defaults = payload.get("defaults", {}) or {}
+    if not isinstance(defaults, dict):
+        raise ValueError("YAML 'defaults' must be a mapping when provided.")
+
+    experiments = payload.get("experiments")
+    if experiments is None:
+        selected = payload
+    else:
+        if not isinstance(experiments, list):
+            raise ValueError("YAML 'experiments' must be a list.")
+        if not experiments:
+            raise ValueError("YAML 'experiments' is empty.")
+
+        if experiment_name is None:
+            if len(experiments) != 1:
+                raise ValueError(
+                    "YAML contains multiple experiments; pass --experiment NAME."
+                )
+            selected = experiments[0]
+        else:
+            matches = [
+                item
+                for item in experiments
+                if str(item.get("name", item.get("exp_name", ""))) == experiment_name
+            ]
+            if not matches:
+                raise ValueError(
+                    f"Experiment '{experiment_name}' not found in {yaml_path}."
+                )
+            selected = matches[0]
+
+    if not isinstance(selected, dict):
+        raise ValueError("Selected experiment must be a mapping.")
+
+    merged = dict(defaults)
+    merged.update(selected)
+
+    default_config = defaults.get("config", {}) or {}
+    selected_config = selected.get("config", {}) or {}
+    if not isinstance(default_config, dict) or not isinstance(selected_config, dict):
+        raise ValueError("'config' entries in YAML must be mappings.")
+    merged["config"] = {**default_config, **selected_config}
+    return merged
 
 
 # --- Utility Functions ---
@@ -132,6 +227,193 @@ def get_loss_weights(
     bbox_weight = (end_num - 0.5) * progress + 0.5
     retrieval_weight = 1.0 - bbox_weight
     return bbox_weight, retrieval_weight
+
+
+def build_geo_features(batch: Dict, device: torch.device) -> Optional[torch.Tensor]:
+    if not Config.USE_ANGLE_INPUT:
+        return None
+
+    angles = batch["angle"].to(device, non_blocking=True).float()
+    angles_rad = torch.deg2rad(angles)
+    height = batch["height"].to(device, non_blocking=True).float()
+    return torch.cat(
+        [
+            torch.cos(angles_rad)[..., None],
+            torch.sin(angles_rad)[..., None],
+            height[..., None] / 300.0,
+        ],
+        dim=1,
+    )
+
+
+def unpack_model_outputs(outputs: Tuple) -> Tuple[
+    torch.Tensor,
+    Any,
+    Optional[torch.Tensor],
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
+    if len(outputs) == 6:
+        pred_anchor, aux, text_feats, anchor_feats, grid_feats, fused_feats = outputs
+        return pred_anchor, aux, text_feats, anchor_feats, grid_feats, fused_feats, None
+    if len(outputs) == 7:
+        pred_anchor, aux, text_feats, anchor_feats, grid_feats, fused_feats, heatmap = outputs
+        return pred_anchor, aux, text_feats, anchor_feats, grid_feats, fused_feats, heatmap
+    raise ValueError(f"Unexpected model output length: {len(outputs)}")
+
+
+def build_heatmap_target(
+    target_bbox: torch.Tensor,
+    heatmap_hw: Tuple[int, int],
+    image_wh: Tuple[int, int],
+    sigma: float,
+) -> torch.Tensor:
+    grid_h, grid_w = int(heatmap_hw[0]), int(heatmap_hw[1])
+    image_w, image_h = float(image_wh[0]), float(image_wh[1])
+    device = target_bbox.device
+    dtype = target_bbox.dtype
+
+    center_x = (target_bbox[:, 0] + target_bbox[:, 2]) * 0.5 / max(image_w, 1.0) * grid_w
+    center_y = (target_bbox[:, 1] + target_bbox[:, 3]) * 0.5 / max(image_h, 1.0) * grid_h
+    center_x = center_x.clamp(0.0, grid_w - 1e-6)
+    center_y = center_y.clamp(0.0, grid_h - 1e-6)
+
+    ys = torch.arange(grid_h, device=device, dtype=dtype).view(1, grid_h, 1)
+    xs = torch.arange(grid_w, device=device, dtype=dtype).view(1, 1, grid_w)
+    dx2 = (xs - center_x.view(-1, 1, 1)) ** 2
+    dy2 = (ys - center_y.view(-1, 1, 1)) ** 2
+    target = torch.exp(-(dx2 + dy2) / (2.0 * max(float(sigma), 1e-6) ** 2))
+    return target.unsqueeze(1).clamp(0.0, 1.0)
+
+
+def heatmap_loss_fn(heatmap_logits: torch.Tensor, target_bbox: torch.Tensor) -> torch.Tensor:
+    heatmap_target = build_heatmap_target(
+        target_bbox=target_bbox,
+        heatmap_hw=heatmap_logits.shape[-2:],
+        image_wh=(Config.UNIV_SAT_SIZE["width"], Config.UNIV_SAT_SIZE["height"]),
+        sigma=Config.HEATMAP_SIGMA,
+    )
+    if Config.HEATMAP_LOSS_TYPE == "spatial_ce":
+        logits = heatmap_logits.float().flatten(1)
+        target = heatmap_target.float().flatten(1)
+        target = target / target.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        return -(target * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
+
+    if Config.HEATMAP_LOSS_TYPE != "weighted_bce":
+        raise ValueError(
+            f"Invalid HEATMAP_LOSS_TYPE={Config.HEATMAP_LOSS_TYPE}. "
+            "Choose 'spatial_ce' or 'weighted_bce'."
+        )
+
+    loss = F.binary_cross_entropy_with_logits(
+        heatmap_logits.float(),
+        heatmap_target.float(),
+        reduction="none",
+    )
+    weight = 1.0 + heatmap_target.float() * (Config.HEATMAP_POS_WEIGHT - 1.0)
+    return (loss * weight).mean()
+
+
+def add_heatmap_to_confidence(
+    pred_anchor: torch.Tensor,
+    heatmap_logits: Optional[torch.Tensor],
+) -> torch.Tensor:
+    if (
+        heatmap_logits is None
+        or Config.ENCODER_TYPE != "heat"
+        or Config.HEATMAP_CONFIDENCE_WEIGHT <= 0.0
+    ):
+        return pred_anchor
+
+    if heatmap_logits.shape[-2:] != pred_anchor.shape[-2:]:
+        heatmap_logits = F.interpolate(
+            heatmap_logits,
+            size=pred_anchor.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+
+    heatmap_logits = heatmap_logits.detach().to(dtype=pred_anchor.dtype)
+    heat_confidence = Config.HEATMAP_CONFIDENCE_WEIGHT * heatmap_logits.unsqueeze(1)
+    return torch.cat(
+        [
+            pred_anchor[:, :, :4, :, :],
+            pred_anchor[:, :, 4:5, :, :] + heat_confidence,
+        ],
+        dim=2,
+    )
+
+
+def _normalize_heatmap_for_writer(heatmap: torch.Tensor) -> torch.Tensor:
+    heatmap = heatmap.detach().float()
+    heatmap_min = heatmap.amin(dim=(-2, -1), keepdim=True)
+    heatmap_max = heatmap.amax(dim=(-2, -1), keepdim=True)
+    return (heatmap - heatmap_min) / (heatmap_max - heatmap_min).clamp_min(1e-6)
+
+
+def _colorize_heatmap_for_writer(heatmap: torch.Tensor) -> torch.Tensor:
+    heatmap = heatmap.clamp(0.0, 1.0)
+    red = heatmap
+    green = torch.zeros_like(heatmap)
+    blue = 1.0 - heatmap
+    return torch.cat([red, green, blue], dim=1)
+
+
+def log_heatmap_images(
+    writer: Optional[SummaryWriter],
+    heatmap_logits: Optional[torch.Tensor],
+    target_bbox: Optional[torch.Tensor],
+    epoch: int,
+) -> None:
+    if writer is None or heatmap_logits is None or target_bbox is None:
+        return
+
+    max_samples = min(Config.HEATMAP_VIS_MAX_SAMPLES, heatmap_logits.shape[0])
+    if max_samples <= 0:
+        return
+
+    pred_heatmap = heatmap_logits[:max_samples]
+    target_bbox = target_bbox[:max_samples]
+    target_heatmap = build_heatmap_target(
+        target_bbox=target_bbox,
+        heatmap_hw=pred_heatmap.shape[-2:],
+        image_wh=(Config.UNIV_SAT_SIZE["width"], Config.UNIV_SAT_SIZE["height"]),
+        sigma=Config.HEATMAP_SIGMA,
+    )
+
+    pred_vis = _colorize_heatmap_for_writer(
+        _normalize_heatmap_for_writer(pred_heatmap)
+    ).cpu()
+    target_vis = _colorize_heatmap_for_writer(
+        target_heatmap.detach().float()
+    ).cpu()
+    side_by_side = torch.cat([pred_vis, target_vis], dim=-1)
+
+    writer.add_images("Heatmap/pred", pred_vis, epoch)
+    writer.add_images("Heatmap/target", target_vis, epoch)
+    writer.add_images("Heatmap/pred_target", side_by_side, epoch)
+
+
+def build_encoder(use_ap: bool, usesg: bool = True) -> nn.Module:
+    if Config.ENCODER_TYPE == "text_angle":
+        return Encoder_text_angle(
+            model_name=Config.MODEL_NAME,
+            proj_dim=Config.PROJECTION_DIM,
+            usesg=usesg,
+            useap=use_ap,
+        )
+    if Config.ENCODER_TYPE == "heat":
+        return Encoder_heat(
+            model_name=Config.MODEL_NAME,
+            proj_dim=Config.PROJECTION_DIM,
+            usesg=usesg,
+            useap=use_ap,
+        )
+    raise ValueError(
+        f"Invalid ENCODER_TYPE={Config.ENCODER_TYPE}. Choose 'text_angle' or 'heat'."
+    )
 
 
 def visualize_batch(
@@ -249,14 +531,22 @@ def validate(
             if Config.USE_TEXT_INPUT
             else None
         )
-        local_indices = batch["index"].to(accelerator.device, non_blocking=True)
-        angles = (
-            batch["angle"].to(accelerator.device, non_blocking=True)
-            if Config.USE_ANGLE_INPUT
+        attention_mask = (
+            batch["attention_mask"].to(accelerator.device, non_blocking=True)
+            if Config.USE_TEXT_INPUT and "attention_mask" in batch
             else None
         )
+        local_indices = batch["index"].to(accelerator.device, non_blocking=True)
+        geo = build_geo_features(batch, accelerator.device)
 
         with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
+            outputs = model(
+                query_imgs,
+                rs_imgs,
+                input_ids,
+                geo,
+                attention_mask=attention_mask,
+            )
             (
                 pred_anchor,
                 _,
@@ -264,12 +554,14 @@ def validate(
                 anchor_feats,
                 grid_feats,
                 fused_feats,
-            ) = model(query_imgs, rs_imgs, input_ids, angles)
+                heatmap_logits,
+            ) = unpack_model_outputs(outputs)
 
         B = pred_anchor.shape[0]
         pred_anchor = pred_anchor.view(
             B, 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
         )
+        pred_anchor = add_heatmap_to_confidence(pred_anchor, heatmap_logits)
 
         _, best_anchor_gi_gj = build_target(
             ori_gt_bbox,
@@ -396,6 +688,8 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     clearml_task = None
     clearml_logger = None
     if Config.CLEARML_ENABLED and accelerator.is_main_process:
+        from clearml import Task
+
         task_name = Config.CLEARML_TASK_NAME or exp_name
         clearml_task = Task.init(
             project_name=Config.CLEARML_PROJECT,
@@ -430,15 +724,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     )
     tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
 
-    # model = Encoder_heading(
-    #     model_name=Config.MODEL_NAME, proj_dim=Config.PROJECTION_DIM
-    # )
-    model = Encoder_text_angle(
-        model_name=Config.MODEL_NAME,
-        proj_dim=Config.PROJECTION_DIM,
-        usesg=True,
-        useap=use_ap,
-    )
+    model = build_encoder(use_ap, usesg=Config.OPTIMIZE_OBJECTIVE != "bbox_only")
     # model = Encoder_dino()
 
     anchors_full = get_tensor_anchors(accelerator.device)
@@ -494,6 +780,9 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         model.train()
         total_loss = 0
         total_bbox_loss = 0
+        total_heatmap_loss = 0
+        last_heatmap_logits = None
+        last_target_bbox = None
         progress_bar = tqdm(
             train_dataloader,
             desc=f"Epoch {epoch + 1}/{Config.NUM_EPOCHS}",
@@ -513,17 +802,25 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     if Config.USE_TEXT_INPUT
                     else None
                 )
+                attention_mask = (
+                    batch["attention_mask"].to(accelerator.device, non_blocking=True)
+                    if Config.USE_TEXT_INPUT and "attention_mask" in batch
+                    else None
+                )
                 local_indices = batch["index"].to(
                     accelerator.device, non_blocking=True
                 )
                 target_bbox = batch["bbox"].to(accelerator.device, non_blocking=True)
-                angles = (
-                    batch["angle"].to(accelerator.device, non_blocking=True)
-                    if Config.USE_ANGLE_INPUT
-                    else None
-                )
+                geo = build_geo_features(batch, accelerator.device)
 
                 with torch.amp.autocast("cuda", enabled=amp_enabled):
+                    outputs = model(
+                        target_pixel_values,
+                        search_pixel_values,
+                        input_ids,
+                        geo,
+                        attention_mask=attention_mask,
+                    )
                     (
                         pred_anchor,
                         _,
@@ -531,12 +828,14 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                         anchor_feats,
                         grid_feats,
                         fused_feats,
-                    ) = model(target_pixel_values, search_pixel_values, input_ids, angles)
+                        heatmap_logits,
+                    ) = unpack_model_outputs(outputs)
 
                     B = pred_anchor.shape[0]
                     pred_anchor = pred_anchor.view(
                         B, 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
                     )
+                    pred_anchor = add_heatmap_to_confidence(pred_anchor, heatmap_logits)
 
                     new_gt_bbox, best_anchor_gi_gj = build_target(
                         target_bbox,
@@ -553,6 +852,19 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                         (Config.UNIV_SAT_SIZE["width"], Config.UNIV_SAT_SIZE["height"]),
                     )
                     bbox_loss = loss_geo + loss_cls
+                    if (
+                        Config.USE_HEATMAP_LOSS
+                        and Config.ENCODER_TYPE == "heat"
+                        and heatmap_logits is not None
+                    ):
+                        heatmap_loss = heatmap_loss_fn(heatmap_logits, target_bbox)
+                        bbox_loss = bbox_loss + Config.HEATMAP_LOSS_WEIGHT * heatmap_loss
+                    else:
+                        heatmap_loss = bbox_loss.new_zeros(())
+
+                    if heatmap_logits is not None:
+                        last_heatmap_logits = heatmap_logits.detach()
+                        last_target_bbox = target_bbox.detach()
 
                     candidate_feats = grid_feats.reshape(-1, Config.PROJECTION_DIM)
                     positive_indices = torch.zeros(B, B * 9, device=accelerator.device)
@@ -584,27 +896,25 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                         anchor_feats, candidate_feats, positive_indices
                     )
                     if input_ids is not None and text_feats is not None:
-                        text_loss = info_nce_loss(
-                            text_feats, candidate_feats, positive_indices
-                        )
-                        img_text_loss += 0.2 * text_loss
+                        text_loss = info_nce_loss(text_feats, candidate_feats.detach(), positive_indices)
+                        img_text_loss = img_text_loss + 0.02 * text_loss
 
 
-                    scheduled_bbox_weight, scheduled_retrieval_weight = get_loss_weights(
-                        epoch, Config.COSINE_EPOCHS, end_num
-                    )
+                    # scheduled_bbox_weight, scheduled_retrieval_weight = get_loss_weights(
+                    #     epoch, Config.COSINE_EPOCHS, end_num
+                    # )
                     if Config.OPTIMIZE_OBJECTIVE == "combined":
-                        bbox_weight = scheduled_bbox_weight
-                        retrieval_weight = scheduled_retrieval_weight
+                        bbox_weight = end_num
+                        retrieval_weight = 1 - end_num
                         loss = retrieval_weight * img_text_loss + bbox_weight * bbox_loss
                     elif Config.OPTIMIZE_OBJECTIVE == "img_text_only":
                         bbox_weight = 0.0
                         retrieval_weight = 1.0
                         loss = img_text_loss
                     else:  # bbox_only
-                        bbox_weight = 1.0
-                        retrieval_weight = 0.0
-                        loss = bbox_loss
+                        bbox_weight = 0.99
+                        retrieval_weight = 0.01
+                        loss = retrieval_weight * img_text_loss + bbox_weight * bbox_loss
 
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
@@ -613,26 +923,56 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 
             total_loss += loss.item()
             total_bbox_loss += bbox_loss.item()
+            total_heatmap_loss += heatmap_loss.item()
+            global_step = epoch * len(train_dataloader) + i
             progress_bar.set_postfix(
                 {
                     "bbox_loss": f"{bbox_loss.item():.4f}",
+                    "heatmap_loss": f"{heatmap_loss.item():.4f}",
                     "img_text_loss": f"{img_text_loss.item():.4f}",
                     "retrieval_weight": f"{retrieval_weight:.4f}",
                     "bbox_weight": f"{bbox_weight:.4f}",
                 }
             )
 
+            if writer is not None:
+                writer.add_scalar("Loss/train_step", loss.item(), global_step)
+                writer.add_scalar("Loss/bbox_step", bbox_loss.item(), global_step)
+                writer.add_scalar("Loss/bbox_geo_step", loss_geo.item(), global_step)
+                writer.add_scalar("Loss/bbox_cls_step", loss_cls.item(), global_step)
+                writer.add_scalar("Loss/heatmap_step", heatmap_loss.item(), global_step)
+                writer.add_scalar("Loss/img_text_step", img_text_loss.item(), global_step)
+                writer.add_scalar("Weight/retrieval", retrieval_weight, global_step)
+                writer.add_scalar("Weight/bbox", bbox_weight, global_step)
+
             if clearml_logger is not None:
-                global_step = epoch * len(train_dataloader) + i
                 clearml_logger.report_scalar("train", "loss", loss.item(), global_step)
                 clearml_logger.report_scalar(
                     "train", "bbox_loss", bbox_loss.item(), global_step
+                )
+                clearml_logger.report_scalar(
+                    "train", "heatmap_loss", heatmap_loss.item(), global_step
                 )
                 clearml_logger.report_scalar(
                     "train", "img_text_loss", img_text_loss.item(), global_step
                 )
 
         scheduler.step()
+
+        if writer is not None:
+            writer.add_scalar("Loss/train_epoch", total_loss / len(train_dataloader), epoch)
+            writer.add_scalar(
+                "Loss/bbox_epoch",
+                total_bbox_loss / len(train_dataloader),
+                epoch,
+            )
+            writer.add_scalar(
+                "Loss/heatmap_epoch",
+                total_heatmap_loss / len(train_dataloader),
+                epoch,
+            )
+            writer.add_scalar("lr/learning_rate", optimizer.param_groups[0]["lr"], epoch)
+            log_heatmap_images(writer, last_heatmap_logits, last_target_bbox, epoch)
 
         if epoch % 2 == 0:
             os.makedirs(save_path, exist_ok=True)
@@ -688,11 +1028,110 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train unified SigLIP grounding/retrieval model."
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="YAML file with defaults/config and optional experiments list.",
+    )
+    parser.add_argument(
+        "--experiment",
+        type=str,
+        default=None,
+        help="Experiment name to select from YAML experiments list.",
+    )
+    parser.add_argument(
+        "--exp-name",
+        type=str,
+        default=None,
+        help="Experiment name used for checkpoint/log directory.",
+    )
+    parser.add_argument(
+        "--save-root",
+        type=str,
+        default="/data/feihong/ckpt",
+        help="Root directory for checkpoints when --save-dir is not set.",
+    )
+    parser.add_argument(
+        "--save-dir",
+        type=str,
+        default=None,
+        help="Full checkpoint directory. Overrides --save-root/--exp-name.",
+    )
+    parser.add_argument(
+        "--end-num",
+        type=float,
+        default=None,
+        help="Final/static bbox loss weight used by train().",
+    )
+    parser.add_argument(
+        "--use-ap",
+        dest="use_ap",
+        action="store_true",
+        default=None,
+        help="Use attention-pooling retrieval branch.",
+    )
+    parser.add_argument(
+        "--no-use-ap",
+        dest="use_ap",
+        action="store_false",
+        help="Disable attention-pooling retrieval branch.",
+    )
+    return parser.parse_args()
+
+
+def resolve_run_settings(args: argparse.Namespace) -> Tuple[str, str, float, bool]:
+    yaml_exp = load_experiment_from_yaml(args.config, args.experiment)
+    apply_config_overrides(yaml_exp.get("config", {}))
+
+    end_num = (
+        float(args.end_num)
+        if args.end_num is not None
+        else float(yaml_exp.get("end_num", 0.5))
+    )
+    exp_name = (
+        args.exp_name
+        or yaml_exp.get("exp_name")
+        or yaml_exp.get("name")
+        or f"{end_num}_mix_model_heat_2"
+    )
+    exp_name = str(exp_name)
+
+    use_ap = bool(yaml_exp.get("use_ap", True))
+    if args.use_ap is not None:
+        use_ap = bool(args.use_ap)
+
+    save_root = str(yaml_exp.get("save_root", args.save_root))
+    save_dir = args.save_dir or yaml_exp.get("save_dir")
+    if save_dir is None:
+        save_dir = os.path.join(save_root, exp_name)
+    save_dir = str(save_dir)
+
+    return exp_name, save_dir, end_num, use_ap
+
+
+def write_effective_config(save_dir: str, exp_name: str, end_num: float, use_ap: bool) -> None:
+    payload = {
+        "exp_name": exp_name,
+        "save_dir": save_dir,
+        "end_num": float(end_num),
+        "use_ap": bool(use_ap),
+        "config": _to_clearml_serializable(config_to_dict()),
+    }
+    out_path = os.path.join(save_dir, "effective_config.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True, ensure_ascii=False)
+    print(f"Saved effective config: {out_path}")
+
+
 # --- Main ---
 if __name__ == "__main__":
-    end_num = 0.1
-    exp_name = f"{end_num}_wo_angle"
-    save_dir = f"/data/feihong/ckpt/{exp_name}"
+    args = parse_args()
+    exp_name, save_dir, end_num, use_ap = resolve_run_settings(args)
 
     if os.path.exists(save_dir):
         print(f"Experiment directory '{save_dir}' already exists.")
@@ -701,4 +1140,9 @@ if __name__ == "__main__":
         os.makedirs(save_dir, exist_ok=True)
         print(f"Created experiment directory: {save_dir}")
 
-    train(save_dir, end_num, use_ap=True)
+    write_effective_config(save_dir, exp_name, end_num, use_ap)
+    print(
+        f"Starting experiment '{exp_name}' with end_num={end_num}, "
+        f"use_ap={use_ap}, save_dir={save_dir}"
+    )
+    train(save_dir, end_num, use_ap=use_ap)

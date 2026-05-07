@@ -203,13 +203,12 @@ class TROGeoLite(nn.Module):
 class SampleGeoLite(nn.Module):
     """Simplified TROGeo without click point input for direct bbox regression."""
 
-    def __init__(self, emb_size=1024):
+    def __init__(self, emb_size=1024, pretrained=True):
         super(SampleGeoLite, self).__init__()
 
         model_name = "convnext_base.fb_in22k_ft_in1k_384"
-        base_model = timm.create_model(model_name, pretrained=True, num_classes=0)
-        self.query_model = base_model
-        self.reference_model = base_model
+        self.query_model = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        self.reference_model = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
 
         self.cross_attention = SpatialTransformer(
             in_channels=emb_size, n_heads=12, d_head=64, depth=1, context_dim=emb_size
@@ -370,8 +369,8 @@ class DetGeoLite(nn.Module):
     def __init__(
         self,
         emb_size=512,
-        config_path="/data/feihong/univerisity_dev/runs/yolov3_rs.cfg",
-        weights_path="/data/feihong/univerisity_dev/runs/yolov3.weights",
+        config_path="/data/feihong/ckpt/yolov3_rs.cfg",
+        weights_path="/data/feihong/ckpt/yolov3.weights",
         use_instnorm=False,
     ):
         super(DetGeoLite, self).__init__()

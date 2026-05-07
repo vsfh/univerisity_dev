@@ -1,0 +1,27 @@
+#!/bin/bash
+set -euo pipefail
+
+cd /data/feihong/univerisity_dev
+
+CONFIGS=(
+    # "configs/unified_siglip_supp/full_model.yaml"
+    "configs/unified_siglip_supp/model_retrieval_only.yaml"
+    "configs/unified_siglip_supp/model_bbox_only.yaml"
+    "configs/unified_siglip_supp/model_wo_angle.yaml"
+    "configs/unified_siglip_supp/model_wo_text.yaml"
+    "configs/unified_siglip_supp/model_wo_angle_wo_text.yaml"
+)
+
+for CONFIG_PATH in "${CONFIGS[@]}"; do
+    echo "============================================================"
+    echo "Running unified_siglip_supp experiment: ${CONFIG_PATH}"
+    echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "============================================================"
+
+    bash train.sh "${CONFIG_PATH}"
+
+    echo "============================================================"
+    echo "Finished experiment: ${CONFIG_PATH}"
+    echo "Finished at: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "============================================================"
+done

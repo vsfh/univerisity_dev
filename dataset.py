@@ -171,7 +171,7 @@ def _normalize_subset_values(
 	return {int(v) for v in values}
 
 
-def _sample_edge_biased(min_value: float, max_value: float, alpha: float = 0.35) -> float:
+def _sample_edge_biased(min_value: float, max_value: float, alpha: float = 0.7) -> float:
 	"""Sample in [min_value, max_value] with higher probability near both edges."""
 	if max_value <= min_value:
 		return float(min_value)
@@ -548,7 +548,7 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		if not self.samples:
 			raise ValueError(f"No valid samples found for split={split}.")
 
-	def _tokenize_text(self, text: str) -> torch.Tensor:
+	def _tokenize_text(self, text: str) -> Tuple[torch.Tensor, torch.Tensor]:
 		text_inputs = self.tokenizer(
 			text,
 			padding="max_length",
@@ -557,11 +557,22 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			return_tensors="pt",
 		)
 		input_ids = text_inputs["input_ids"]
+		attention_mask = text_inputs.get("attention_mask")
 		if not isinstance(input_ids, torch.Tensor):
 			input_ids = torch.tensor(input_ids, dtype=torch.long)
+		if attention_mask is None:
+			pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+			if pad_token_id is None:
+				attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+			else:
+				attention_mask = (input_ids != int(pad_token_id)).long()
+		elif not isinstance(attention_mask, torch.Tensor):
+			attention_mask = torch.tensor(attention_mask, dtype=torch.long)
 		if input_ids.ndim > 1:
 			input_ids = input_ids[0]
-		return input_ids.long().clone()
+		if attention_mask.ndim > 1:
+			attention_mask = attention_mask[0]
+		return input_ids.long().clone(), attention_mask.long().clone()
 
 	def _list_satellite_files(self) -> List[Path]:
 		sat_root = self.train_satellite_root if self.split == "train" else self.test_satellite_root
@@ -650,8 +661,8 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		with open(text_path, "r", encoding="utf-8") as f:
 			payload = json.load(f)
 
-		# text = payload.get("unified_description", "")
-		text = payload.get("chunk_descriptions", "")[0]
+		text = payload.get("unified_description", "")
+		# text = payload.get("chunk_descriptions", "")[0]
 		if not isinstance(text, str):
 			return None
 
@@ -785,7 +796,7 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		row_idx = min(int(center_y * 3), 2)
 		index = row_idx * 3 + col_idx
 
-		input_ids = self._tokenize_text(sample["text"])
+		input_ids, attention_mask = self._tokenize_text(sample["text"])
 		query_inputs = self.processor(images=query_image, return_tensors="pt")
 		search_inputs = self.processor_sat(
 			images=augmented_search_image,
@@ -796,6 +807,7 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			"target_pixel_values": query_inputs["pixel_values"][0],
 			"search_pixel_values": search_inputs["pixel_values"][0],
 			"input_ids": input_ids,
+			"attention_mask": attention_mask,
 			"index": index,
 			"bbox": torch.tensor(resized_bbox, dtype=torch.float32),
 			"height": torch.tensor(sample["height"], dtype=torch.long),

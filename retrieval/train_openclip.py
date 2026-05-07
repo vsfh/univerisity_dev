@@ -36,7 +36,7 @@ DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
 IMAGE_FOLDER = "/data/feihong/image_1024"
 HEADING_FOLDER = "/data/feihong/range_250"
 
-NUM_EPOCHS = 4
+NUM_EPOCHS = 8
 BATCH_SIZE = 8
 LEARNING_RATE = 1e-5
 DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"

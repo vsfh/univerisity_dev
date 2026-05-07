@@ -124,11 +124,11 @@ class AverageMeter(object):
 class SampleGeoLite(nn.Module):
     """SampleGeoLite for retrieval (modified for InfoNCE loss)."""
 
-    def __init__(self, emb_size=1024):
+    def __init__(self, emb_size=1024, pretrained=True):
         super().__init__()
 
         model_name = "convnext_base.fb_in22k_ft_in1k_384"
-        base_model = timm.create_model(model_name, pretrained=True, num_classes=0)
+        base_model = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
         self.query_model = base_model
         self.reference_model = base_model
 

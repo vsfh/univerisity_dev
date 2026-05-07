@@ -29,9 +29,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from ground_cvos import SampleGeoLite
-from bbox.yolo_utils import yolo_loss, build_target
+from bbox.yolo_utils import build_target, eval_iou_acc, yolo_loss
 from grounding.model.loss import adjust_learning_rate
-from utils.utils import AverageMeter, eval_iou_acc
+from utils.utils import AverageMeter
 
 from dataset import ShiftedSatelliteDroneDataset
 
@@ -53,7 +53,7 @@ UNIV_TEST_FILE = "/data/feihong/ckpt/test.txt"
 # UNIV_CROP_SIZE = (640, 640)
 UNIV_DRONE_SIZE = (256, 256)
 UNIV_SAT_SIZE = IMG_SIZE
-DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 CVOGL_TRANSFORM = None
 
@@ -234,7 +234,12 @@ def train_epoch(
         )
 
         loss_geo, loss_cls = yolo_loss(
-            pred_anchor, new_gt_bbox, anchors_full, best_anchor_gi_gj, image_wh
+            pred_anchor,
+            new_gt_bbox,
+            anchors_full,
+            best_anchor_gi_gj,
+            image_wh,
+            confidence_loss_type="balanced_bce",
         )
         bbox_loss = loss_geo + loss_cls
         heading_loss = F.mse_loss(pred_heading, heading_target)
