@@ -12,14 +12,14 @@ from torch.utils.data import Dataset
 
 
 # --- Configuration ---
-TRAIN_SATELLITE_ROOT = "/data/feihong/image_2048"
-TEST_SATELLITE_ROOT = "/data/feihong/img_test_1"
-DRONE_IMAGE_ROOT = "/data/feihong/drone_img"
-BBOX_FILE = "/data/feihong/ckpt/bbox_test_1.json"
+TRAIN_SATELLITE_ROOT = "/media/data1/feihong/image_2048"
+TEST_SATELLITE_ROOT = "/media/data1/feihong/img_test_1"
+DRONE_IMAGE_ROOT = "/media/data1/feihong/drone_img"
+BBOX_FILE = "/media/data1/feihong/ckpt/bbox_test_1.json"
 TRAIN_MAX_SATELLITE_ID = 1065
-TRAIN_SPLIT_FILE = "/data/feihong/ckpt/train.txt"
-VAL_SPLIT_FILE = "/data/feihong/ckpt/val.txt"
-TEST_SPLIT_FILE = "/data/feihong/ckpt/test_1.txt"
+TRAIN_SPLIT_FILE = "/media/data1/feihong/ckpt/train.txt"
+VAL_SPLIT_FILE = "/media/data1/feihong/ckpt/val.txt"
+TEST_SPLIT_FILE = "/media/data1/feihong/ckpt/test_1.txt"
 VAL_SPLIT_COUNT = 20
 TEST_SPLIT_COUNT = 400
 MAX_TEXT_LENGTH = 64
@@ -30,7 +30,7 @@ DEFAULT_SUBSET_ANGLES = [0, 45, 90, 135, 180, 225, 270, 315]
 DEFAULT_ENABLE_TIMING_LOG = False
 DEFAULT_TIMING_LOG_INTERVAL = 200
 DEFAULT_MODEL_NAME = "google/siglip-base-patch16-224"
-DEFAULT_CACHE_DIR = "/data/feihong/hf_cache"
+DEFAULT_CACHE_DIR = "/media/data1/feihong/hf_cache"
 TRAIN_HEIGHT_TO_BOX_SIZE = {
 	150: 330//2,
 	200: 414//2,
@@ -363,11 +363,11 @@ def _augment_satellite_image_with_bbox_640(
 
 	if mode == "train":
 		context_scale = 3.0
-		min_crop_w = max(bbox_w, bbox_h * target_aspect) * context_scale
+		min_crop_w = 3840 // 2
 	else:
 		ratio = max(1e-3, min(1.0, float(test_crop_ratio)))
 		context_scale = 3.0
-		min_crop_w = max(bbox_w, bbox_h * target_aspect) * context_scale
+		min_crop_w = 3840
 		# Keep ratio<1.0 as an optional lower bound; ratio>=1.0 should not force full-size crop.
 		if ratio < 1.0:
 			ratio_crop_w = max_crop_w * ratio

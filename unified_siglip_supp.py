@@ -45,24 +45,26 @@ class Config:
     CLEARML_PROJECT = "unified_siglip"
     CLEARML_TASK_NAME = None
     MODEL_NAME = "google/siglip-base-patch16-224"
-    CACHE_DIR = "/data/feihong/hf_cache"
-    DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
-    IMAGE_FOLDER = "/data/feihong/image_1024"
-    HEADING_FOLDER = "/data/feihong/range_250"
-    TEXT_FILE = "/data/feihong/ckpt/drone_text_single_long.json"
-    TRAIN_BBOX_FILE = "/data/feihong/univerisity_dev/runs/train.json"
-    TEST_BBOX_FILE = "/data/feihong/univerisity_dev/runs/test.json"
-    SATELLITE_FOLDER = "/data/feihong/asian_univ"
+    CACHE_DIR = "/media/data1/feihong/hf_cache"
+    DRONE_VIEW_FOLDER = "/media/data1/feihong/drone_view"
+    IMAGE_FOLDER = "/media/data1/feihong/image_1024"
+    HEADING_FOLDER = "/media/data1/feihong/range_250"
+    TEXT_FILE = "/media/data1/feihong/ckpt/drone_text_single_long.json"
+    TRAIN_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/train.json"
+    TEST_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
+    SATELLITE_FOLDER = "/media/data1/feihong/asian_univ"
 
     SAT_ORIG_SIZE = (3840, 2160)
     UNIV_SAT_SIZE = {"height": 432, "width": 768}
-    # UNIV_SAT_SIZE = (640, 640)
     DRONE_SIZE = (256, 256)
 
     NUM_EPOCHS = 16
     BATCH_SIZE = 16
     GRAD_ACCUMULATION_STEPS = 2
     LEARNING_RATE = 5e-5
+    USE_DIFFERENTIAL_LR = True
+    VISION_LEARNING_RATE = None
+    VISION_LR_MULTIPLIER = 0.1
     LR_MIN = 1e-10
     COSINE_EPOCHS = NUM_EPOCHS
     BBOX_LOSS_WEIGHT = 0.5
@@ -85,8 +87,12 @@ class Config:
     OPTIMIZE_OBJECTIVE = "combined"  # combined | img_text_only | bbox_only
     USE_HEATMAP_LOSS = True
     HEATMAP_LOSS_WEIGHT = 0.2
-    HEATMAP_LOSS_TYPE = "spatial_ce"  # spatial_ce | weighted_bce
+    HEATMAP_LOSS_TYPE = ["mse", "cross_entropy"]  # mse | cross_entropy | weighted_bce
+    HEATMAP_TARGET_MODE = "bbox_aware"  # center | bbox_aware
     HEATMAP_SIGMA = 1.5
+    HEATMAP_RADIUS = 4.5
+    HEATMAP_BBOX_INSIDE_VALUE = 0.5
+    HEATMAP_BBOX_OUTSIDE_VALUE = 0.2
     HEATMAP_POS_WEIGHT = 8.0
     HEATMAP_CONFIDENCE_WEIGHT = 0.5
     HEATMAP_VIS_MAX_SAMPLES = 10
@@ -220,13 +226,35 @@ def build_dataloader_kwargs(num_workers: int, drop_last: bool = False) -> Dict:
     return kwargs
 
 
-def get_loss_weights(
-    epoch: int, num_epochs: int, end_num: float
-) -> Tuple[float, float]:
-    progress = epoch / num_epochs
-    bbox_weight = (end_num - 0.5) * progress + 0.5
-    retrieval_weight = 1.0 - bbox_weight
-    return bbox_weight, retrieval_weight
+def build_optimizer(model: nn.Module) -> AdamW:
+    if not Config.USE_DIFFERENTIAL_LR:
+        return AdamW(model.parameters(), lr=Config.LEARNING_RATE)
+
+    vision_params = []
+    other_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith("vision_model."):
+            vision_params.append(param)
+        else:
+            other_params.append(param)
+
+    if not vision_params:
+        return AdamW(other_params, lr=Config.LEARNING_RATE)
+
+    vision_lr = (
+        float(Config.VISION_LEARNING_RATE)
+        if Config.VISION_LEARNING_RATE is not None
+        else float(Config.LEARNING_RATE) * float(Config.VISION_LR_MULTIPLIER)
+    )
+    param_groups = [
+        {"params": other_params, "lr": Config.LEARNING_RATE, "name": "other"},
+        {"params": vision_params, "lr": vision_lr, "name": "vision_model"},
+    ]
+    return AdamW(param_groups)
+
+
 
 
 def build_geo_features(batch: Dict, device: torch.device) -> Optional[torch.Tensor]:
@@ -260,7 +288,15 @@ def unpack_model_outputs(outputs: Tuple) -> Tuple[
         return pred_anchor, aux, text_feats, anchor_feats, grid_feats, fused_feats, None
     if len(outputs) == 7:
         pred_anchor, aux, text_feats, anchor_feats, grid_feats, fused_feats, heatmap = outputs
-        return pred_anchor, aux, text_feats, anchor_feats, grid_feats, fused_feats, heatmap
+        return (
+            pred_anchor,
+            aux,
+            text_feats,
+            anchor_feats,
+            grid_feats,
+            fused_feats,
+            heatmap,
+        )
     raise ValueError(f"Unexpected model output length: {len(outputs)}")
 
 
@@ -269,11 +305,17 @@ def build_heatmap_target(
     heatmap_hw: Tuple[int, int],
     image_wh: Tuple[int, int],
     sigma: float,
+    radius: Optional[float] = None,
 ) -> torch.Tensor:
     grid_h, grid_w = int(heatmap_hw[0]), int(heatmap_hw[1])
     image_w, image_h = float(image_wh[0]), float(image_wh[1])
     device = target_bbox.device
     dtype = target_bbox.dtype
+
+    x1 = torch.minimum(target_bbox[:, 0], target_bbox[:, 2]).clamp(0.0, image_w)
+    y1 = torch.minimum(target_bbox[:, 1], target_bbox[:, 3]).clamp(0.0, image_h)
+    x2 = torch.maximum(target_bbox[:, 0], target_bbox[:, 2]).clamp(0.0, image_w)
+    y2 = torch.maximum(target_bbox[:, 1], target_bbox[:, 3]).clamp(0.0, image_h)
 
     center_x = (target_bbox[:, 0] + target_bbox[:, 2]) * 0.5 / max(image_w, 1.0) * grid_w
     center_y = (target_bbox[:, 1] + target_bbox[:, 3]) * 0.5 / max(image_h, 1.0) * grid_h
@@ -284,36 +326,132 @@ def build_heatmap_target(
     xs = torch.arange(grid_w, device=device, dtype=dtype).view(1, 1, grid_w)
     dx2 = (xs - center_x.view(-1, 1, 1)) ** 2
     dy2 = (ys - center_y.view(-1, 1, 1)) ** 2
-    target = torch.exp(-(dx2 + dy2) / (2.0 * max(float(sigma), 1e-6) ** 2))
+    dist2 = dx2 + dy2
+    sigma = max(float(sigma), 1e-6)
+    center_target = torch.exp(-dist2 / (2.0 * sigma**2))
+    if radius is not None and float(radius) > 0.0:
+        center_target = center_target * (dist2 <= float(radius) ** 2).to(dtype=dtype)
+
+    if Config.HEATMAP_TARGET_MODE == "center":
+        target = center_target
+    elif Config.HEATMAP_TARGET_MODE == "bbox_aware":
+        x_img = (xs + 0.5) / max(float(grid_w), 1.0) * image_w
+        y_img = (ys + 0.5) / max(float(grid_h), 1.0) * image_h
+
+        inside_x = (x_img >= x1.view(-1, 1, 1)) & (x_img <= x2.view(-1, 1, 1))
+        inside_y = (y_img >= y1.view(-1, 1, 1)) & (y_img <= y2.view(-1, 1, 1))
+        inside = (inside_x & inside_y).to(dtype=dtype)
+
+        dx_out = torch.maximum(
+            torch.maximum(x1.view(-1, 1, 1) - x_img, x_img - x2.view(-1, 1, 1)),
+            torch.zeros((), device=device, dtype=dtype),
+        )
+        dy_out = torch.maximum(
+            torch.maximum(y1.view(-1, 1, 1) - y_img, y_img - y2.view(-1, 1, 1)),
+            torch.zeros((), device=device, dtype=dtype),
+        )
+        dx_out = dx_out / max(image_w, 1.0) * grid_w
+        dy_out = dy_out / max(image_h, 1.0) * grid_h
+        outside_dist2 = dx_out**2 + dy_out**2
+        outside_band = torch.exp(-outside_dist2 / (2.0 * sigma**2)) * (1.0 - inside)
+        if radius is not None and float(radius) > 0.0:
+            outside_band = outside_band * (
+                outside_dist2 <= float(radius) ** 2
+            ).to(dtype=dtype)
+
+        inside_target = inside * float(Config.HEATMAP_BBOX_INSIDE_VALUE)
+        outside_target = outside_band * float(Config.HEATMAP_BBOX_OUTSIDE_VALUE)
+        target = torch.maximum(center_target, torch.maximum(inside_target, outside_target))
+    else:
+        raise ValueError(
+            f"Invalid HEATMAP_TARGET_MODE={Config.HEATMAP_TARGET_MODE}. "
+            "Choose 'center' or 'bbox_aware'."
+        )
     return target.unsqueeze(1).clamp(0.0, 1.0)
 
 
-def heatmap_loss_fn(heatmap_logits: torch.Tensor, target_bbox: torch.Tensor) -> torch.Tensor:
+def parse_heatmap_loss_types(loss_type: Any) -> List[str]:
+    if isinstance(loss_type, str):
+        loss_types = loss_type.replace(",", "+").split("+")
+    elif isinstance(loss_type, (list, tuple, set)):
+        loss_types = []
+        for item in loss_type:
+            loss_types.extend(str(item).replace(",", "+").split("+"))
+    else:
+        raise TypeError(
+            f"Invalid HEATMAP_LOSS_TYPE={loss_type!r}. Use a string or a list."
+        )
+
+    normalized = []
+    aliases = {
+        "ce": "cross_entropy",
+        "spatial_ce": "cross_entropy",
+        "spatial_cross_entropy": "cross_entropy",
+    }
+    for item in loss_types:
+        item = str(item).strip().lower()
+        if not item:
+            continue
+        normalized.append(aliases.get(item, item))
+
+    if not normalized:
+        raise ValueError("HEATMAP_LOSS_TYPE must contain at least one loss type.")
+    return normalized
+
+
+def heatmap_loss_fn(
+    heatmap_logits: torch.Tensor,
+    target_bbox: torch.Tensor,
+    return_target: bool = False,
+):
     heatmap_target = build_heatmap_target(
         target_bbox=target_bbox,
         heatmap_hw=heatmap_logits.shape[-2:],
         image_wh=(Config.UNIV_SAT_SIZE["width"], Config.UNIV_SAT_SIZE["height"]),
         sigma=Config.HEATMAP_SIGMA,
+        radius=Config.HEATMAP_RADIUS,
     )
-    if Config.HEATMAP_LOSS_TYPE == "spatial_ce":
-        logits = heatmap_logits.float().flatten(1)
-        target = heatmap_target.float().flatten(1)
-        target = target / target.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        return -(target * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
+    pred = heatmap_logits.float().flatten(1)
+    target = heatmap_target.float().flatten(1)
+    target_prob = target / target.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    pred_prob = pred / pred.sum(dim=1, keepdim=True).clamp_min(1e-6)
 
-    if Config.HEATMAP_LOSS_TYPE != "weighted_bce":
+    loss = heatmap_logits.new_zeros(())
+    for loss_type in parse_heatmap_loss_types(Config.HEATMAP_LOSS_TYPE):
+        if loss_type == "mse":
+            loss = loss + F.mse_loss(
+                pred_prob,
+                target_prob,
+                reduction="mean",
+            ) * pred_prob.shape[1]
+            continue
+
+        if loss_type == "cross_entropy":
+            loss = loss + -(
+                target_prob * pred_prob.clamp_min(1e-8).log()
+            ).sum(dim=1).mean()
+            continue
+
+        if loss_type == "weighted_bce":
+            bce_loss = F.binary_cross_entropy(
+                heatmap_logits.float().clamp(1e-6, 1.0 - 1e-6),
+                heatmap_target.float(),
+                reduction="none",
+            )
+            weight = 1.0 + heatmap_target.float() * (
+                Config.HEATMAP_POS_WEIGHT - 1.0
+            )
+            loss = loss + (bce_loss * weight).mean()
+            continue
+
         raise ValueError(
             f"Invalid HEATMAP_LOSS_TYPE={Config.HEATMAP_LOSS_TYPE}. "
-            "Choose 'spatial_ce' or 'weighted_bce'."
+            "Choose from 'mse', 'cross_entropy', 'spatial_ce', or 'weighted_bce'."
         )
 
-    loss = F.binary_cross_entropy_with_logits(
-        heatmap_logits.float(),
-        heatmap_target.float(),
-        reduction="none",
-    )
-    weight = 1.0 + heatmap_target.float() * (Config.HEATMAP_POS_WEIGHT - 1.0)
-    return (loss * weight).mean()
+    if return_target:
+        return loss, heatmap_target
+    return loss
 
 
 def add_heatmap_to_confidence(
@@ -366,22 +504,33 @@ def log_heatmap_images(
     heatmap_logits: Optional[torch.Tensor],
     target_bbox: Optional[torch.Tensor],
     epoch: int,
+    heatmap_target: Optional[torch.Tensor] = None,
 ) -> None:
-    if writer is None or heatmap_logits is None or target_bbox is None:
+    if writer is None or heatmap_logits is None:
         return
 
-    max_samples = min(Config.HEATMAP_VIS_MAX_SAMPLES, heatmap_logits.shape[0])
+    if heatmap_target is None and target_bbox is None:
+        return
+
+    sample_count = heatmap_logits.shape[0]
+    if heatmap_target is not None:
+        sample_count = min(sample_count, heatmap_target.shape[0])
+    max_samples = min(Config.HEATMAP_VIS_MAX_SAMPLES, sample_count)
     if max_samples <= 0:
         return
 
     pred_heatmap = heatmap_logits[:max_samples]
-    target_bbox = target_bbox[:max_samples]
-    target_heatmap = build_heatmap_target(
-        target_bbox=target_bbox,
-        heatmap_hw=pred_heatmap.shape[-2:],
-        image_wh=(Config.UNIV_SAT_SIZE["width"], Config.UNIV_SAT_SIZE["height"]),
-        sigma=Config.HEATMAP_SIGMA,
-    )
+    if heatmap_target is None:
+        target_bbox = target_bbox[:max_samples]
+        target_heatmap = build_heatmap_target(
+            target_bbox=target_bbox,
+            heatmap_hw=pred_heatmap.shape[-2:],
+            image_wh=(Config.UNIV_SAT_SIZE["width"], Config.UNIV_SAT_SIZE["height"]),
+            sigma=Config.HEATMAP_SIGMA,
+            radius=Config.HEATMAP_RADIUS,
+        )
+    else:
+        target_heatmap = heatmap_target[:max_samples]
 
     pred_vis = _colorize_heatmap_for_writer(
         _normalize_heatmap_for_writer(pred_heatmap)
@@ -389,10 +538,14 @@ def log_heatmap_images(
     target_vis = _colorize_heatmap_for_writer(
         target_heatmap.detach().float()
     ).cpu()
+    target_range_vis = _colorize_heatmap_for_writer(
+        _normalize_heatmap_for_writer(target_heatmap)
+    ).cpu()
     side_by_side = torch.cat([pred_vis, target_vis], dim=-1)
 
     writer.add_images("Heatmap/pred", pred_vis, epoch)
     writer.add_images("Heatmap/target", target_vis, epoch)
+    writer.add_images("Heatmap/target_range_vis", target_range_vis, epoch)
     writer.add_images("Heatmap/pred_target", side_by_side, epoch)
 
 
@@ -640,7 +793,7 @@ def load_data_splits() -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], se
     train_ids = set()
     test_ids = set()
 
-    with open("/data/feihong/ckpt/train.txt", "r") as f:
+    with open("/media/data1/feihong/ckpt/train.txt", "r") as f:
         for line in f:
             query_path = line.strip()
             name = query_path.split("/")[-2]
@@ -648,7 +801,7 @@ def load_data_splits() -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], se
             train_image_pairs.append((query_path, search_path))
             train_ids.add(name)
 
-    with open("/data/feihong/ckpt/test.txt", "r") as f:
+    with open("/media/data1/feihong/ckpt/test.txt", "r") as f:
         for line in f:
             query_path = line.strip()
             name = query_path.split("/")[-2]
@@ -759,7 +912,14 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     )
     accelerator.print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")
 
-    optimizer = AdamW(model.parameters(), lr=Config.LEARNING_RATE)
+    optimizer = build_optimizer(model)
+    for group in optimizer.param_groups:
+        group_name = group.get("name", "default")
+        group_param_count = sum(param.numel() for param in group["params"])
+        accelerator.print(
+            f"Optimizer group '{group_name}': "
+            f"lr={group['lr']:.2e}, params={group_param_count:,}"
+        )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=Config.COSINE_EPOCHS
     )
@@ -771,7 +931,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     )
 
     accelerator.print(f"Starting training for {Config.NUM_EPOCHS} epochs...")
-    soft_label = 0.3
+    soft_label = 0.01
     max_iou = 0
     min_info = 1000
     amp_enabled = Config.USE_AMP and accelerator.device.type == "cuda"
@@ -783,6 +943,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         total_heatmap_loss = 0
         last_heatmap_logits = None
         last_target_bbox = None
+        last_heatmap_target = None
         progress_bar = tqdm(
             train_dataloader,
             desc=f"Epoch {epoch + 1}/{Config.NUM_EPOCHS}",
@@ -857,14 +1018,24 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                         and Config.ENCODER_TYPE == "heat"
                         and heatmap_logits is not None
                     ):
-                        heatmap_loss = heatmap_loss_fn(heatmap_logits, target_bbox)
+                        heatmap_loss, heatmap_target = heatmap_loss_fn(
+                            heatmap_logits,
+                            target_bbox,
+                            return_target=True,
+                        )
                         bbox_loss = bbox_loss + Config.HEATMAP_LOSS_WEIGHT * heatmap_loss
                     else:
                         heatmap_loss = bbox_loss.new_zeros(())
+                        heatmap_target = None
 
                     if heatmap_logits is not None:
                         last_heatmap_logits = heatmap_logits.detach()
                         last_target_bbox = target_bbox.detach()
+                        last_heatmap_target = (
+                            heatmap_target.detach()
+                            if heatmap_target is not None
+                            else None
+                        )
 
                     candidate_feats = grid_feats.reshape(-1, Config.PROJECTION_DIM)
                     positive_indices = torch.zeros(B, B * 9, device=accelerator.device)
@@ -880,7 +1051,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 
                     global_positive_indices = local_indices + batch_offsets
                     row_indices_flat = torch.arange(B, device=accelerator.device)
-                    positive_indices[row_indices_flat, global_positive_indices] = 0.95
+                    positive_indices[row_indices_flat, global_positive_indices] = 0.92
 
 
                     # if fused_feats is not None:
@@ -897,7 +1068,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     )
                     if input_ids is not None and text_feats is not None:
                         text_loss = info_nce_loss(text_feats, candidate_feats.detach(), positive_indices)
-                        img_text_loss = img_text_loss + 0.02 * text_loss
+                        img_text_loss = img_text_loss + 0.05 * text_loss
 
 
                     # scheduled_bbox_weight, scheduled_retrieval_weight = get_loss_weights(
@@ -912,8 +1083,8 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                         retrieval_weight = 1.0
                         loss = img_text_loss
                     else:  # bbox_only
-                        bbox_weight = 0.99
-                        retrieval_weight = 0.01
+                        bbox_weight = 1.0
+                        retrieval_weight = 0.0
                         loss = retrieval_weight * img_text_loss + bbox_weight * bbox_loss
 
                 optimizer.zero_grad(set_to_none=True)
@@ -972,7 +1143,16 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 epoch,
             )
             writer.add_scalar("lr/learning_rate", optimizer.param_groups[0]["lr"], epoch)
-            log_heatmap_images(writer, last_heatmap_logits, last_target_bbox, epoch)
+            for group_idx, group in enumerate(optimizer.param_groups):
+                group_name = str(group.get("name", f"group_{group_idx}"))
+                writer.add_scalar(f"lr/{group_name}", group["lr"], epoch)
+            log_heatmap_images(
+                writer,
+                last_heatmap_logits,
+                last_target_bbox,
+                epoch,
+                heatmap_target=last_heatmap_target,
+            )
 
         if epoch % 2 == 0:
             os.makedirs(save_path, exist_ok=True)
@@ -1053,7 +1233,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-root",
         type=str,
-        default="/data/feihong/ckpt",
+        default="/media/data1/feihong/ckpt",
         help="Root directory for checkpoints when --save-dir is not set.",
     )
     parser.add_argument(

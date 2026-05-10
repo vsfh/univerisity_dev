@@ -29,13 +29,13 @@ from train_uni import (
 
 # --- Configuration ---
 MODEL_NAME = "google/siglip-base-patch16-224"
-CACHE_DIR = "/data/feihong/hf_cache"
+CACHE_DIR = "/media/data1/feihong/hf_cache"
 DEFAULT_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-DEFAULT_OUTPUT_DIR = "/data/feihong/univerisity_dev/eval_results/test_unify"
-DEFAULT_INCLUDE_FILE = "/data/feihong/ckpt/include1.json"
-DEFAULT_ENCODER_HEAT_CONFIG_DIR = "/data/feihong/univerisity_dev/configs/unified_siglip_supp"
-DEFAULT_ENCODER_HEAT_CHECKPOINT = "/data/feihong/ckpt/model_full/best_iou.pth"
-DEFAULT_UNIFY_CHECKPOINT = "/data/feihong/ckpt/unify_geo/best_iou.pth"
+DEFAULT_OUTPUT_DIR = "/media/data1/feihong/univerisity_dev/eval_results/test_unify"
+DEFAULT_INCLUDE_FILE = "/media/data1/feihong/ckpt/include1.json"
+DEFAULT_ENCODER_HEAT_CONFIG_DIR = "/media/data1/feihong/univerisity_dev/configs/unified_siglip_supp"
+DEFAULT_ENCODER_HEAT_CHECKPOINT = "/media/data1/feihong/ckpt/model_full/best_iou.pth"
+DEFAULT_UNIFY_CHECKPOINT = "/media/data1/feihong/ckpt/unify_geo/best_iou.pth"
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
 
@@ -182,7 +182,7 @@ def bool_from_config(config: Dict[str, Any], key: str, default: bool) -> bool:
 def resolve_encoder_heat_checkpoint(config_path: str, payload: Dict[str, Any], checkpoint_name: str) -> str:
     config_file = Path(config_path)
     exp_name = str(payload.get("exp_name") or payload.get("name") or config_file.stem)
-    save_root = str(payload.get("save_root", "/data/feihong/ckpt"))
+    save_root = str(payload.get("save_root", "/media/data1/feihong/ckpt"))
     save_dir = payload.get("save_dir")
 
     candidates: List[Path] = []

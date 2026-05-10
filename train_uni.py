@@ -667,7 +667,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/data/feihong/ckpt/unify_geo",
+        default="/media/data1/feihong/ckpt/unify_geo",
         help="Path to save model checkpoints",
     )
     args = parser.parse_args()

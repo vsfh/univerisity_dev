@@ -1,5 +1,5 @@
 exp_name: model_retrieval_only
-save_root: /data/feihong/ckpt
+save_root: /media/data1/feihong/ckpt
 end_num: 0.5
 use_ap: true
 
@@ -8,6 +8,9 @@ config:
   BATCH_SIZE: 16
   GRAD_ACCUMULATION_STEPS: 2
   LEARNING_RATE: 5.0e-5
+  USE_DIFFERENTIAL_LR: true
+  VISION_LEARNING_RATE: null
+  VISION_LR_MULTIPLIER: 0.1
   USE_AMP: true
   ENABLE_TF32: true
   ENCODER_TYPE: heat

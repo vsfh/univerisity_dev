@@ -529,7 +529,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/data/feihong/ckpt/ground_ocg",
+        default="/media/data1/feihong/ckpt/ground_ocg",
         help="Path to save model checkpoints",
     )
     args = parser.parse_args()

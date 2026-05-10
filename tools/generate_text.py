@@ -14,8 +14,8 @@ MODEL_NAME = "Qwen/Qwen3-VL-4B-Instruct"
 IMAGE_SIZE = (256, 256)
 NUM_PATCHES = 32
 ANGLE_ORDER = (0, 45, 90, 135, 180, 225, 270, 315)
-DEFAULT_IMAGE_ROOT = "/data/feihong/drone_img"
-CACHE_DIR = "/data/feihong/hf_cache"
+DEFAULT_IMAGE_ROOT = "/media/data1/feihong/drone_img"
+CACHE_DIR = "/media/data1/feihong/hf_cache"
 DEFAULT_GPU_ID = 1
 
 
@@ -252,7 +252,7 @@ def resolve_image_dir(
 
 
 def list_sample_dirs(image_root: str) -> List[str]:
-	"""List sample directories under root (e.g., /data/feihong/drone_img/0000)."""
+	"""List sample directories under root (e.g., /media/data1/feihong/drone_img/0000)."""
 	root = Path(image_root).resolve()
 	if not root.is_dir():
 		raise NotADirectoryError(f"Image root does not exist: {root}")

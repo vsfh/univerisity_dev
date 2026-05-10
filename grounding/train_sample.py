@@ -45,11 +45,11 @@ WEIGHT_DECAY = 1e-4
 PRINT_FREQ = 50
 HEADING_LOSS_WEIGHT = 8.0
 
-UNIV_IMAGE_FOLDER = "/data/feihong/image_1024"
-HEADING_FOLDER = "/data/feihong/range_250"
-UNIV_BBOX_FILE = "/data/feihong/univerisity_dev/runs/test.json"
-UNIV_TRAIN_FILE = "/data/feihong/ckpt/train.txt"
-UNIV_TEST_FILE = "/data/feihong/ckpt/test.txt"
+UNIV_IMAGE_FOLDER = "/media/data1/feihong/image_1024"
+HEADING_FOLDER = "/media/data1/feihong/range_250"
+UNIV_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
+UNIV_TRAIN_FILE = "/media/data1/feihong/ckpt/train.txt"
+UNIV_TEST_FILE = "/media/data1/feihong/ckpt/test.txt"
 # UNIV_CROP_SIZE = (640, 640)
 UNIV_DRONE_SIZE = (256, 256)
 UNIV_SAT_SIZE = IMG_SIZE
@@ -505,7 +505,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/data/feihong/ckpt/ground_sample",
+        default="/media/data1/feihong/ckpt/ground_sample",
         help="Path to save model checkpoints",
     )
     parser.add_argument(

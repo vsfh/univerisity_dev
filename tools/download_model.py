@@ -1,8 +1,8 @@
 import torch
 import os
-os.environ['HF_HOME'] = '/data/feihong/hf_cache'
+os.environ['HF_HOME'] = '/media/data1/feihong/hf_cache'
 device = "cuda" if torch.cuda.is_available() else "cpu"
-custom_cache_path = "/data/feihong/hf_cache"
+custom_cache_path = "/media/data1/feihong/hf_cache"
 def clip_siglip(image_folder = "image_512",output_folder = "features", large=False):
     import open_clip
     from transformers import CLIPModel, CLIPProcessor, SiglipModel, SiglipProcessor

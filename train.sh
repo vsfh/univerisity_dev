@@ -12,9 +12,9 @@ if [ -z "$CONFIG_PATH" ]; then
 fi
 shift
 
-cd /data/feihong/univerisity_dev
+cd /media/data1/feihong/univerisity_dev
 
-export CUDA_VISIBLE_DEVICES=0,2
+export CUDA_VISIBLE_DEVICES=0,1
 
 accelerate launch \
     --multi_gpu \

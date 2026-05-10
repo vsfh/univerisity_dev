@@ -10,7 +10,7 @@ from bbox.yolo_utils import SpatialTransformer,CrossAttention
 from transformers.models.siglip.modeling_siglip import SiglipVisionConfig, SiglipMLP
 MODEL_NAME = "google/siglip-base-patch16-224"
 DINO_MODEL_NAME = "nvidia/C-RADIOv4-H"
-CACHE_DIR = "/data/feihong/hf_cache"
+CACHE_DIR = "/media/data1/feihong/hf_cache"
 PROJECTION_DIM = 768
 DINO_PROJECTION_DIM = 768
 
@@ -638,6 +638,7 @@ class Encoder_heat(Encoder_text_angle):
         useap=False,
         heat_channels=128,
         heat_kernel_size=9,
+        heat_softmax_temperature=1.0,
     ):
         super().__init__(
             model_name=model_name,
@@ -647,6 +648,7 @@ class Encoder_heat(Encoder_text_angle):
         )
         del heat_channels
         self.heat_kernel_size = heat_kernel_size
+        self.heat_softmax_temperature = heat_softmax_temperature
         self.heat_fuse = nn.Conv2d(self.feature_dim + 1, self.feature_dim, kernel_size=1)
         self.bbox_pos_proj = nn.Conv2d(2, self.feature_dim, kernel_size=1)
 
@@ -725,6 +727,13 @@ class Encoder_heat(Encoder_text_angle):
         )
         return heatmap.view(B, 1, H, W)
 
+    def _spatial_softmax(self, heatmap):
+        B, C, H, W = heatmap.shape
+        temperature = max(float(self.heat_softmax_temperature), 1e-6)
+        heatmap = heatmap.view(B, C, -1) / temperature
+        heatmap = F.softmax(heatmap, dim=-1)
+        return heatmap.view(B, C, H, W)
+
     def _build_position_embedding(self, feature_map):
         B, _, H, W = feature_map.shape
         y_coords = torch.linspace(
@@ -771,12 +780,8 @@ class Encoder_heat(Encoder_text_angle):
                 dim=1,
             )
             anchor_pooler = F.normalize(anchor_pooler, p=2, dim=1)
-            text_weight = F.softplus(self.text_weight) / 20
-            anchor_pooler = F.normalize(
-                (1 - text_weight) * anchor_pooler + text_weight * text_feats,
-                p=2,
-                dim=1,
-            )
+            text_weight = 0.05
+            anchor_pooler = (1 - text_weight) * anchor_pooler + text_weight * text_feats
 
 
         fused_feats = None
@@ -803,16 +808,17 @@ class Encoder_heat(Encoder_text_angle):
             anchor_feats_detached = anchor_feats.detach()
             anchor_context = self.bbox_adapter(anchor_feats_detached) + anchor_feats_detached
 
-        heatmap = self._dynamic_heatmap(anchor_feats, sat_features_2d, angle)
-        if heatmap.shape[-2:] != sat_features_2d.shape[-2:]:
-            heatmap = F.interpolate(
-                heatmap,
+        heatmap_logits = self._dynamic_heatmap(anchor_feats, sat_features_2d, angle)
+        if heatmap_logits.shape[-2:] != sat_features_2d.shape[-2:]:
+            heatmap_logits = F.interpolate(
+                heatmap_logits,
                 size=sat_features_2d.shape[-2:],
                 mode="bilinear",
                 align_corners=False,
             )
+        heatmap = self._spatial_softmax(heatmap_logits)
 
-        heat_gate = torch.sigmoid(heatmap)
+        heat_gate = heatmap * heatmap.shape[-2] * heatmap.shape[-1] / 2
         guided_sat_features = self.heat_fuse(
             torch.cat([sat_features_2d, heat_gate], dim=1)
         )
@@ -824,14 +830,18 @@ class Encoder_heat(Encoder_text_angle):
             x=guided_sat_features, context=anchor_context
         )
 
+        
+
         pred_anchor = self.bbox_fcn_out(fused_features)
-        if heatmap.shape[-2:] != pred_anchor.shape[-2:]:
-            heatmap = F.interpolate(
-                heatmap,
+        heatmap_out = heatmap
+        if heatmap_logits.shape[-2:] != pred_anchor.shape[-2:]:
+            heatmap_logits = F.interpolate(
+                heatmap_logits,
                 size=pred_anchor.shape[-2:],
                 mode="bilinear",
                 align_corners=False,
             )
+            heatmap_out = self._spatial_softmax(heatmap_logits)
 
         return (
             pred_anchor,
@@ -840,7 +850,7 @@ class Encoder_heat(Encoder_text_angle):
             anchor_pooler,
             sat_feature_2d_pool,
             fused_feats,
-            heatmap,
+            heatmap_out,
         )
 
 
