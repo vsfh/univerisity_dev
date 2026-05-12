@@ -80,6 +80,20 @@ class DummyTokenizer:
         return {"input_ids": torch.zeros((1, max_length), dtype=torch.long)}
 
 
+def build_geo_features(batch: Dict, device: torch.device) -> torch.Tensor:
+    angles = batch["angle"].to(device, non_blocking=True).float()
+    angles_rad = torch.deg2rad(angles)
+    heights = batch["height"].to(device, non_blocking=True).float()
+    return torch.cat(
+        [
+            torch.cos(angles_rad)[..., None],
+            torch.sin(angles_rad)[..., None],
+            heights[..., None] / 300.0,
+        ],
+        dim=1,
+    )
+
+
 def format_satellite_img_bbox(
     image,
     bbox,
@@ -199,8 +213,9 @@ def train_epoch(
         query_imgs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
         rs_imgs = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
         ori_gt_bbox = batch["bbox"].to(DEVICE)
+        geo = build_geo_features(batch, torch.device(DEVICE))
 
-        pred_anchor, _ = model(query_imgs, rs_imgs)
+        pred_anchor, _ = model(query_imgs, rs_imgs, geo=geo)
 
         pred_anchor = pred_anchor.view(
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
@@ -252,9 +267,10 @@ def validate(loader, model, anchors_full, img_size):
         query_imgs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
         rs_imgs = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
         ori_gt_bbox = batch["bbox"].to(DEVICE)
+        geo = build_geo_features(batch, torch.device(DEVICE))
 
         with torch.no_grad():
-            pred_anchor, _ = model(query_imgs, rs_imgs)
+            pred_anchor, _ = model(query_imgs, rs_imgs, geo=geo)
 
         pred_anchor = pred_anchor.view(
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]

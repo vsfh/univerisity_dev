@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 @file train_lpn.py
-@desc Training LPNGeoLite on GroundSmgeoDataset with heading prediction.
+@desc Training LPNGeoLite on GroundSmgeoDataset with geo conditioning.
 """
 
 import time
@@ -43,10 +43,7 @@ NUM_EPOCHS = 4
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 PRINT_FREQ = 50
-HEADING_LOSS_WEIGHT = 8.0
-
 UNIV_IMAGE_FOLDER = "/media/data1/feihong/image_1024"
-HEADING_FOLDER = "/media/data1/feihong/range_250"
 UNIV_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
 UNIV_TRAIN_FILE = "/media/data1/feihong/ckpt/train.txt"
 UNIV_TEST_FILE = "/media/data1/feihong/ckpt/test.txt"
@@ -56,14 +53,6 @@ UNIV_SAT_SIZE = IMG_SIZE
 DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
 
 CVOGL_TRANSFORM = None
-
-HEADING_TO_TARGET = {
-    0: [0.0, 0.0],
-    90: [0.0, 1.0],
-    180: [1.0, 0.0],
-    270: [1.0, 1.0],
-}
-
 
 class TransformProcessorWrapper:
     def __init__(self):
@@ -89,16 +78,18 @@ class DummyTokenizer:
         return {"input_ids": torch.zeros((1, max_length), dtype=torch.long)}
 
 
-def angle_to_heading_target(angle_tensor: torch.Tensor) -> torch.Tensor:
-    # Quantize arbitrary angles to nearest heading target used by this model.
-    angles = torch.remainder(angle_tensor.float(), 360.0)
-    heading_classes = torch.round(angles / 90.0).remainder(4).long()
-    mapping = torch.tensor(
-        [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]],
-        device=angle_tensor.device,
-        dtype=torch.float32,
+def build_geo_features(batch: Dict, device: torch.device) -> torch.Tensor:
+    angles = batch["angle"].to(device, non_blocking=True).float()
+    angles_rad = torch.deg2rad(angles)
+    heights = batch["height"].to(device, non_blocking=True).float()
+    return torch.cat(
+        [
+            torch.cos(angles_rad)[..., None],
+            torch.sin(angles_rad)[..., None],
+            heights[..., None] / 300.0,
+        ],
+        dim=1,
     )
-    return mapping[heading_classes]
 
 
 def format_satellite_img_bbox(
@@ -201,7 +192,6 @@ def train_epoch(
     epoch,
     anchors_full,
     img_size,
-    heading_loss_weight,
     print_freq=PRINT_FREQ,
 ):
     """Train for one epoch."""
@@ -211,16 +201,15 @@ def train_epoch(
     losses = AverageMeter()
     geo_losses = AverageMeter()
     cls_losses = AverageMeter()
-    heading_losses = AverageMeter()
 
     end = time.time()
     for batch_idx, batch in enumerate(loader):
         query_imgs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
         rs_imgs = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
         ori_gt_bbox = batch["bbox"].to(DEVICE)
-        heading_target = angle_to_heading_target(batch["angle"].to(DEVICE))
+        geo = build_geo_features(batch, torch.device(DEVICE))
 
-        pred_anchor, _, pred_heading = model(query_imgs, rs_imgs)
+        pred_anchor, _ = model(query_imgs, rs_imgs, geo=geo)
 
         pred_anchor = pred_anchor.view(
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
@@ -237,8 +226,7 @@ def train_epoch(
             pred_anchor, new_gt_bbox, anchors_full, best_anchor_gi_gj, image_wh
         )
         bbox_loss = loss_geo + loss_cls
-        heading_loss = F.mse_loss(pred_heading, heading_target)
-        loss = bbox_loss + heading_loss * heading_loss_weight
+        loss = bbox_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -247,7 +235,6 @@ def train_epoch(
         losses.update(loss.item(), query_imgs.shape[0])
         geo_losses.update(loss_geo.item(), query_imgs.shape[0])
         cls_losses.update(loss_cls.item(), query_imgs.shape[0])
-        heading_losses.update(heading_loss.item(), query_imgs.shape[0])
 
         batch_time.update(time.time() - end)
         end = time.time()
@@ -258,11 +245,10 @@ def train_epoch(
                 f"Time: {batch_time.val:.3f}\t"
                 f"Loss: {losses.val:.4f} ({losses.avg:.4f})\t"
                 f"Geo: {geo_losses.val:.4f} ({geo_losses.avg:.4f})\t"
-                f"Cls: {cls_losses.val:.4f} ({cls_losses.avg:.4f})\t"
-                f"Heading: {heading_losses.val:.4f} ({heading_losses.avg:.4f})"
+                f"Cls: {cls_losses.val:.4f} ({cls_losses.avg:.4f})"
             )
 
-    return losses.avg, geo_losses.avg, cls_losses.avg, heading_losses.avg
+    return losses.avg, geo_losses.avg, cls_losses.avg
 
 
 def validate(loader, model, anchors_full, img_size):
@@ -272,16 +258,15 @@ def validate(loader, model, anchors_full, img_size):
     accu50_meter = AverageMeter()
     accu25_meter = AverageMeter()
     iou_meter = AverageMeter()
-    heading_meter = AverageMeter()
 
     for batch in tqdm(loader, desc="Validating"):
         query_imgs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
         rs_imgs = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
         ori_gt_bbox = batch["bbox"].to(DEVICE)
-        heading_target = angle_to_heading_target(batch["angle"].to(DEVICE))
+        geo = build_geo_features(batch, torch.device(DEVICE))
 
         with torch.no_grad():
-            pred_anchor, _, pred_heading = model(query_imgs, rs_imgs)
+            pred_anchor, _ = model(query_imgs, rs_imgs, geo=geo)
 
         pred_anchor = pred_anchor.view(
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
@@ -304,14 +289,11 @@ def validate(loader, model, anchors_full, img_size):
             iou_threshold_list=[0.5, 0.25],
         )
 
-        heading_loss = F.mse_loss(pred_heading, heading_target)
-
         accu50_meter.update(accu_list[0].item(), query_imgs.shape[0])
         accu25_meter.update(accu_list[1].item(), query_imgs.shape[0])
         iou_meter.update(iou.item(), query_imgs.shape[0])
-        heading_meter.update(heading_loss.item(), query_imgs.shape[0])
 
-    return accu50_meter.avg, accu25_meter.avg, iou_meter.avg, heading_meter.avg
+    return accu50_meter.avg, accu25_meter.avg, iou_meter.avg
 
 
 def main(args):
@@ -370,30 +352,27 @@ def main(args):
     anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
     anchors_full = torch.tensor(anchors_full, dtype=torch.float32).to(DEVICE)
 
-    heading_loss_weight = args.heading_loss_weight
     print(f"Starting training for {args.max_epoch} epochs...")
     for epoch in range(args.max_epoch):
         adjust_learning_rate(args, optimizer, epoch)
 
-        train_loss, train_geo, train_cls, train_heading = train_epoch(
+        train_loss, train_geo, train_cls = train_epoch(
             train_loader,
             model,
             optimizer,
             epoch,
             anchors_full,
             args.img_size,
-            heading_loss_weight,
             args.print_freq,
         )
 
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/train_geo", train_geo, epoch)
         writer.add_scalar("Loss/train_cls", train_cls, epoch)
-        writer.add_scalar("Loss/train_heading", train_heading, epoch)
 
         print(
             f"Epoch {epoch + 1}/{args.max_epoch}:\t"
-            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f}, Heading: {train_heading:.4f})"
+            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})"
         )
         torch.save(model.state_dict(), f"{args.checkpoint}/last.pth")
 
@@ -452,17 +431,17 @@ def eval(args):
     anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
     anchors_full = torch.tensor(anchors_full, dtype=torch.float32).to(DEVICE)
 
-    accu50, accu25, val_iou, val_heading = validate(
+    accu50, accu25, val_iou = validate(
         test_loader, model, anchors_full, args.img_size
     )
     print(
-        f"Eval Accu50: {accu50:.4f}, Accu25: {accu25:.4f}, IoU: {val_iou:.4f}, Heading: {val_heading:.4f}"
+        f"Eval Accu50: {accu50:.4f}, Accu25: {accu25:.4f}, IoU: {val_iou:.4f}"
     )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="LPNGeoLite Training on GroundSmgeoDataset with Heading"
+        description="LPNGeoLite Training on GroundSmgeoDataset with Geo Conditioning"
     )
     parser.add_argument("--gpu", default="1", help="GPU id (e.g., '1' or '1,2')")
     parser.add_argument(
@@ -480,12 +459,6 @@ if __name__ == "__main__":
         metavar=("WIDTH", "HEIGHT"),
         default=list(IMG_SIZE),
         help="image size as WIDTH HEIGHT",
-    )
-    parser.add_argument(
-        "--heading-loss-weight",
-        type=float,
-        default=HEADING_LOSS_WEIGHT,
-        help="heading loss weight",
     )
     parser.add_argument(
         "--savename", type=str, default="ground_lpn", help="Name head for saved model"

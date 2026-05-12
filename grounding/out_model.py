@@ -55,6 +55,28 @@ class ResidualBlock(nn.Module):
         return x + self.conv(x)
 
 
+class GeoConditioner(nn.Module):
+    def __init__(self, channels: int, geo_dim: int = 3):
+        super().__init__()
+        hidden = max(channels // 4, 64)
+        self.mlp = nn.Sequential(
+            nn.Linear(geo_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, channels * 2),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, features: torch.Tensor, geo=None) -> torch.Tensor:
+        if geo is None:
+            return features
+        cond = self.mlp(geo.to(device=features.device, dtype=features.dtype))
+        gamma, beta = cond.chunk(2, dim=1)
+        gamma = gamma.view(-1, features.shape[1], 1, 1)
+        beta = beta.view(-1, features.shape[1], 1, 1)
+        return features * (1.0 + gamma) + beta
+
+
 class Encoder_gem(nn.Module):
     """Enhanced encoder with GeM pooling, gated fusion, and residual connections.
 
@@ -353,7 +375,7 @@ class Encoder_attn(nn.Module):
         return query_inputs["pixel_values"][0], search_inputs["pixel_values"][0]
 
 
-class Encoder_heading(nn.Module):
+class Encoder_geo(nn.Module):
     """Enhanced encoder with GeM pooling, gated fusion, and residual connections.
 
     Improvements over Encoder_attn:
@@ -414,20 +436,7 @@ class Encoder_heading(nn.Module):
             nn.GELU(),
             nn.Linear(self.feature_dim, self.feature_dim),
         )
-        self.bbox_heading = nn.Sequential(
-            nn.ConvTranspose2d(
-                in_channels=self.feature_dim,
-                out_channels=self.feature_dim // 2,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.ReLU(inplace=True),
-            ResidualBlock(self.feature_dim // 2),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(self.feature_dim // 2, 2),
-        )
+        self.geo_conditioner = GeoConditioner(self.feature_dim)
 
     def text_forward(self, input_ids, attention_mask=None):
         text_outputs = self.text_model(
@@ -443,7 +452,7 @@ class Encoder_heading(nn.Module):
         fused = gate * text_feats + (1 - gate) * anchor_feats
         return fused
 
-    def forward(self, anchor_pixel_values, search_pixel_values, input_ids=None):
+    def forward(self, anchor_pixel_values, search_pixel_values, input_ids=None, geo=None):
         B = anchor_pixel_values.shape[0]
 
         anchor_output = self.vision_model(anchor_pixel_values)
@@ -467,9 +476,9 @@ class Encoder_heading(nn.Module):
         fused_features = self.bbox_transformer(
             x=sat_features_2d, context=anchor_context
         )
+        fused_features = self.geo_conditioner(fused_features, geo)
 
         pred_anchor = self.bbox_fcn_out(fused_features)
-        pred_heading = torch.sigmoid(self.bbox_heading(fused_features))
 
         sat_feature_2d_pool = (
             self.pool_info_sat(sat_features_2d)
@@ -486,7 +495,6 @@ class Encoder_heading(nn.Module):
 
         return (
             pred_anchor,
-            pred_heading,
             text_feats,
             anchor_pooler,
             sat_feature_2d_pool,
@@ -576,20 +584,7 @@ class Encoder_abla(nn.Module):
             nn.GELU(),
             nn.Linear(self.feature_dim, self.feature_dim),
         )
-        self.bbox_heading = nn.Sequential(
-            nn.ConvTranspose2d(
-                in_channels=self.feature_dim,
-                out_channels=self.feature_dim // 2,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.ReLU(inplace=True),
-            ResidualBlock(self.feature_dim // 2),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(self.feature_dim // 2, 2),
-        )
+        self.geo_conditioner = GeoConditioner(self.feature_dim)
 
     def text_forward(self, input_ids, attention_mask=None):
         text_outputs = self.text_model(
@@ -605,7 +600,7 @@ class Encoder_abla(nn.Module):
         fused = gate * text_feats + (1 - gate) * anchor_feats
         return fused
 
-    def forward(self, anchor_pixel_values, search_pixel_values, input_ids=None):
+    def forward(self, anchor_pixel_values, search_pixel_values, input_ids=None, geo=None):
         B = anchor_pixel_values.shape[0]
 
         anchor_output = self.vision_model(anchor_pixel_values)
@@ -634,9 +629,9 @@ class Encoder_abla(nn.Module):
         fused_features = self.bbox_transformer(
             x=sat_features_2d, context=anchor_context
         )
+        fused_features = self.geo_conditioner(fused_features, geo)
 
         pred_anchor = self.bbox_fcn_out(fused_features)
-        pred_heading = torch.sigmoid(self.bbox_heading(fused_features))
 
         if self.useap:
             sat_feature_2d_pool = (
@@ -656,7 +651,6 @@ class Encoder_abla(nn.Module):
 
         return (
             pred_anchor,
-            pred_heading,
             text_feats,
             anchor_pooler,
             sat_feature_2d_pool,

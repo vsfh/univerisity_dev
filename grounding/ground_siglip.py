@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 @file ground_siglip.py
-@desc Training SigLIP with heading prediction.
+@desc Training SigLIP for grounding.
 """
 
 import time
@@ -46,6 +46,28 @@ class ResidualBlock(nn.Module):
         return x + self.conv(x)
 
 
+class GeoConditioner(nn.Module):
+    def __init__(self, channels: int, geo_dim: int = 3):
+        super().__init__()
+        hidden = max(channels // 4, 64)
+        self.mlp = nn.Sequential(
+            nn.Linear(geo_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, channels * 2),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, features: torch.Tensor, geo: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if geo is None:
+            return features
+        cond = self.mlp(geo.to(device=features.device, dtype=features.dtype))
+        gamma, beta = cond.chunk(2, dim=1)
+        gamma = gamma.view(-1, features.shape[1], 1, 1)
+        beta = beta.view(-1, features.shape[1], 1, 1)
+        return features * (1.0 + gamma) + beta
+
+
 class AverageMeter:
     def __init__(self):
         self.val = 0
@@ -74,7 +96,6 @@ UNIV_DRONE_SIZE = (224, 224)
 NUM_EPOCHS = 25
 BATCH_SIZE = 12
 LEARNING_RATE = 1e-4
-HEADING_LOSS_WEIGHT = 10.0
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 PROJECTION_DIM = 768
 FEATURE_DIM = 768
@@ -149,7 +170,7 @@ def resize_drone_image(image, target_size=UNIV_DRONE_SIZE):
 
 
 class HeadingGeoDataset(Dataset):
-    """Dataset with heading prediction."""
+    """Dataset that samples heading-specific drone views."""
 
     def __init__(self, image_pairs, bbox_dict, mode="train", transform=None):
         self.image_paths = image_pairs
@@ -381,21 +402,7 @@ class Encoder(nn.Module):
             nn.GELU(),
             nn.Linear(self.feature_dim, self.feature_dim),
         )
-
-        self.bbox_heading = nn.Sequential(
-            nn.ConvTranspose2d(
-                in_channels=self.feature_dim,
-                out_channels=self.feature_dim // 2,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.ReLU(inplace=True),
-            ResidualBlock(self.feature_dim // 2),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(self.feature_dim // 2, 2),
-        )
+        self.geo_conditioner = GeoConditioner(self.feature_dim)
 
     def sat_forward(self, pixel_values):
         embedding = self.vision_model.embeddings.patch_embedding(pixel_values)
@@ -415,7 +422,7 @@ class Encoder(nn.Module):
         proj_feature = self.text_projector(pooler_output)
         return proj_feature
 
-    def forward(self, anchor_pixel_values, search_pixel_values, input_ids=None):
+    def forward(self, anchor_pixel_values, search_pixel_values, input_ids=None, geo=None):
         B = anchor_pixel_values.shape[0]
 
         anchor_output = self.vision_model(anchor_pixel_values)
@@ -436,9 +443,9 @@ class Encoder(nn.Module):
         fused_features = self.bbox_transformer(
             x=sat_features_2d, context=anchor_context
         )
+        fused_features = self.geo_conditioner(fused_features, geo)
 
         pred_anchor = self.bbox_fcn_out(fused_features)
-        pred_heading = torch.sigmoid(self.bbox_heading(fused_features))
 
         sat_feature_2d_pool = (
             self.pool_info_sat(sat_features_2d)
@@ -452,10 +459,10 @@ class Encoder(nn.Module):
             pooler_output = text_outputs.pooler_output
             text_feats = self.text_projector(pooler_output)
 
-        return pred_anchor, pred_heading, text_feats, anchor_pooler, sat_feature_2d_pool
+        return pred_anchor, text_feats, anchor_pooler, sat_feature_2d_pool
 
-    def bbox_forward(self, anchor_pixel_values, search_pixel_values):
-        return self.forward(anchor_pixel_values, search_pixel_values, None)
+    def bbox_forward(self, anchor_pixel_values, search_pixel_values, geo=None):
+        return self.forward(anchor_pixel_values, search_pixel_values, None, geo=geo)
 
 
 def train_epoch(
@@ -465,7 +472,6 @@ def train_epoch(
     epoch,
     anchors_full,
     img_size,
-    heading_loss_weight,
     print_freq=50,
 ):
     """Train for one epoch."""
@@ -475,16 +481,14 @@ def train_epoch(
     losses = AverageMeter()
     geo_losses = AverageMeter()
     cls_losses = AverageMeter()
-    heading_losses = AverageMeter()
 
     end = time.time()
     for batch_idx, batch in enumerate(loader):
         query_imgs = batch["target_pixel_values"].to(DEVICE)
         rs_imgs = batch["search_pixel_values"].to(DEVICE)
         ori_gt_bbox = batch["bbox"].to(DEVICE)
-        heading_target = batch["heading"].to(DEVICE)
 
-        pred_anchor, pred_heading, _, _, _ = model(query_imgs, rs_imgs)
+        pred_anchor, _, _, _ = model(query_imgs, rs_imgs)
 
         pred_anchor = pred_anchor.view(
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
@@ -498,8 +502,7 @@ def train_epoch(
             pred_anchor, new_gt_bbox, anchors_full, best_anchor_gi_gj, img_size
         )
         bbox_loss = loss_geo + loss_cls
-        heading_loss = F.mse_loss(pred_heading, heading_target)
-        loss = bbox_loss + heading_loss * heading_loss_weight
+        loss = bbox_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -508,7 +511,6 @@ def train_epoch(
         losses.update(loss.item(), query_imgs.shape[0])
         geo_losses.update(loss_geo.item(), query_imgs.shape[0])
         cls_losses.update(loss_cls.item(), query_imgs.shape[0])
-        heading_losses.update(heading_loss.item(), query_imgs.shape[0])
 
         batch_time.update(time.time() - end)
         end = time.time()
@@ -519,11 +521,10 @@ def train_epoch(
                 f"Time: {batch_time.val:.3f}\t"
                 f"Loss: {losses.val:.4f} ({losses.avg:.4f})\t"
                 f"Geo: {geo_losses.val:.4f} ({geo_losses.avg:.4f})\t"
-                f"Cls: {cls_losses.val:.4f} ({cls_losses.avg:.4f})\t"
-                f"Heading: {heading_losses.val:.4f} ({heading_losses.avg:.4f})"
+                f"Cls: {cls_losses.val:.4f} ({cls_losses.avg:.4f})"
             )
 
-    return losses.avg, geo_losses.avg, cls_losses.avg, heading_losses.avg
+    return losses.avg, geo_losses.avg, cls_losses.avg
 
 
 def validate(loader, model, anchors_full, img_size):
@@ -533,16 +534,14 @@ def validate(loader, model, anchors_full, img_size):
     accu50_meter = AverageMeter()
     accu25_meter = AverageMeter()
     iou_meter = AverageMeter()
-    heading_meter = AverageMeter()
 
     for batch in tqdm(loader, desc="Validating"):
         query_imgs = batch["target_pixel_values"].to(DEVICE)
         rs_imgs = batch["search_pixel_values"].to(DEVICE)
         ori_gt_bbox = batch["bbox"].to(DEVICE)
-        heading_target = batch["heading"].to(DEVICE)
 
         with torch.no_grad():
-            pred_anchor, pred_heading, _, _, _ = model(query_imgs, rs_imgs)
+            pred_anchor, _, _, _ = model(query_imgs, rs_imgs)
 
         pred_anchor = pred_anchor.view(
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
@@ -562,15 +561,12 @@ def validate(loader, model, anchors_full, img_size):
                 iou_threshold_list=[0.5, 0.25],
             )
 
-            heading_loss = F.mse_loss(pred_heading[i], heading_target[i])
-
             accu50_meter.update(1.0 if iou.item() >= 0.5 else 0.0, 1)
             accu25_meter.update(1.0 if iou.item() >= 0.25 else 0.0, 1)
             iou_meter.update(iou.item(), 1)
             # iou_meter.update(iou.item(), query_imgs.shape[0])
-            heading_meter.update(heading_loss.item(), query_imgs.shape[0])
 
-    return accu50_meter.avg, accu25_meter.avg, iou_meter.avg, heading_meter.avg
+    return accu50_meter.avg, accu25_meter.avg, iou_meter.avg
 
 
 def main(save_path):
@@ -666,24 +662,22 @@ def main(save_path):
     print(f"Starting training on {DEVICE} for {NUM_EPOCHS} epochs...")
 
     for epoch in range(NUM_EPOCHS):
-        train_loss, train_geo, train_cls, train_heading = train_epoch(
+        train_loss, train_geo, train_cls = train_epoch(
             train_loader,
             model,
             optimizer,
             epoch,
             anchors_full,
             UNIV_SAT_SIZE[0],
-            HEADING_LOSS_WEIGHT,
         )
 
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/train_geo", train_geo, epoch)
         writer.add_scalar("Loss/train_cls", train_cls, epoch)
-        writer.add_scalar("Loss/train_heading", train_heading, epoch)
 
         print(
             f"Epoch {epoch + 1}/{NUM_EPOCHS}:\t"
-            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f}, Heading: {train_heading:.4f})"
+            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})"
         )
         os.makedirs(save_path, exist_ok=True)
         torch.save(model.state_dict(), f"{save_path}/last.pth")
@@ -771,7 +765,7 @@ def eval_ground():
         ori_gt_bbox = batch["bbox"].to(DEVICE)
 
         with torch.no_grad():
-            pred_anchor, pred_heading, _, _, _ = model(query_imgs, rs_imgs)
+            pred_anchor, _, _, _ = model(query_imgs, rs_imgs)
 
         pred_anchor = pred_anchor.view(
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]

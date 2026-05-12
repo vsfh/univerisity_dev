@@ -212,3 +212,5 @@ runs/
 *.npz
 *.pt
 .codex
+configs/
+eval_results/

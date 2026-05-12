@@ -25,6 +25,13 @@ from train_uni import (
     UnifyGeoLite,
     decode_bbox,
 )
+from train_trans import (
+    DETAIL_DIM as TRANS_DETAIL_DIM,
+    EMBED_DIM as TRANS_EMBED_DIM,
+    NUM_HEADS as TRANS_NUM_HEADS,
+    PATCH_SIZE as TRANS_PATCH_SIZE,
+    TransGeoGrounding,
+)
 
 
 # --- Configuration ---
@@ -36,6 +43,7 @@ DEFAULT_INCLUDE_FILE = "/media/data1/feihong/ckpt/include1.json"
 DEFAULT_ENCODER_HEAT_CONFIG_DIR = "/media/data1/feihong/univerisity_dev/configs/unified_siglip_supp"
 DEFAULT_ENCODER_HEAT_CHECKPOINT = "/media/data1/feihong/ckpt/model_full/best_iou.pth"
 DEFAULT_UNIFY_CHECKPOINT = "/media/data1/feihong/ckpt/unify_geo/best_iou.pth"
+DEFAULT_TRANS_CHECKPOINT = "/media/data1/feihong/ckpt/trans_geo/best_iou.pth"
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
 
@@ -318,6 +326,24 @@ def create_unify_loader(
     )
 
 
+def create_trans_loader(
+    batch_size: int,
+    num_workers: int,
+    sat_size: Tuple[int, int],
+    test_crop_ratio: float,
+    subset_heights: Optional[Sequence[int]],
+    subset_angles: Optional[Sequence[int]],
+) -> DataLoader:
+    return create_unify_loader(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        sat_size=sat_size,
+        test_crop_ratio=test_crop_ratio,
+        subset_heights=subset_heights,
+        subset_angles=subset_angles,
+    )
+
+
 def extract_encoder_heat_features(
     checkpoint_path: str,
     device: torch.device,
@@ -534,6 +560,119 @@ def extract_unify_features(
 
     gallery_labels = sorted(gallery_feat_dict.keys())
     temperature = float(model.decoder.temperature.detach().clamp(min=0.01, max=1.0).cpu().item())
+    logit_scale = float(model.logit_scale.detach().exp().clamp(max=100.0).cpu().item())
+
+    return FeatureBundle(
+        query_feats=torch.cat(query_feats, dim=0),
+        query_labels=query_labels,
+        query_drone_paths=query_drone_paths,
+        query_satellite_paths=query_satellite_paths,
+        query_heights=query_heights,
+        query_angles=query_angles,
+        iou_values=iou_values,
+        center_distances=center_distances,
+        gallery_labels=gallery_labels,
+        gallery_satellite_paths=[gallery_path_dict.get(label, "") for label in gallery_labels],
+        gallery_feats=torch.stack([gallery_feat_dict[label] for label in gallery_labels], dim=0),
+        query_detail_feats=torch.cat(query_detail_feats, dim=0),
+        gallery_detail_feats=torch.stack([gallery_detail_dict[label] for label in gallery_labels], dim=0),
+        unify_logit_scale=logit_scale,
+        unify_temperature=temperature,
+    )
+
+
+def extract_trans_features(
+    checkpoint_path: str,
+    device: torch.device,
+    batch_size: int,
+    num_workers: int,
+    sat_size: Tuple[int, int],
+    test_crop_ratio: float,
+    subset_heights: Optional[Sequence[int]],
+    subset_angles: Optional[Sequence[int]],
+    proj_dim: int,
+    detail_dim: int,
+    embed_dim: int,
+    depth: int,
+    num_heads: int,
+    patch_size: int,
+) -> FeatureBundle:
+    sat_hw = (int(sat_size[1]), int(sat_size[0]))
+    model = TransGeoGrounding(
+        sat_size=sat_hw,
+        drone_size=DRONE_SIZE,
+        proj_dim=proj_dim,
+        detail_dim=detail_dim,
+        embed_dim=embed_dim,
+        depth=depth,
+        num_heads=num_heads,
+        patch_size=patch_size,
+    ).to(device)
+    load_checkpoint(model, checkpoint_path)
+    model.eval()
+
+    loader = create_trans_loader(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        sat_size=sat_size,
+        test_crop_ratio=test_crop_ratio,
+        subset_heights=subset_heights,
+        subset_angles=subset_angles,
+    )
+
+    query_feats: List[torch.Tensor] = []
+    query_detail_feats: List[torch.Tensor] = []
+    query_labels: List[str] = []
+    query_drone_paths: List[str] = []
+    query_satellite_paths: List[str] = []
+    query_heights: List[int] = []
+    query_angles: List[int] = []
+    iou_values: List[float] = []
+    center_distances: List[float] = []
+    gallery_feat_dict: Dict[str, torch.Tensor] = {}
+    gallery_detail_dict: Dict[str, torch.Tensor] = {}
+    gallery_path_dict: Dict[str, str] = {}
+
+    with torch.inference_mode():
+        for batch in tqdm(loader, desc="Extract/eval [trans_geo]"):
+            query_imgs = batch["target_pixel_values"].to(device, non_blocking=True)
+            search_imgs = batch["search_pixel_values"].to(device, non_blocking=True)
+            gt_bbox = batch["bbox"].to(device, non_blocking=True)
+            outputs = model(query_imgs, search_imgs)
+
+            query_feats.append(outputs["query_global"].detach().cpu())
+            query_detail_feats.append(outputs["ground_detail"].detach().cpu())
+
+            batch_labels = [_path_label(path) for path in batch["satellite_path"]]
+            query_labels.extend(batch_labels)
+            query_drone_paths.extend([str(p) for p in batch["drone_path"]])
+            query_satellite_paths.extend([str(p) for p in batch["satellite_path"]])
+            query_heights.extend([int(v) for v in batch["height"].tolist()])
+            query_angles.extend([int(v) for v in batch["angle"].tolist()])
+
+            aerial_global = outputs["aerial_global"].detach().cpu()
+            aerial_detail = outputs["aerial_detail"].detach().cpu()
+            for idx, label in enumerate(batch_labels):
+                if label not in gallery_feat_dict:
+                    gallery_feat_dict[label] = aerial_global[idx]
+                    gallery_detail_dict[label] = aerial_detail[idx]
+                    gallery_path_dict[label] = str(batch["satellite_path"][idx])
+
+            pred_bbox = decode_bbox(
+                outputs["heatmap_logits"],
+                outputs["bbox_raw"],
+                image_wh=(search_imgs.shape[-1], search_imgs.shape[-2]),
+            )
+            ious = bbox_iou(pred_bbox, gt_bbox, x1y1x2y2=True)
+            for idx in range(pred_bbox.shape[0]):
+                iou_values.append(float(ious[idx].item()))
+                center_distances.append(center_distance(pred_bbox[idx].float(), gt_bbox[idx].float()))
+
+    if not query_feats or not gallery_feat_dict:
+        raise RuntimeError("No trans_geo features were extracted.")
+
+    gallery_labels = sorted(gallery_feat_dict.keys())
+    temperature = float(model.temperature.detach().clamp(min=0.01, max=1.0).cpu().item())
     logit_scale = float(model.logit_scale.detach().exp().clamp(max=100.0).cpu().item())
 
     return FeatureBundle(
@@ -814,6 +953,23 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
             proj_dim=args.proj_dim,
             detail_dim=args.detail_dim,
         )
+    elif model_type == "trans_geo":
+        bundle = extract_trans_features(
+            checkpoint_path=checkpoint_path,
+            device=device,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            sat_size=sat_size,
+            test_crop_ratio=args.test_crop_ratio,
+            subset_heights=subset_heights,
+            subset_angles=subset_angles,
+            proj_dim=args.trans_proj_dim,
+            detail_dim=args.trans_detail_dim,
+            embed_dim=args.trans_embed_dim,
+            depth=args.trans_depth,
+            num_heads=args.trans_num_heads,
+            patch_size=args.trans_patch_size,
+        )
     else:
         raise ValueError(f"Unsupported model_type: {model_type}")
 
@@ -860,6 +1016,8 @@ def checkpoint_for_model(model_type: str, args: argparse.Namespace) -> str:
         return args.encoder_heat_checkpoint
     if model_type == "unify_geo":
         return args.unify_checkpoint
+    if model_type == "trans_geo":
+        return args.trans_checkpoint
     raise ValueError(f"Unsupported model_type: {model_type}")
 
 
@@ -911,7 +1069,7 @@ def parse_args() -> argparse.Namespace:
         "--model-types",
         nargs="+",
         default=["encoder_heat"],
-        choices=["encoder_heat", "unify_geo"],
+        choices=["encoder_heat", "unify_geo", "trans_geo"],
     )
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--encoder-heat-checkpoint", type=str, default=DEFAULT_ENCODER_HEAT_CHECKPOINT)
@@ -925,6 +1083,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-heat-use-ap", action="store_true", default=True)
     parser.add_argument("--no-encoder-heat-use-ap", dest="encoder_heat_use_ap", action="store_false")
     parser.add_argument("--unify-checkpoint", type=str, default=DEFAULT_UNIFY_CHECKPOINT)
+    parser.add_argument("--trans-checkpoint", type=str, default=DEFAULT_TRANS_CHECKPOINT)
     parser.add_argument("--device", type=str, default=DEFAULT_DEVICE)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=8)
@@ -947,6 +1106,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-dim", type=int, default=96)
     parser.add_argument("--proj-dim", type=int, default=PROJECTION_DIM)
     parser.add_argument("--detail-dim", type=int, default=384)
+    parser.add_argument("--trans-proj-dim", type=int, default=PROJECTION_DIM)
+    parser.add_argument("--trans-detail-dim", type=int, default=TRANS_DETAIL_DIM)
+    parser.add_argument("--trans-embed-dim", type=int, default=TRANS_EMBED_DIM)
+    parser.add_argument("--trans-depth", type=int, default=12)
+    parser.add_argument("--trans-num-heads", type=int, default=TRANS_NUM_HEADS)
+    parser.add_argument("--trans-patch-size", type=int, default=TRANS_PATCH_SIZE)
     parser.add_argument("--seed", type=int, default=43)
     parser.add_argument("--save-query-records", action="store_true")
     return parser.parse_args()

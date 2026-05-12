@@ -536,7 +536,10 @@ def evaluate(config: EvalConfig) -> Dict[str, Any]:
 
         with torch.no_grad():
             if hasattr(model, "bbox_forward"):
-                output = model.bbox_forward(query_imgs, search_imgs)
+                try:
+                    output = model.bbox_forward(query_imgs, search_imgs, geo=geo)
+                except TypeError:
+                    output = model.bbox_forward(query_imgs, search_imgs)
             elif model_type in {"encoder_abla", "encoder_heat"}:
                 output = model(query_imgs, search_imgs, input_ids=input_ids, angle=geo)
             else:

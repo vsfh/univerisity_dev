@@ -42,7 +42,6 @@ from grounding.model.loss import adjust_learning_rate
 from grounding.utils.utils import AverageMeter, eval_iou_acc
 from grounding.utils.checkpoint import save_checkpoint
 from grounding.model.darknet import *
-from grounding.out_model import ResidualBlock
 
 DATA_ROOT = "/media/data1/feihong/CVOGL"
 DATA_NAME = "CVOGL_DroneAerial"
@@ -120,6 +119,30 @@ class CrossViewFusionModule(nn.Module):
         return context, attn
 
 
+class GeoConditioner(nn.Module):
+    """FiLM-style conditioning from [cos(angle), sin(angle), height/300]."""
+
+    def __init__(self, channels: int, geo_dim: int = 3):
+        super().__init__()
+        hidden = max(channels // 4, 64)
+        self.mlp = nn.Sequential(
+            nn.Linear(geo_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, channels * 2),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, features: torch.Tensor, geo: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if geo is None:
+            return features
+        cond = self.mlp(geo.to(device=features.device, dtype=features.dtype))
+        gamma, beta = cond.chunk(2, dim=1)
+        gamma = gamma.view(-1, features.shape[1], 1, 1)
+        beta = beta.view(-1, features.shape[1], 1, 1)
+        return features * (1.0 + gamma) + beta
+
+
 class TROGeoLite(nn.Module):
     """Simplified TROGeo without click point input for direct bbox regression."""
 
@@ -133,6 +156,7 @@ class TROGeoLite(nn.Module):
         self.cross_attention = SpatialTransformer(
             in_channels=emb_size, n_heads=12, d_head=64, depth=1, context_dim=emb_size
         )
+        self.geo_conditioner = GeoConditioner(emb_size)
 
         self.fcn_out = nn.Sequential(
             nn.ConvTranspose2d(
@@ -158,46 +182,21 @@ class TROGeoLite(nn.Module):
             nn.Conv2d(emb_size // 2, 1, kernel_size=1),
         )
 
-        self.bbox_heading = nn.Sequential(
-            nn.ConvTranspose2d(
-                in_channels=emb_size,
-                out_channels=emb_size // 2,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.ReLU(inplace=True),
-            ResidualBlock(emb_size // 2),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(emb_size // 2, 2),
-        )
-
-    def forward(self, query_imgs, reference_imgs):
+    def forward(self, query_imgs, reference_imgs, geo=None):
         query_fvisu = self.query_model(query_imgs)
         reference_fvisu = self.reference_model(reference_imgs)
 
         context = rearrange(query_fvisu, "b c h w -> b (h w) c").contiguous()
         fused_features = self.cross_attention(x=reference_fvisu, context=context)
+        fused_features = self.geo_conditioner(fused_features, geo)
 
         outbox = self.fcn_out(fused_features)
         coodrs = self.coodrs_out(fused_features)
-        pred_heading = torch.sigmoid(self.bbox_heading(fused_features))
 
-        return outbox, coodrs, pred_heading
+        return outbox, coodrs
 
-    def bbox_forward(self, query_imgs, reference_imgs):
-        query_fvisu = self.query_model(query_imgs)
-        reference_fvisu = self.reference_model(reference_imgs)
-
-        context = rearrange(query_fvisu, "b c h w -> b (h w) c").contiguous()
-        fused_features = self.cross_attention(x=reference_fvisu, context=context)
-
-        outbox = self.fcn_out(fused_features)
-        coodrs = self.coodrs_out(fused_features)
-        pred_heading = torch.sigmoid(self.bbox_heading(fused_features))
-
-        return outbox, coodrs, pred_heading
+    def bbox_forward(self, query_imgs, reference_imgs, geo=None):
+        return self.forward(query_imgs, reference_imgs, geo=geo)
 
 
 class SampleGeoLite(nn.Module):
@@ -213,6 +212,7 @@ class SampleGeoLite(nn.Module):
         self.cross_attention = SpatialTransformer(
             in_channels=emb_size, n_heads=12, d_head=64, depth=1, context_dim=emb_size
         )
+        self.geo_conditioner = GeoConditioner(emb_size)
 
         self.fcn_out = nn.Sequential(
             nn.ConvTranspose2d(
@@ -238,46 +238,21 @@ class SampleGeoLite(nn.Module):
             nn.Conv2d(emb_size // 2, 1, kernel_size=1),
         )
 
-        self.bbox_heading = nn.Sequential(
-            nn.ConvTranspose2d(
-                in_channels=emb_size,
-                out_channels=emb_size // 2,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.ReLU(inplace=True),
-            ResidualBlock(emb_size // 2),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(emb_size // 2, 2),
-        )
-
-    def forward(self, query_imgs, reference_imgs):
+    def forward(self, query_imgs, reference_imgs, geo=None):
         query_fvisu = self.query_model.forward_features(query_imgs)
         reference_fvisu = self.reference_model.forward_features(reference_imgs)
 
         context = rearrange(query_fvisu, "b c h w -> b (h w) c").contiguous()
         fused_features = self.cross_attention(x=reference_fvisu, context=context)
+        fused_features = self.geo_conditioner(fused_features, geo)
 
         outbox = self.fcn_out(fused_features)
         coodrs = self.coodrs_out(fused_features)
-        pred_heading = torch.sigmoid(self.bbox_heading(fused_features))
 
-        return outbox, coodrs, pred_heading
+        return outbox, coodrs
 
-    def bbox_forward(self, query_imgs, reference_imgs):
-        query_fvisu = self.query_model.forward_features(query_imgs)
-        reference_fvisu = self.reference_model.forward_features(reference_imgs)
-
-        context = rearrange(query_fvisu, "b c h w -> b (h w) c").contiguous()
-        fused_features = self.cross_attention(x=reference_fvisu, context=context)
-
-        outbox = self.fcn_out(fused_features)
-        coodrs = self.coodrs_out(fused_features)
-        pred_heading = torch.sigmoid(self.bbox_heading(fused_features))
-
-        return outbox, coodrs, pred_heading
+    def bbox_forward(self, query_imgs, reference_imgs, geo=None):
+        return self.forward(query_imgs, reference_imgs, geo=geo)
 
 
 class LPNGeoLite(nn.Module):
@@ -296,6 +271,7 @@ class LPNGeoLite(nn.Module):
         self.cross_attention = SpatialTransformer(
             in_channels=emb_size, n_heads=12, d_head=64, depth=1, context_dim=emb_size
         )
+        self.geo_conditioner = GeoConditioner(emb_size)
 
         self.fcn_out = nn.Sequential(
             nn.ConvTranspose2d(
@@ -321,46 +297,21 @@ class LPNGeoLite(nn.Module):
             nn.Conv2d(emb_size // 2, 1, kernel_size=1),
         )
 
-        self.bbox_heading = nn.Sequential(
-            nn.ConvTranspose2d(
-                in_channels=emb_size,
-                out_channels=emb_size // 2,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
-            nn.ReLU(inplace=True),
-            ResidualBlock(emb_size // 2),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(emb_size // 2, 2),
-        )
-
-    def forward(self, query_imgs, reference_imgs):
+    def forward(self, query_imgs, reference_imgs, geo=None):
         query_fvisu = self.query_model(query_imgs)[0]
         reference_fvisu = self.reference_model(reference_imgs)[0]
 
         context = rearrange(query_fvisu, "b c h w -> b (h w) c").contiguous()
         fused_features = self.cross_attention(x=reference_fvisu, context=context)
+        fused_features = self.geo_conditioner(fused_features, geo)
 
         outbox = self.fcn_out(fused_features)
         coodrs = self.coodrs_out(fused_features)
-        pred_heading = torch.sigmoid(self.bbox_heading(fused_features))
 
-        return outbox, coodrs, pred_heading
+        return outbox, coodrs
 
-    def bbox_forward(self, query_imgs, reference_imgs):
-        query_fvisu = self.query_model(query_imgs)[0]
-        reference_fvisu = self.reference_model(reference_imgs)[0]
-
-        context = rearrange(query_fvisu, "b c h w -> b (h w) c").contiguous()
-        fused_features = self.cross_attention(x=reference_fvisu, context=context)
-
-        outbox = self.fcn_out(fused_features)
-        coodrs = self.coodrs_out(fused_features)
-        pred_heading = torch.sigmoid(self.bbox_heading(fused_features))
-
-        return outbox, coodrs, pred_heading
+    def bbox_forward(self, query_imgs, reference_imgs, geo=None):
+        return self.forward(query_imgs, reference_imgs, geo=geo)
 
 
 class DetGeoLite(nn.Module):
@@ -402,6 +353,7 @@ class DetGeoLite(nn.Module):
             leaky=True,
             instance=use_instnorm,
         )
+        self.geo_conditioner = GeoConditioner(emb_size)
 
         self.fcn_out = nn.Sequential(
             ConvBatchNormReLU(
@@ -417,7 +369,7 @@ class DetGeoLite(nn.Module):
             nn.Conv2d(emb_size // 2, 1, kernel_size=1),
         )
 
-    def forward(self, query_imgs, reference_imgs, click_pts=None):
+    def forward(self, query_imgs, reference_imgs, click_pts=None, geo=None):
         if click_pts is not None:
             click_pts = click_pts.unsqueeze(1)
             query_imgs = self.combine_clickptns_conv(
@@ -441,6 +393,7 @@ class DetGeoLite(nn.Module):
         fused_features, attn_score = self.crossview_fusionmodule(
             query_gvisu, reference_fvisu
         )
+        fused_features = self.geo_conditioner(fused_features, geo)
         attn_score = attn_score.squeeze(1)
 
         outbox = self.fcn_out(fused_features)
@@ -448,7 +401,7 @@ class DetGeoLite(nn.Module):
 
         return outbox, coodrs
 
-    def bbox_forward(self, query_imgs, reference_imgs, click_pts=None):
+    def bbox_forward(self, query_imgs, reference_imgs, click_pts=None, geo=None):
         if click_pts is not None:
             click_pts = click_pts.unsqueeze(1)
             query_imgs = self.combine_clickptns_conv(
@@ -472,6 +425,7 @@ class DetGeoLite(nn.Module):
         fused_features, attn_score = self.crossview_fusionmodule(
             query_gvisu, reference_fvisu
         )
+        fused_features = self.geo_conditioner(fused_features, geo)
         attn_score = attn_score.squeeze(1)
 
         outbox = self.fcn_out(fused_features)
