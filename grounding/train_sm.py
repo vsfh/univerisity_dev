@@ -262,11 +262,11 @@ class SwinMoEBackbone(nn.Module):
 
     def __init__(
         self,
-        embed_dim: int = 64,
-        patch_size: int = 8,
+        embed_dim: int = 96,
+        patch_size: int = 4,
         window_size: int = 8,
-        depths: Tuple[int, ...] = (1, 1, 2),
-        num_heads: Tuple[int, ...] = (2, 4, 8),
+        depths: Tuple[int, ...] = (2, 2, 6, 2),
+        num_heads: Tuple[int, ...] = (3, 6, 12, 24),
         num_experts: int = 4,
         top_k: int = 2,
     ):
@@ -357,8 +357,8 @@ class AnchorFreeHead(nn.Module):
 class SMGeoLite(nn.Module):
     def __init__(
         self,
-        embed_dim: int = 64,
-        patch_size: int = 8,
+        embed_dim: int = 96,
+        patch_size: int = 4,
         window_size: int = 8,
         num_experts: int = 4,
         top_k: int = 2,
@@ -702,10 +702,10 @@ if __name__ == "__main__":
     parser.add_argument("--savename", type=str, default="ground_sm", help="TensorBoard run name")
     parser.add_argument("--seed", type=int, default=2024, help="random seed")
     parser.add_argument("--print-freq", type=int, default=PRINT_FREQ, help="print frequency")
-    parser.add_argument("--embed-dim", type=int, default=64, help="Swin patch embedding dimension")
-    parser.add_argument("--patch-size", type=int, default=8, help="patch size for query and satellite inputs")
+    parser.add_argument("--embed-dim", type=int, default=96, help="Swin patch embedding dimension")
+    parser.add_argument("--patch-size", type=int, default=4, help="patch size for query and satellite inputs")
     parser.add_argument("--window-size", type=int, default=8, help="local attention window size")
-    parser.add_argument("--num-experts", type=int, default=4, help="number of sparse MoE experts")
+    parser.add_argument("--num-experts", type=int, default=6, help="number of sparse MoE experts")
     parser.add_argument("--top-k", type=int, default=2, help="number of active experts per token")
     parser.add_argument("--heatmap-sigma", type=float, default=HEATMAP_SIGMA, help="Gaussian target sigma in feature cells")
     parser.add_argument("--bbox-loss-weight", type=float, default=BBOX_LOSS_WEIGHT, help="bbox loss weight")
