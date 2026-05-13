@@ -62,6 +62,9 @@ class Config:
     BATCH_SIZE = 16
     GRAD_ACCUMULATION_STEPS = 2
     LEARNING_RATE = 5e-5
+    USE_DIFFERENTIAL_LR = True
+    VISION_LEARNING_RATE = None
+    VISION_LR_MULTIPLIER = 0.1
     LR_MIN = 1e-10
     COSINE_EPOCHS = NUM_EPOCHS
     BBOX_LOSS_WEIGHT = 0.5
@@ -85,11 +88,13 @@ class Config:
     USE_HEATMAP_LOSS = True
     HEATMAP_LOSS_WEIGHT = 0.2
     HEATMAP_LOSS_TYPE = ["mse", "cross_entropy"]  # mse | cross_entropy | weighted_bce
-    HEATMAP_TARGET_MODE = "bbox_aware"  # center | bbox_aware
-    HEATMAP_SIGMA = 4
+    HEATMAP_TARGET_MODE = "bbox_center"  # center | bbox_aware | bbox_center
+    HEATMAP_SIGMA = 1.5
     HEATMAP_RADIUS = 4.5
-    HEATMAP_BBOX_INSIDE_VALUE = 0.4
-    HEATMAP_BBOX_OUTSIDE_VALUE = 0.1
+    HEATMAP_BBOX_INSIDE_VALUE = 0.5
+    HEATMAP_BBOX_OUTSIDE_VALUE = 0.2
+    HEATMAP_BBOX_CENTER_EDGE_VALUE = 0.2
+    HEATMAP_BBOX_CENTER_LOG_SCALE = 9.0
     HEATMAP_POS_WEIGHT = 8.0
     HEATMAP_CONFIDENCE_WEIGHT = 0.5
     HEATMAP_VIS_MAX_SAMPLES = 10
@@ -223,6 +228,9 @@ def build_dataloader_kwargs(num_workers: int, drop_last: bool = False) -> Dict:
     return kwargs
 
 
+def build_optimizer(model: nn.Module) -> AdamW:
+    return AdamW(model.parameters(), lr=Config.LEARNING_RATE)
+
 def build_geo_features(batch: Dict, device: torch.device) -> Optional[torch.Tensor]:
     if not Config.USE_ANGLE_INPUT:
         return None
@@ -328,10 +336,37 @@ def build_heatmap_target(
         inside_target = inside * float(Config.HEATMAP_BBOX_INSIDE_VALUE)
         outside_target = outside_band * float(Config.HEATMAP_BBOX_OUTSIDE_VALUE)
         target = torch.maximum(center_target, torch.maximum(inside_target, outside_target))
+    elif Config.HEATMAP_TARGET_MODE == "bbox_center":
+        x_img = (xs + 0.5) / max(float(grid_w), 1.0) * image_w
+        y_img = (ys + 0.5) / max(float(grid_h), 1.0) * image_h
+
+        inside_x = (x_img >= x1.view(-1, 1, 1)) & (x_img <= x2.view(-1, 1, 1))
+        inside_y = (y_img >= y1.view(-1, 1, 1)) & (y_img <= y2.view(-1, 1, 1))
+        inside = inside_x & inside_y
+
+        center_img_x = (x1 + x2).view(-1, 1, 1) * 0.5
+        center_img_y = (y1 + y2).view(-1, 1, 1) * 0.5
+        half_w = ((x2 - x1) * 0.5).view(-1, 1, 1).clamp_min(1e-6)
+        half_h = ((y2 - y1) * 0.5).view(-1, 1, 1).clamp_min(1e-6)
+
+        norm_radius = torch.maximum(
+            (x_img - center_img_x).abs() / half_w,
+            (y_img - center_img_y).abs() / half_h,
+        ).clamp(0.0, 1.0)
+        log_scale = max(float(Config.HEATMAP_BBOX_CENTER_LOG_SCALE), 1e-6)
+        decay = torch.log1p(norm_radius * log_scale) / np.log1p(log_scale)
+        edge_value = float(Config.HEATMAP_BBOX_CENTER_EDGE_VALUE)
+        target = 1.0 - (1.0 - edge_value) * decay
+        target = target * inside.to(dtype=dtype)
+
+        center_x_idx = torch.floor(center_x).long().clamp(0, grid_w - 1)
+        center_y_idx = torch.floor(center_y).long().clamp(0, grid_h - 1)
+        batch_idx = torch.arange(target.shape[0], device=device)
+        target[batch_idx, center_y_idx, center_x_idx] = 1.0
     else:
         raise ValueError(
             f"Invalid HEATMAP_TARGET_MODE={Config.HEATMAP_TARGET_MODE}. "
-            "Choose 'center' or 'bbox_aware'."
+            "Choose 'center', 'bbox_aware', or 'bbox_center'."
         )
     return target.unsqueeze(1).clamp(0.0, 1.0)
 
@@ -878,14 +913,14 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     )
     accelerator.print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")
 
-    optimizer = AdamW(model.parameters(), lr=Config.LEARNING_RATE)
-    trainable_param_count = sum(
-        param.numel() for param in model.parameters() if param.requires_grad
-    )
-    accelerator.print(
-        f"Optimizer: lr={Config.LEARNING_RATE:.2e}, "
-        f"trainable params={trainable_param_count:,}"
-    )
+    optimizer = build_optimizer(model)
+    for group in optimizer.param_groups:
+        group_name = group.get("name", "default")
+        group_param_count = sum(param.numel() for param in group["params"])
+        accelerator.print(
+            f"Optimizer group '{group_name}': "
+            f"lr={group['lr']:.2e}, params={group_param_count:,}"
+        )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=Config.COSINE_EPOCHS
     )
@@ -1081,11 +1116,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 writer.add_scalar("Loss/img_text_step", img_text_loss.item(), global_step)
                 writer.add_scalar("Weight/retrieval", retrieval_weight, global_step)
                 writer.add_scalar("Weight/bbox", bbox_weight, global_step)
-                writer.add_scalar(
-                    "lr/learning_rate",
-                    optimizer.param_groups[0]["lr"],
-                    global_step,
-                )
 
             if clearml_logger is not None:
                 clearml_logger.report_scalar("train", "loss", loss.item(), global_step)
@@ -1097,12 +1127,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 )
                 clearml_logger.report_scalar(
                     "train", "img_text_loss", img_text_loss.item(), global_step
-                )
-                clearml_logger.report_scalar(
-                    "lr",
-                    "learning_rate",
-                    optimizer.param_groups[0]["lr"],
-                    global_step,
                 )
 
         scheduler.step()
@@ -1119,6 +1143,10 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 total_heatmap_loss / len(train_dataloader),
                 epoch,
             )
+            writer.add_scalar("lr/learning_rate", optimizer.param_groups[0]["lr"], epoch)
+            for group_idx, group in enumerate(optimizer.param_groups):
+                group_name = str(group.get("name", f"group_{group_idx}"))
+                writer.add_scalar(f"lr/{group_name}", group["lr"], epoch)
             log_heatmap_images(
                 writer,
                 last_heatmap_logits,
@@ -1162,6 +1190,10 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
             #         save_filename = f"{save_path}/best_iou.pth"
             #         accelerator.save(unwrapped_model.state_dict(), save_filename)
             #         accelerator.print(f"Saved best IoU checkpoint: {save_filename}")
+
+        if clearml_logger is not None:
+            current_lr = optimizer.param_groups[0]["lr"]
+            clearml_logger.report_scalar("lr", "learning_rate", current_lr, epoch)
 
     accelerator.print("Training complete.")
     if accelerator.is_main_process:

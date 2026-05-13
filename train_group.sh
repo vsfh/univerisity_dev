@@ -10,10 +10,10 @@ CONFIGS=(
     # "configs/unified_siglip_supp/model_wo_angle.yaml"
     # "configs/unified_siglip_supp/model_wo_text.yaml"
     # "configs/unified_siglip_supp/model_wo_angle_wo_text.yaml"    
-    "configs/unified_siglip_supp/end_num/model_end1.yaml"
-    "configs/unified_siglip_supp/end_num/model_end2.yaml"
-    "configs/unified_siglip_supp/end_num/model_end3.yaml"
-    "configs/unified_siglip_supp/end_num/model_end4.yaml"
+    # "configs/unified_siglip_supp/end_num/model_end1.yaml"
+    # "configs/unified_siglip_supp/end_num/model_end2.yaml"
+    # "configs/unified_siglip_supp/end_num/model_end3.yaml"
+    # "configs/unified_siglip_supp/end_num/model_end4.yaml"
     "configs/unified_siglip_supp/end_num/model_end5.yaml"
 )
 

@@ -402,7 +402,7 @@ class Encoder_text_angle(nn.Module):
 
         nn.init.zeros_(self.bbox_adapter[-1].weight)
         nn.init.zeros_(self.bbox_adapter[-1].bias)
-        self.text_weight = nn.Parameter(torch.tensor([0.693]))
+        self.text_weight = nn.Parameter(torch.tensor([0.001]))
         self.f_param = nn.Parameter(torch.tensor([0.693]))
 
     def vision_forward(
@@ -769,6 +769,7 @@ class Encoder_heat(Encoder_text_angle):
 
         anchor_pooler = self.attnPooling(anchor_feats, 1)[:, 0, :]
         text_feats = None
+        anchor_pooler_x = None
         if input_ids is not None:
             text_outputs = self.text_model(
                 input_ids=input_ids,
@@ -779,9 +780,8 @@ class Encoder_heat(Encoder_text_angle):
                 p=2,
                 dim=1,
             )
-            anchor_pooler = F.normalize(anchor_pooler, p=2, dim=1)
-            text_weight = 0.05
-            anchor_pooler = (1 - text_weight) * anchor_pooler + text_weight * text_feats
+            anchor_pooler_x = F.normalize(anchor_pooler, p=2, dim=1)
+            anchor_pooler = F.normalize(anchor_pooler_x + self.text_weight * text_feats, p=2, dim=1)
 
 
         fused_feats = None
@@ -846,7 +846,7 @@ class Encoder_heat(Encoder_text_angle):
         return (
             pred_anchor,
             None,
-            text_feats,
+            anchor_pooler_x,
             anchor_pooler,
             sat_feature_2d_pool,
             fused_feats,

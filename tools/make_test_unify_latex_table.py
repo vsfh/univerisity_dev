@@ -1,12 +1,20 @@
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple, Union
 
 
 DEFAULT_INPUT = (
-    "eval_results/test_unify/test_unify_encoder_heat_configs_summary.json"
+    # "eval_results/test_unify/test_unify_encoder_heat_configs_summary.json",
+    "eval_results/test_unify/test_unify_encoder_heat_model_end1.json",
+    "eval_results/test_unify/test_unify_encoder_heat_model_end2.json",
+    "eval_results/test_unify/test_unify_encoder_heat_model_end3.json",
+    "eval_results/test_unify/test_unify_encoder_heat_model_end4.json",
+    "eval_results/test_unify/test_unify_encoder_heat_model_end5.json"
 )
+
+InputPath = Union[str, Path]
+InputPaths = Union[InputPath, Sequence[InputPath]]
 
 RETRIEVAL_COLUMNS: Sequence[Tuple[str, str]] = (
     ("recall@1", "R@1"),
@@ -35,6 +43,18 @@ def load_results(path: Path) -> List[Dict[str, Any]]:
     if isinstance(payload, list):
         return payload
     raise ValueError(f"Expected JSON list or object, got {type(payload).__name__}.")
+
+
+def load_all_results(inputs: InputPaths) -> List[Dict[str, Any]]:
+    if isinstance(inputs, (str, Path)):
+        input_paths = [inputs]
+    else:
+        input_paths = list(inputs)
+
+    results: List[Dict[str, Any]] = []
+    for path in input_paths:
+        results.extend(load_results(Path(path)))
+    return results
 
 
 def latex_escape(value: Any) -> str:
@@ -160,7 +180,12 @@ def parse_args() -> argparse.Namespace:
             "table with retrieval, grounding, and unify metrics."
         )
     )
-    parser.add_argument("--input", default=DEFAULT_INPUT, help="Input summary JSON.")
+    parser.add_argument(
+        "--input",
+        nargs="+",
+        default=DEFAULT_INPUT,
+        help="Input summary JSON path(s).",
+    )
     parser.add_argument("--output", default='eval_results/test_unify/res_tab.tex', help="Optional output .tex path.")
     parser.add_argument("--precision", type=int, default=2, help="Decimal places.")
     parser.add_argument(
@@ -183,7 +208,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    results = load_results(Path(args.input))
+    results = load_all_results(args.input)
     table = build_latex_table(
         results,
         precision=args.precision,
