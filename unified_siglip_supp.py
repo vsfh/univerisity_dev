@@ -25,7 +25,13 @@ from accelerate.utils import DistributedDataParallelKwargs
 from transformers import AutoImageProcessor, AutoModel, AutoTokenizer
 import yaml
 
-from model import Encoder_text_angle, Encoder_abla, Encoder_heat
+from model import (
+    Encoder_text_angle,
+    Encoder_abla,
+    Encoder_heat,
+    Encoder_sig,
+    SIGLIP2_MODEL_NAME,
+)
 from bbox.yolo_utils import (
     get_tensor_anchors,
     build_target,
@@ -83,7 +89,7 @@ class Config:
     ENABLE_TF32 = True
     USE_ANGLE_INPUT = True
     USE_TEXT_INPUT = True
-    ENCODER_TYPE = "heat"  # text_angle | heat
+    ENCODER_TYPE = "heat"  # text_angle | heat | sig
     OPTIMIZE_OBJECTIVE = "combined"  # combined | img_text_only | bbox_only
     USE_HEATMAP_LOSS = True
     HEATMAP_LOSS_WEIGHT = 0.2
@@ -230,6 +236,13 @@ def build_dataloader_kwargs(num_workers: int, drop_last: bool = False) -> Dict:
 
 def build_optimizer(model: nn.Module) -> AdamW:
     return AdamW(model.parameters(), lr=Config.LEARNING_RATE)
+
+
+def effective_model_name() -> str:
+    if Config.ENCODER_TYPE == "sig" and Config.MODEL_NAME == "google/siglip-base-patch16-224":
+        return SIGLIP2_MODEL_NAME
+    return Config.MODEL_NAME
+
 
 def build_geo_features(batch: Dict, device: torch.device) -> Optional[torch.Tensor]:
     if not Config.USE_ANGLE_INPUT:
@@ -565,8 +578,21 @@ def build_encoder(use_ap: bool, usesg: bool = True) -> nn.Module:
             usesg=usesg,
             useap=use_ap,
         )
+    if Config.ENCODER_TYPE == "sig":
+        model_name = effective_model_name()
+        return Encoder_sig(
+            model_name=model_name,
+            proj_dim=Config.PROJECTION_DIM,
+            usesg=usesg,
+            useap=use_ap,
+            query_image_size=Config.DRONE_SIZE,
+            search_image_size=(
+                Config.UNIV_SAT_SIZE["height"],
+                Config.UNIV_SAT_SIZE["width"],
+            ),
+        )
     raise ValueError(
-        f"Invalid ENCODER_TYPE={Config.ENCODER_TYPE}. Choose 'text_angle' or 'heat'."
+        f"Invalid ENCODER_TYPE={Config.ENCODER_TYPE}. Choose 'text_angle', 'heat', or 'sig'."
     )
 
 
@@ -749,18 +775,11 @@ def validate(
         positive_indices[row_indices_flat, global_positive_indices] = 0.95
 
         if useap:
-            if fused_feats is not None:
-                img_text_loss = 0.7 * info_nce_loss(
-                    fused_feats, candidate_feats, positive_indices
-                )
-                img_text_loss += 0.3 * info_nce_loss(
-                    anchor_feats, candidate_feats, positive_indices
-                )
-            else:
-                # No text branch: fall back to image-only retrieval objective.
-                img_text_loss = info_nce_loss(
-                    anchor_feats, candidate_feats, positive_indices
-                )
+            img_text_loss = info_nce_loss(
+                anchor_feats,
+                candidate_feats,
+                positive_indices,
+            )
         else:
             scorer_input = fused_feats if fused_feats is not None else anchor_feats
             scores = model.scorer(scorer_input, candidate_feats)
@@ -868,15 +887,16 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         )
 
     accelerator.print("Loading models and processor...")
+    model_name = effective_model_name()
     processor = AutoImageProcessor.from_pretrained(
-        Config.MODEL_NAME, cache_dir=Config.CACHE_DIR
+        model_name, cache_dir=Config.CACHE_DIR
     )
     processor_sat = AutoImageProcessor.from_pretrained(
-        Config.MODEL_NAME,
+        model_name,
         cache_dir=Config.CACHE_DIR,
         size=Config.UNIV_SAT_SIZE,
     )
-    tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     model = build_encoder(use_ap, usesg=Config.OPTIMIZE_OBJECTIVE != "bbox_only")
     # model = Encoder_dino()
@@ -1054,22 +1074,12 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     row_indices_flat = torch.arange(B, device=accelerator.device)
                     positive_indices[row_indices_flat, global_positive_indices] = 0.92
 
-
-                    # if fused_feats is not None:
-                    #     img_text_loss = 0.7 * info_nce_loss(
-                    #         fused_feats, candidate_feats, positive_indices
-                    #     )
-                    #     img_text_loss += 0.3 * info_nce_loss(
-                    #         anchor_feats, candidate_feats, positive_indices
-                    #     )
-                    # else:
-                        # No text branch: fall back to image-only retrieval objective.
-                    img_text_loss = info_nce_loss(
-                        anchor_feats, candidate_feats, positive_indices
+                    image_retrieval_loss = info_nce_loss(
+                        anchor_feats,
+                        candidate_feats,
+                        positive_indices,
                     )
-                    if input_ids is not None and text_feats is not None:
-                        text_loss = info_nce_loss(text_feats, candidate_feats.detach(), positive_indices)
-                        img_text_loss = img_text_loss + 0.05 * text_loss
+                    img_text_loss = image_retrieval_loss
 
 
                     # scheduled_bbox_weight, scheduled_retrieval_weight = get_loss_weights(
@@ -1114,6 +1124,11 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 writer.add_scalar("Loss/bbox_cls_step", loss_cls.item(), global_step)
                 writer.add_scalar("Loss/heatmap_step", heatmap_loss.item(), global_step)
                 writer.add_scalar("Loss/img_text_step", img_text_loss.item(), global_step)
+                writer.add_scalar(
+                    "Loss/image_retrieval_step",
+                    image_retrieval_loss.item(),
+                    global_step,
+                )
                 writer.add_scalar("Weight/retrieval", retrieval_weight, global_step)
                 writer.add_scalar("Weight/bbox", bbox_weight, global_step)
 
@@ -1127,6 +1142,12 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 )
                 clearml_logger.report_scalar(
                     "train", "img_text_loss", img_text_loss.item(), global_step
+                )
+                clearml_logger.report_scalar(
+                    "train",
+                    "image_retrieval_loss",
+                    image_retrieval_loss.item(),
+                    global_step,
                 )
 
         scheduler.step()

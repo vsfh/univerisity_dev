@@ -5,10 +5,11 @@ from transformers import AutoModel, AutoImageProcessor, AutoTokenizer
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 import math
 import argparse
-from typing import Optional
+from typing import Optional, Tuple
 from bbox.yolo_utils import SpatialTransformer,CrossAttention
 from transformers.models.siglip.modeling_siglip import SiglipVisionConfig, SiglipMLP
 MODEL_NAME = "google/siglip-base-patch16-224"
+SIGLIP2_MODEL_NAME = "google/siglip2-base-patch16-224"
 DINO_MODEL_NAME = "nvidia/C-RADIOv4-H"
 CACHE_DIR = "/media/data1/feihong/hf_cache"
 PROJECTION_DIM = 768
@@ -402,7 +403,7 @@ class Encoder_text_angle(nn.Module):
 
         nn.init.zeros_(self.bbox_adapter[-1].weight)
         nn.init.zeros_(self.bbox_adapter[-1].bias)
-        self.text_weight = nn.Parameter(torch.tensor([0.001]))
+        self.text_weight = nn.Parameter(torch.tensor([0.01]))
         self.f_param = nn.Parameter(torch.tensor([0.693]))
 
     def vision_forward(
@@ -768,8 +769,8 @@ class Encoder_heat(Encoder_text_angle):
         anchor_feats = anchor_output.last_hidden_state
 
         anchor_pooler = self.attnPooling(anchor_feats, 1)[:, 0, :]
+        anchor_pooler_x = F.normalize(anchor_pooler, p=2, dim=1)
         text_feats = None
-        anchor_pooler_x = None
         if input_ids is not None:
             text_outputs = self.text_model(
                 input_ids=input_ids,
@@ -780,11 +781,15 @@ class Encoder_heat(Encoder_text_angle):
                 p=2,
                 dim=1,
             )
-            anchor_pooler_x = F.normalize(anchor_pooler, p=2, dim=1)
-            anchor_pooler = F.normalize(anchor_pooler_x + self.text_weight * text_feats, p=2, dim=1)
+            anchor_pooler = F.normalize(
+                anchor_pooler_x + self.text_weight * text_feats,
+                p=2,
+                dim=1,
+            )
+        else:
+            anchor_pooler = anchor_pooler_x
 
-
-        fused_feats = None
+        fused_feats = anchor_pooler if input_ids is not None else None
 
         sat_output = self.vision_model(
             search_pixel_values, interpolate_pos_encoding=True
@@ -830,8 +835,6 @@ class Encoder_heat(Encoder_text_angle):
             x=guided_sat_features, context=anchor_context
         )
 
-        
-
         pred_anchor = self.bbox_fcn_out(fused_features)
         heatmap_out = heatmap
         if heatmap_logits.shape[-2:] != pred_anchor.shape[-2:]:
@@ -846,8 +849,244 @@ class Encoder_heat(Encoder_text_angle):
         return (
             pred_anchor,
             None,
+            text_feats,
             anchor_pooler_x,
-            anchor_pooler,
+            sat_feature_2d_pool,
+            fused_feats,
+            heatmap_out,
+        )
+
+
+class Encoder_sig(Encoder_heat):
+    """SigLIP2 version of the heat encoder with the same forward output contract."""
+
+    def __init__(
+        self,
+        model_name=SIGLIP2_MODEL_NAME,
+        proj_dim=PROJECTION_DIM,
+        usesg=False,
+        useap=False,
+        heat_channels=128,
+        heat_kernel_size=9,
+        heat_softmax_temperature=1.0,
+        query_image_size: Tuple[int, int] = (256, 256),
+        search_image_size: Tuple[int, int] = (432, 768),
+    ):
+        super().__init__(
+            model_name=model_name,
+            proj_dim=proj_dim,
+            usesg=usesg,
+            useap=useap,
+            heat_channels=heat_channels,
+            heat_kernel_size=heat_kernel_size,
+            heat_softmax_temperature=heat_softmax_temperature,
+        )
+        self.query_image_size = query_image_size
+        self.search_image_size = search_image_size
+        self.patch_size = int(getattr(self.vision_model.config, "patch_size", 16))
+        self.num_channels = int(getattr(self.vision_model.config, "num_channels", 3))
+
+    def _is_siglip2_vision_model(self) -> bool:
+        return "siglip2" in self.vision_model.__class__.__module__.lower()
+
+    def _patchify_images(self, pixel_values: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
+        B, C, H, W = pixel_values.shape
+        if C != self.num_channels:
+            raise ValueError(
+                f"Expected {self.num_channels} image channels, got {C}."
+            )
+        if H % self.patch_size != 0 or W % self.patch_size != 0:
+            raise ValueError(
+                f"SigLIP2 input image size {(H, W)} must be divisible by "
+                f"patch_size={self.patch_size}."
+            )
+
+        grid_h = H // self.patch_size
+        grid_w = W // self.patch_size
+        patches = pixel_values.unfold(2, self.patch_size, self.patch_size).unfold(
+            3, self.patch_size, self.patch_size
+        )
+        patches = patches.permute(0, 2, 3, 4, 5, 1).contiguous()
+        patches = patches.view(B, grid_h * grid_w, self.patch_size * self.patch_size * C)
+        return patches, (grid_h, grid_w)
+
+    def _siglip2_spatial_shape(
+        self,
+        pixel_values: torch.Tensor,
+        image_size: Tuple[int, int],
+    ) -> Tuple[int, int]:
+        if pixel_values.ndim == 4:
+            return pixel_values.shape[-2] // self.patch_size, pixel_values.shape[-1] // self.patch_size
+
+        image_h, image_w = image_size
+        grid_h = int(image_h) // self.patch_size
+        grid_w = int(image_w) // self.patch_size
+        if grid_h * grid_w == pixel_values.shape[1]:
+            return grid_h, grid_w
+        return _infer_patch_grid(pixel_values.shape[1], image_h, image_w)
+
+    def _siglip2_vision_forward(
+        self,
+        pixel_values: torch.Tensor,
+        image_size: Tuple[int, int],
+    ):
+        if pixel_values.ndim == 4:
+            pixel_values, (grid_h, grid_w) = self._patchify_images(pixel_values)
+        elif pixel_values.ndim == 3:
+            grid_h, grid_w = self._siglip2_spatial_shape(pixel_values, image_size)
+        else:
+            raise ValueError(
+                "SigLIP2 vision input must be either image tensors with shape "
+                f"(B, C, H, W) or patch tensors with shape (B, N, D), got {tuple(pixel_values.shape)}."
+            )
+
+        B, N, _ = pixel_values.shape
+        pixel_attention_mask = torch.ones(
+            B,
+            N,
+            device=pixel_values.device,
+            dtype=torch.bool,
+        )
+        spatial_shapes = torch.tensor(
+            [[grid_h, grid_w]],
+            device=pixel_values.device,
+            dtype=torch.long,
+        ).expand(B, -1)
+        return self.vision_model(
+            pixel_values=pixel_values,
+            pixel_attention_mask=pixel_attention_mask,
+            spatial_shapes=spatial_shapes,
+        )
+
+    def _vision_forward(
+        self,
+        pixel_values: torch.Tensor,
+        image_size: Tuple[int, int],
+        interpolate_pos_encoding: bool = False,
+    ):
+        if self._is_siglip2_vision_model():
+            return self._siglip2_vision_forward(pixel_values, image_size)
+        return self.vision_model(
+            pixel_values,
+            interpolate_pos_encoding=interpolate_pos_encoding,
+        )
+
+    def _feature_grid_shape(
+        self,
+        pixel_values: torch.Tensor,
+        image_size: Tuple[int, int],
+    ) -> Tuple[int, int]:
+        if self._is_siglip2_vision_model():
+            return self._siglip2_spatial_shape(pixel_values, image_size)
+        if pixel_values.ndim == 4:
+            return pixel_values.shape[-2] // self.patch_size, pixel_values.shape[-1] // self.patch_size
+        return _infer_patch_grid(
+            pixel_values.shape[1],
+            image_size[0],
+            image_size[1],
+        )
+
+    def forward(
+        self,
+        anchor_pixel_values,
+        search_pixel_values,
+        input_ids=None,
+        angle=None,
+        attention_mask=None,
+    ):
+        anchor_output = self._vision_forward(
+            anchor_pixel_values,
+            self.query_image_size,
+        )
+        anchor_feats = anchor_output.last_hidden_state
+
+        anchor_pooler = self.attnPooling(anchor_feats, 1)[:, 0, :]
+        anchor_pooler_x = F.normalize(anchor_pooler, p=2, dim=1)
+        text_feats = None
+        if input_ids is not None:
+            text_outputs = self.text_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            text_feats = F.normalize(
+                self.text_projector(text_outputs.pooler_output),
+                p=2,
+                dim=1,
+            )
+            anchor_pooler = F.normalize(
+                anchor_pooler_x + self.text_weight * text_feats,
+                p=2,
+                dim=1,
+            )
+        else:
+            anchor_pooler = anchor_pooler_x
+
+        fused_feats = anchor_pooler if input_ids is not None else None
+
+        sat_output = self._vision_forward(
+            search_pixel_values,
+            self.search_image_size,
+            interpolate_pos_encoding=True,
+        )
+        sat_feats = sat_output.last_hidden_state
+        sat_feature_2d_pool = self.attnPooling(sat_feats, 9)
+
+        H, W = self._feature_grid_shape(search_pixel_values, self.search_image_size)
+        sat_features_2d = sat_feats.permute(0, 2, 1).reshape(
+            sat_feats.shape[0],
+            self.feature_dim,
+            H,
+            W,
+        )
+
+        if angle is not None:
+            if self.usesg:
+                anchor_feats_mod = self.angle_film(anchor_feats.detach(), angle)
+            else:
+                anchor_feats_mod = self.angle_film(anchor_feats, angle)
+            anchor_context = self.bbox_adapter(anchor_feats_mod) + anchor_feats_mod
+        else:
+            anchor_feats_detached = anchor_feats.detach()
+            anchor_context = self.bbox_adapter(anchor_feats_detached) + anchor_feats_detached
+
+        heatmap_logits = self._dynamic_heatmap(anchor_feats, sat_features_2d, angle)
+        if heatmap_logits.shape[-2:] != sat_features_2d.shape[-2:]:
+            heatmap_logits = F.interpolate(
+                heatmap_logits,
+                size=sat_features_2d.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        heatmap = self._spatial_softmax(heatmap_logits)
+
+        heat_gate = heatmap * heatmap.shape[-2] * heatmap.shape[-1] / 2
+        guided_sat_features = self.heat_fuse(
+            torch.cat([sat_features_2d, heat_gate], dim=1)
+        )
+        guided_sat_features = guided_sat_features + self._build_position_embedding(
+            guided_sat_features
+        )
+
+        fused_features = self.bbox_transformer(
+            x=guided_sat_features,
+            context=anchor_context,
+        )
+        pred_anchor = self.bbox_fcn_out(fused_features)
+        heatmap_out = heatmap
+        if heatmap_logits.shape[-2:] != pred_anchor.shape[-2:]:
+            heatmap_logits = F.interpolate(
+                heatmap_logits,
+                size=pred_anchor.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            heatmap_out = self._spatial_softmax(heatmap_logits)
+
+        return (
+            pred_anchor,
+            None,
+            text_feats,
+            anchor_pooler_x,
             sat_feature_2d_pool,
             fused_feats,
             heatmap_out,

@@ -10,7 +10,7 @@ config:
   LEARNING_RATE: 5.0e-5
   USE_AMP: true
   ENABLE_TF32: true
-  ENCODER_TYPE: heat
+  ENCODER_TYPE: sig
   OPTIMIZE_OBJECTIVE: combined
   USE_ANGLE_INPUT: true
   USE_TEXT_INPUT: false

@@ -11,6 +11,7 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 
 # --- Configuration ---
 MODEL_NAME = "Qwen/Qwen3-VL-4B-Instruct"
+# gemma4
 IMAGE_SIZE = (256, 256)
 NUM_PATCHES = 32
 ANGLE_ORDER = (0, 45, 90, 135, 180, 225, 270, 315)

@@ -7,9 +7,9 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple, Union
 DEFAULT_INPUT = (
     # "eval_results/test_unify/test_unify_encoder_heat_configs_summary.json",
     "eval_results/test_unify/test_unify_encoder_heat_model_end1.json",
-    "eval_results/test_unify/test_unify_encoder_heat_model_end2.json",
-    "eval_results/test_unify/test_unify_encoder_heat_model_end3.json",
-    "eval_results/test_unify/test_unify_encoder_heat_model_end4.json",
+    # "eval_results/test_unify/test_unify_encoder_heat_model_end2.json",
+    # "eval_results/test_unify/test_unify_encoder_heat_model_end3.json",
+    # "eval_results/test_unify/test_unify_encoder_heat_model_end4.json",
     "eval_results/test_unify/test_unify_encoder_heat_model_end5.json"
 )
 
