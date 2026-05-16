@@ -16,7 +16,7 @@ from transformers import AutoImageProcessor, AutoTokenizer
 
 from bbox.yolo_utils import bbox_iou, build_target, eval_iou_acc
 from dataset import DEFAULT_SUBSET_ANGLES, DEFAULT_SUBSET_HEIGHTS, ShiftedSatelliteDroneDataset
-from model import Encoder_heat, Encoder_sig, SIGLIP2_MODEL_NAME
+from model import Encoder_heat, Encoder_lora, Encoder_sig, SIGLIP2_MODEL_NAME
 from train_uni import (
     DRONE_SIZE,
     PROJECTION_DIM,
@@ -43,6 +43,7 @@ DEFAULT_INCLUDE_FILE = "/media/data1/feihong/ckpt/include1.json"
 DEFAULT_ENCODER_HEAT_CONFIG_DIR = "/media/data1/feihong/univerisity_dev/configs/unified_siglip_supp"
 DEFAULT_ENCODER_HEAT_CHECKPOINT = "/media/data1/feihong/ckpt/model_full/last.pth"
 DEFAULT_ENCODER_SIG_CHECKPOINT = "/media/data1/feihong/ckpt/model_sig/last.pth"
+DEFAULT_ENCODER_LORA_CHECKPOINT = "/media/data1/feihong/ckpt/model_lora/last.pth"
 DEFAULT_UNIFY_CHECKPOINT = "/media/data1/feihong/ckpt/unify_geo/last.pth"
 DEFAULT_TRANS_CHECKPOINT = "/media/data1/feihong/ckpt/trans_geo/last.pth"
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
@@ -164,14 +165,13 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> None:
         state = state["state_dict"]
     if isinstance(state, dict):
         state = {str(k).replace("module.", ""): v for k, v in state.items()}
+        state = {
+            key: value
+            for key, value in state.items()
+            if not key.startswith("text_projector.")
+        }
 
-    result = model.load_state_dict(state, strict=False)
-    if result.missing_keys or result.unexpected_keys:
-        print(
-            "Checkpoint loaded with "
-            f"missing_keys={len(result.missing_keys)}, "
-            f"unexpected_keys={len(result.unexpected_keys)}"
-        )
+    model.load_state_dict(state, strict=True)
 
 
 def load_yaml(path: str) -> Dict[str, Any]:
@@ -413,6 +413,9 @@ def extract_encoder_features(
     use_angle: bool = True,
     use_ap: bool = True,
     model_name: str = MODEL_NAME,
+    lora_rank: int = 8,
+    lora_alpha: float = 16.0,
+    lora_dropout: float = 0.05,
 ) -> FeatureBundle:
     if model_type == "encoder_sig":
         model = Encoder_sig(
@@ -422,6 +425,18 @@ def extract_encoder_features(
             useap=use_ap,
             query_image_size=DRONE_SIZE,
             search_image_size=(int(sat_size[0]), int(sat_size[1])),
+        ).to(device)
+    elif model_type == "encoder_lora":
+        model = Encoder_lora(
+            model_name=model_name,
+            proj_dim=768,
+            usesg=True,
+            useap=use_ap,
+            query_image_size=DRONE_SIZE,
+            search_image_size=(int(sat_size[0]), int(sat_size[1])),
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
         ).to(device)
     else:
         model = Encoder_heat(
@@ -480,7 +495,19 @@ def extract_encoder_features(
                 angle=geo,
                 attention_mask=attention_mask,
             )
-            pred_anchor, _, text_feats, anchor_pooler, grid_feats, _, heatmap_logits = outputs
+            if len(outputs) != 9:
+                raise ValueError(f"Expected 9 model outputs, got {len(outputs)}.")
+            (
+                pred_anchor,
+                _,
+                text_feats,
+                anchor_pooler,
+                grid_feats,
+                _,
+                heatmap_logits,
+                _,
+                _,
+            ) = outputs
 
             query_batch = F.normalize(anchor_pooler, p=2, dim=1)
             gallery_grid_batch = F.normalize(grid_feats, p=2, dim=2)
@@ -1066,6 +1093,26 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
             use_ap=args.encoder_sig_use_ap,
             model_name=args.encoder_sig_model_name,
         )
+    elif model_type == "encoder_lora":
+        bundle = extract_encoder_features(
+            model_type="encoder_lora",
+            checkpoint_path=checkpoint_path,
+            device=device,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            sat_size=sat_size,
+            test_crop_ratio=args.test_crop_ratio,
+            subset_heights=subset_heights,
+            subset_angles=subset_angles,
+            heatmap_confidence_weight=args.heatmap_confidence_weight,
+            use_text=args.encoder_lora_use_text,
+            use_angle=args.encoder_lora_use_angle,
+            use_ap=args.encoder_lora_use_ap,
+            model_name=args.encoder_sig_model_name,
+            lora_rank=args.encoder_lora_rank,
+            lora_alpha=args.encoder_lora_alpha,
+            lora_dropout=args.encoder_lora_dropout,
+        )
     elif model_type == "unify_geo":
         bundle = extract_unify_features(
             checkpoint_path=checkpoint_path,
@@ -1122,10 +1169,19 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
         "candidate_size": args.candidate_size,
         "encoder_heat_text_score_weight": (
             float(args.encoder_heat_text_score_weight)
-            if model_type in {"encoder_heat", "encoder_sig"}
+            if model_type in {"encoder_heat", "encoder_sig", "encoder_lora"}
             else None
         ),
-        "encoder_sig_model_name": args.encoder_sig_model_name if model_type == "encoder_sig" else None,
+        "encoder_sig_model_name": args.encoder_sig_model_name if model_type in {"encoder_sig", "encoder_lora"} else None,
+        "encoder_lora": (
+            {
+                "rank": int(args.encoder_lora_rank),
+                "alpha": float(args.encoder_lora_alpha),
+                "dropout": float(args.encoder_lora_dropout),
+            }
+            if model_type == "encoder_lora"
+            else None
+        ),
         "include_file": args.include_file,
         "subset_heights": subset_heights or DEFAULT_SUBSET_HEIGHTS,
         "subset_angles": subset_angles or DEFAULT_SUBSET_ANGLES,
@@ -1150,6 +1206,8 @@ def checkpoint_for_model(model_type: str, args: argparse.Namespace) -> str:
         return args.encoder_heat_checkpoint
     if model_type == "encoder_sig":
         return args.encoder_sig_checkpoint
+    if model_type == "encoder_lora":
+        return args.encoder_lora_checkpoint
     if model_type == "unify_geo":
         return args.unify_checkpoint
     if model_type == "trans_geo":
@@ -1205,12 +1263,16 @@ def parse_args() -> argparse.Namespace:
         "--model-types",
         nargs="+",
         default=["encoder_heat"],
-        choices=["encoder_heat", "encoder_sig", "unify_geo", "trans_geo"],
+        choices=["encoder_heat", "encoder_sig", "encoder_lora", "unify_geo", "trans_geo"],
     )
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--encoder-heat-checkpoint", type=str, default=DEFAULT_ENCODER_HEAT_CHECKPOINT)
     parser.add_argument("--encoder-sig-checkpoint", type=str, default=DEFAULT_ENCODER_SIG_CHECKPOINT)
+    parser.add_argument("--encoder-lora-checkpoint", type=str, default=DEFAULT_ENCODER_LORA_CHECKPOINT)
     parser.add_argument("--encoder-sig-model-name", type=str, default=SIGLIP2_MODEL_NAME)
+    parser.add_argument("--encoder-lora-rank", type=int, default=8)
+    parser.add_argument("--encoder-lora-alpha", type=float, default=16.0)
+    parser.add_argument("--encoder-lora-dropout", type=float, default=0.05)
     parser.add_argument("--encoder-heat-config-dir", type=str, default=DEFAULT_ENCODER_HEAT_CONFIG_DIR)
     parser.add_argument("--eval-encoder-heat-configs", action="store_true")
     parser.add_argument("--encoder-heat-checkpoint-name", type=str, default="last.pth")
@@ -1226,6 +1288,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-encoder-sig-use-angle", dest="encoder_sig_use_angle", action="store_false")
     parser.add_argument("--encoder-sig-use-ap", action="store_true", default=True)
     parser.add_argument("--no-encoder-sig-use-ap", dest="encoder_sig_use_ap", action="store_false")
+    parser.add_argument("--encoder-lora-use-text", action="store_true", default=True)
+    parser.add_argument("--no-encoder-lora-use-text", dest="encoder_lora_use_text", action="store_false")
+    parser.add_argument("--encoder-lora-use-angle", action="store_true", default=True)
+    parser.add_argument("--no-encoder-lora-use-angle", dest="encoder_lora_use_angle", action="store_false")
+    parser.add_argument("--encoder-lora-use-ap", action="store_true", default=True)
+    parser.add_argument("--no-encoder-lora-use-ap", dest="encoder_lora_use_ap", action="store_false")
     parser.add_argument(
         "--encoder-heat-text-score-weight",
         type=float,

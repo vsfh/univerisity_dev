@@ -22,13 +22,12 @@ from PIL import Image
 from tqdm import tqdm
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
-from transformers import AutoImageProcessor, AutoModel, AutoTokenizer
+from transformers import AutoImageProcessor, AutoTokenizer
 import yaml
 
 from model import (
-    Encoder_text_angle,
-    Encoder_abla,
     Encoder_heat,
+    Encoder_lora,
     Encoder_sig,
     SIGLIP2_MODEL_NAME,
 )
@@ -89,7 +88,10 @@ class Config:
     ENABLE_TF32 = True
     USE_ANGLE_INPUT = True
     USE_TEXT_INPUT = True
-    ENCODER_TYPE = "heat"  # text_angle | heat | sig
+    ENCODER_TYPE = "heat"  # heat | sig | lora
+    LORA_RANK = 8
+    LORA_ALPHA = 16.0
+    LORA_DROPOUT = 0.05
     OPTIMIZE_OBJECTIVE = "combined"  # combined | img_text_only | bbox_only
     USE_HEATMAP_LOSS = True
     HEATMAP_LOSS_WEIGHT = 0.2
@@ -104,6 +106,8 @@ class Config:
     HEATMAP_POS_WEIGHT = 8.0
     HEATMAP_CONFIDENCE_WEIGHT = 0.5
     HEATMAP_VIS_MAX_SAMPLES = 10
+    TEXT_ROI_LOSS_WEIGHT = 1.0
+    TEXT_ROI_TARGET_SCALE = 1.5
 
 
 def config_to_dict() -> Dict[str, Any]:
@@ -235,11 +239,14 @@ def build_dataloader_kwargs(num_workers: int, drop_last: bool = False) -> Dict:
 
 
 def build_optimizer(model: nn.Module) -> AdamW:
-    return AdamW(model.parameters(), lr=Config.LEARNING_RATE)
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    if not trainable_params:
+        raise ValueError("No trainable parameters found for optimizer.")
+    return AdamW(trainable_params, lr=Config.LEARNING_RATE)
 
 
 def effective_model_name() -> str:
-    if Config.ENCODER_TYPE == "sig" and Config.MODEL_NAME == "google/siglip-base-patch16-224":
+    if Config.ENCODER_TYPE in {"sig", "lora"} and Config.MODEL_NAME == "google/siglip-base-patch16-224":
         return SIGLIP2_MODEL_NAME
     return Config.MODEL_NAME
 
@@ -269,22 +276,12 @@ def unpack_model_outputs(outputs: Tuple) -> Tuple[
     torch.Tensor,
     Optional[torch.Tensor],
     Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
 ]:
-    if len(outputs) == 6:
-        pred_anchor, aux, text_feats, anchor_feats, grid_feats, fused_feats = outputs
-        return pred_anchor, aux, text_feats, anchor_feats, grid_feats, fused_feats, None
-    if len(outputs) == 7:
-        pred_anchor, aux, text_feats, anchor_feats, grid_feats, fused_feats, heatmap = outputs
-        return (
-            pred_anchor,
-            aux,
-            text_feats,
-            anchor_feats,
-            grid_feats,
-            fused_feats,
-            heatmap,
-        )
-    raise ValueError(f"Unexpected model output length: {len(outputs)}")
+    if len(outputs) != 9:
+        raise ValueError(f"Expected 9 model outputs, got {len(outputs)}.")
+    return outputs
 
 
 def build_heatmap_target(
@@ -384,6 +381,47 @@ def build_heatmap_target(
     return target.unsqueeze(1).clamp(0.0, 1.0)
 
 
+def build_text_roi_target(
+    target_bbox: torch.Tensor,
+    heatmap_hw: Tuple[int, int],
+    image_wh: Tuple[int, int],
+    scale: float,
+) -> torch.Tensor:
+    grid_h, grid_w = int(heatmap_hw[0]), int(heatmap_hw[1])
+    image_w, image_h = float(image_wh[0]), float(image_wh[1])
+    device = target_bbox.device
+    dtype = target_bbox.dtype
+
+    x1 = torch.minimum(target_bbox[:, 0], target_bbox[:, 2]).clamp(0.0, image_w)
+    y1 = torch.minimum(target_bbox[:, 1], target_bbox[:, 3]).clamp(0.0, image_h)
+    x2 = torch.maximum(target_bbox[:, 0], target_bbox[:, 2]).clamp(0.0, image_w)
+    y2 = torch.maximum(target_bbox[:, 1], target_bbox[:, 3]).clamp(0.0, image_h)
+
+    center_x = (x1 + x2) * 0.5
+    center_y = (y1 + y2) * 0.5
+    half_w = ((x2 - x1) * 0.5 * float(scale)).clamp_min(image_w / max(grid_w, 1))
+    half_h = ((y2 - y1) * 0.5 * float(scale)).clamp_min(image_h / max(grid_h, 1))
+    roi_x1 = (center_x - half_w).clamp(0.0, image_w)
+    roi_y1 = (center_y - half_h).clamp(0.0, image_h)
+    roi_x2 = (center_x + half_w).clamp(0.0, image_w)
+    roi_y2 = (center_y + half_h).clamp(0.0, image_h)
+
+    ys = torch.arange(grid_h, device=device, dtype=dtype).view(1, grid_h, 1)
+    xs = torch.arange(grid_w, device=device, dtype=dtype).view(1, 1, grid_w)
+    x_img = (xs + 0.5) / max(float(grid_w), 1.0) * image_w
+    y_img = (ys + 0.5) / max(float(grid_h), 1.0) * image_h
+
+    inside_x = (x_img >= roi_x1.view(-1, 1, 1)) & (x_img <= roi_x2.view(-1, 1, 1))
+    inside_y = (y_img >= roi_y1.view(-1, 1, 1)) & (y_img <= roi_y2.view(-1, 1, 1))
+    target = (inside_x & inside_y).to(dtype=dtype)
+
+    center_x_idx = torch.floor(center_x / max(image_w, 1.0) * grid_w).long().clamp(0, grid_w - 1)
+    center_y_idx = torch.floor(center_y / max(image_h, 1.0) * grid_h).long().clamp(0, grid_h - 1)
+    batch_idx = torch.arange(target.shape[0], device=device)
+    target[batch_idx, center_y_idx, center_x_idx] = 1.0
+    return target.unsqueeze(1).clamp(0.0, 1.0)
+
+
 def parse_heatmap_loss_types(loss_type: Any) -> List[str]:
     if isinstance(loss_type, str):
         loss_types = loss_type.replace(",", "+").split("+")
@@ -468,13 +506,35 @@ def heatmap_loss_fn(
     return loss
 
 
+def text_roi_loss_fn(
+    text_heatmap: torch.Tensor,
+    target_bbox: torch.Tensor,
+    return_target: bool = False,
+):
+    roi_target = build_text_roi_target(
+        target_bbox=target_bbox,
+        heatmap_hw=text_heatmap.shape[-2:],
+        image_wh=(Config.UNIV_SAT_SIZE["width"], Config.UNIV_SAT_SIZE["height"]),
+        scale=Config.TEXT_ROI_TARGET_SCALE,
+    )
+    pred_prob = text_heatmap.float().flatten(1)
+    pred_prob = pred_prob / pred_prob.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    target = roi_target.float().flatten(1)
+    inside_mass = (pred_prob * target).sum(dim=1).clamp_min(1e-8)
+    loss = -inside_mass.log().mean()
+
+    if return_target:
+        return loss, roi_target
+    return loss
+
+
 def add_heatmap_to_confidence(
     pred_anchor: torch.Tensor,
     heatmap_logits: Optional[torch.Tensor],
 ) -> torch.Tensor:
     if (
         heatmap_logits is None
-        or Config.ENCODER_TYPE != "heat"
+        or Config.ENCODER_TYPE not in {"heat", "sig", "lora"}
         or Config.HEATMAP_CONFIDENCE_WEIGHT <= 0.0
     ):
         return pred_anchor
@@ -519,6 +579,7 @@ def log_heatmap_images(
     target_bbox: Optional[torch.Tensor],
     epoch: int,
     heatmap_target: Optional[torch.Tensor] = None,
+    tag_prefix: str = "Heatmap",
 ) -> None:
     if writer is None or heatmap_logits is None:
         return
@@ -557,20 +618,13 @@ def log_heatmap_images(
     ).cpu()
     side_by_side = torch.cat([pred_vis, target_vis], dim=-1)
 
-    writer.add_images("Heatmap/pred", pred_vis, epoch)
-    writer.add_images("Heatmap/target", target_vis, epoch)
-    writer.add_images("Heatmap/target_range_vis", target_range_vis, epoch)
-    writer.add_images("Heatmap/pred_target", side_by_side, epoch)
+    writer.add_images(f"{tag_prefix}/pred", pred_vis, epoch)
+    writer.add_images(f"{tag_prefix}/target", target_vis, epoch)
+    writer.add_images(f"{tag_prefix}/target_range_vis", target_range_vis, epoch)
+    writer.add_images(f"{tag_prefix}/pred_target", side_by_side, epoch)
 
 
 def build_encoder(use_ap: bool, usesg: bool = True) -> nn.Module:
-    if Config.ENCODER_TYPE == "text_angle":
-        return Encoder_text_angle(
-            model_name=Config.MODEL_NAME,
-            proj_dim=Config.PROJECTION_DIM,
-            usesg=usesg,
-            useap=use_ap,
-        )
     if Config.ENCODER_TYPE == "heat":
         return Encoder_heat(
             model_name=Config.MODEL_NAME,
@@ -591,8 +645,24 @@ def build_encoder(use_ap: bool, usesg: bool = True) -> nn.Module:
                 Config.UNIV_SAT_SIZE["width"],
             ),
         )
+    if Config.ENCODER_TYPE == "lora":
+        model_name = effective_model_name()
+        return Encoder_lora(
+            model_name=model_name,
+            proj_dim=Config.PROJECTION_DIM,
+            usesg=usesg,
+            useap=use_ap,
+            query_image_size=Config.DRONE_SIZE,
+            search_image_size=(
+                Config.UNIV_SAT_SIZE["height"],
+                Config.UNIV_SAT_SIZE["width"],
+            ),
+            lora_rank=Config.LORA_RANK,
+            lora_alpha=Config.LORA_ALPHA,
+            lora_dropout=Config.LORA_DROPOUT,
+        )
     raise ValueError(
-        f"Invalid ENCODER_TYPE={Config.ENCODER_TYPE}. Choose 'text_angle', 'heat', or 'sig'."
+        f"Invalid ENCODER_TYPE={Config.ENCODER_TYPE}. Choose 'heat', 'sig', or 'lora'."
     )
 
 
@@ -735,6 +805,8 @@ def validate(
                 grid_feats,
                 fused_feats,
                 heatmap_logits,
+                text_heatmap_logits,
+                roi_mask,
             ) = unpack_model_outputs(outputs)
 
         B = pred_anchor.shape[0]
@@ -899,8 +971,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     model = build_encoder(use_ap, usesg=Config.OPTIMIZE_OBJECTIVE != "bbox_only")
-    # model = Encoder_dino()
-
     anchors_full = get_tensor_anchors(accelerator.device)
 
     accelerator.print("Setting up dataset and dataloader...")
@@ -962,9 +1032,13 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         total_loss = 0
         total_bbox_loss = 0
         total_heatmap_loss = 0
+        total_text_heatmap_loss = 0
         last_heatmap_logits = None
+        last_text_heatmap_logits = None
+        last_roi_mask = None
         last_target_bbox = None
         last_heatmap_target = None
+        last_text_roi_target = None
         progress_bar = tqdm(
             train_dataloader,
             desc=f"Epoch {epoch + 1}/{Config.NUM_EPOCHS}",
@@ -1011,6 +1085,8 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                         grid_feats,
                         fused_feats,
                         heatmap_logits,
+                        text_heatmap_logits,
+                        roi_mask,
                     ) = unpack_model_outputs(outputs)
 
                     B = pred_anchor.shape[0]
@@ -1036,7 +1112,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     bbox_loss = loss_geo + loss_cls
                     if (
                         Config.USE_HEATMAP_LOSS
-                        and Config.ENCODER_TYPE == "heat"
+                        and Config.ENCODER_TYPE in {"heat", "sig", "lora"}
                         and heatmap_logits is not None
                     ):
                         heatmap_loss, heatmap_target = heatmap_loss_fn(
@@ -1044,10 +1120,25 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                             target_bbox,
                             return_target=True,
                         )
+                        if text_heatmap_logits is not None:
+                            text_heatmap_loss, text_roi_target = text_roi_loss_fn(
+                                text_heatmap_logits,
+                                target_bbox,
+                                return_target=True,
+                            )
+                            heatmap_loss = (
+                                heatmap_loss
+                                + Config.TEXT_ROI_LOSS_WEIGHT * text_heatmap_loss
+                            )
+                        else:
+                            text_heatmap_loss = bbox_loss.new_zeros(())
+                            text_roi_target = None
                         bbox_loss = bbox_loss + Config.HEATMAP_LOSS_WEIGHT * heatmap_loss
                     else:
                         heatmap_loss = bbox_loss.new_zeros(())
+                        text_heatmap_loss = bbox_loss.new_zeros(())
                         heatmap_target = None
+                        text_roi_target = None
 
                     if heatmap_logits is not None:
                         last_heatmap_logits = heatmap_logits.detach()
@@ -1057,6 +1148,15 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                             if heatmap_target is not None
                             else None
                         )
+                    if text_heatmap_logits is not None:
+                        last_text_heatmap_logits = text_heatmap_logits.detach()
+                        last_text_roi_target = (
+                            text_roi_target.detach()
+                            if text_roi_target is not None
+                            else None
+                        )
+                    if roi_mask is not None:
+                        last_roi_mask = roi_mask.detach()
 
                     candidate_feats = grid_feats.reshape(-1, Config.PROJECTION_DIM)
                     positive_indices = torch.zeros(B, B * 9, device=accelerator.device)
@@ -1106,11 +1206,13 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
             total_loss += loss.item()
             total_bbox_loss += bbox_loss.item()
             total_heatmap_loss += heatmap_loss.item()
+            total_text_heatmap_loss += text_heatmap_loss.item()
             global_step = epoch * len(train_dataloader) + i
             progress_bar.set_postfix(
                 {
                     "bbox_loss": f"{bbox_loss.item():.4f}",
                     "heatmap_loss": f"{heatmap_loss.item():.4f}",
+                    "text_heatmap_loss": f"{text_heatmap_loss.item():.4f}",
                     "img_text_loss": f"{img_text_loss.item():.4f}",
                     "retrieval_weight": f"{retrieval_weight:.4f}",
                     "bbox_weight": f"{bbox_weight:.4f}",
@@ -1123,6 +1225,11 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 writer.add_scalar("Loss/bbox_geo_step", loss_geo.item(), global_step)
                 writer.add_scalar("Loss/bbox_cls_step", loss_cls.item(), global_step)
                 writer.add_scalar("Loss/heatmap_step", heatmap_loss.item(), global_step)
+                writer.add_scalar(
+                    "Loss/text_heatmap_step",
+                    text_heatmap_loss.item(),
+                    global_step,
+                )
                 writer.add_scalar("Loss/img_text_step", img_text_loss.item(), global_step)
                 writer.add_scalar(
                     "Loss/image_retrieval_step",
@@ -1139,6 +1246,12 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 )
                 clearml_logger.report_scalar(
                     "train", "heatmap_loss", heatmap_loss.item(), global_step
+                )
+                clearml_logger.report_scalar(
+                    "train",
+                    "text_heatmap_loss",
+                    text_heatmap_loss.item(),
+                    global_step,
                 )
                 clearml_logger.report_scalar(
                     "train", "img_text_loss", img_text_loss.item(), global_step
@@ -1164,6 +1277,11 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 total_heatmap_loss / len(train_dataloader),
                 epoch,
             )
+            writer.add_scalar(
+                "Loss/text_heatmap_epoch",
+                total_text_heatmap_loss / len(train_dataloader),
+                epoch,
+            )
             writer.add_scalar("lr/learning_rate", optimizer.param_groups[0]["lr"], epoch)
             for group_idx, group in enumerate(optimizer.param_groups):
                 group_name = str(group.get("name", f"group_{group_idx}"))
@@ -1174,6 +1292,22 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 last_target_bbox,
                 epoch,
                 heatmap_target=last_heatmap_target,
+            )
+            log_heatmap_images(
+                writer,
+                last_text_heatmap_logits,
+                last_target_bbox,
+                epoch,
+                heatmap_target=last_text_roi_target,
+                tag_prefix="TextHeatmap",
+            )
+            log_heatmap_images(
+                writer,
+                last_roi_mask,
+                last_target_bbox,
+                epoch,
+                heatmap_target=last_text_roi_target,
+                tag_prefix="ROI",
             )
 
         if epoch % 2 == 0:

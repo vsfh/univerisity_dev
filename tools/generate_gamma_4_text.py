@@ -1,11 +1,13 @@
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from PIL import Image
+from huggingface_hub import snapshot_download
 from transformers import AutoProcessor
 
 try:
@@ -27,6 +29,7 @@ ANGLE_ORDER = (0, 45, 90, 135, 180, 225, 270, 315)
 DEFAULT_IMAGE_ROOT = "/media/data1/feihong/drone_img"
 CACHE_DIR = "/media/data1/feihong/hf_cache"
 DEFAULT_GPU_ID = -1
+DEFAULT_HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "")
 RETRIEVAL_PROMPT = (
     "All images show the same place from drone views.\n\n"
     "Write a satellite-retrieval description as 8-12 comma-separated noun phrases. "
@@ -73,6 +76,43 @@ def _dtype_from_name(dtype_name: str) -> Any:
     raise ValueError(f"Unsupported dtype: {dtype_name}")
 
 
+def _snapshot_download_with_retries(
+    model_name: str,
+    cache_dir: str,
+    hf_endpoint: Optional[str],
+    hf_token: Optional[str],
+    retries: int,
+    max_workers: int,
+) -> str:
+    endpoint = hf_endpoint.strip().rstrip("/") if hf_endpoint else None
+    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max(int(retries), 1) + 1):
+        try:
+            return snapshot_download(
+                repo_id=model_name,
+                cache_dir=cache_dir,
+                endpoint=endpoint,
+                token=hf_token,
+                max_workers=max(int(max_workers), 1),
+                etag_timeout=30,
+                force_download=False,
+            )
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max(int(retries), 1):
+                break
+            wait_seconds = min(60, 2 ** attempt)
+            print(
+                f"Download attempt {attempt}/{retries} failed: {exc}. "
+                f"Retrying in {wait_seconds}s..."
+            )
+            time.sleep(wait_seconds)
+
+    raise RuntimeError(f"Failed to download {model_name}: {last_error}") from last_error
+
+
 def load_gemma4(
     model_name: str = MODEL_NAME,
     cache_dir: str = CACHE_DIR,
@@ -80,12 +120,18 @@ def load_gemma4(
     dtype: str = "auto",
     use_flash_attention: bool = False,
     hf_token: Optional[str] = None,
+    hf_endpoint: Optional[str] = DEFAULT_HF_ENDPOINT,
+    pre_download: bool = True,
+    download_retries: int = 5,
+    download_max_workers: int = 8,
 ) -> Tuple[Any, AutoProcessor]:
     """Load Gemma 4 with the official multimodal Transformers API."""
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["HF_HOME"] = cache_dir
     os.environ["HUGGINGFACE_HUB_CACHE"] = cache_dir
     os.environ["TRANSFORMERS_CACHE"] = cache_dir
+    if hf_endpoint:
+        os.environ["HF_ENDPOINT"] = hf_endpoint.strip().rstrip("/")
 
     if gpu_id is None:
         device_map: str | Dict[str, str] = "auto"
@@ -116,17 +162,28 @@ def load_gemma4(
     if use_flash_attention:
         model_kwargs["attn_implementation"] = "flash_attention_2"
 
+    load_path = model_name
+    if pre_download:
+        load_path = _snapshot_download_with_retries(
+            model_name=model_name,
+            cache_dir=cache_dir,
+            hf_endpoint=hf_endpoint,
+            hf_token=hf_token,
+            retries=download_retries,
+            max_workers=download_max_workers,
+        )
+
     try:
-        model = model_cls.from_pretrained(model_name, **model_kwargs)
+        model = model_cls.from_pretrained(load_path, **model_kwargs)
     except TypeError:
         torch_dtype = model_kwargs.pop("dtype")
         model_kwargs["torch_dtype"] = torch_dtype
-        model = model_cls.from_pretrained(model_name, **model_kwargs)
+        model = model_cls.from_pretrained(load_path, **model_kwargs)
 
     processor_kwargs: Dict[str, Any] = {"cache_dir": cache_dir}
     if hf_token:
         processor_kwargs["token"] = hf_token
-    processor = AutoProcessor.from_pretrained(model_name, **processor_kwargs)
+    processor = AutoProcessor.from_pretrained(load_path, **processor_kwargs)
     model.eval()
     return model, processor
 
@@ -417,6 +474,19 @@ def main() -> None:
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"])
     parser.add_argument("--flash_attn", action="store_true")
     parser.add_argument("--hf_token", type=str, default=None)
+    parser.add_argument(
+        "--hf_endpoint",
+        type=str,
+        default=DEFAULT_HF_ENDPOINT,
+        help="Optional Hugging Face mirror endpoint, e.g. https://hf-mirror.com.",
+    )
+    parser.add_argument(
+        "--skip_pre_download",
+        action="store_true",
+        help="Skip snapshot_download and let from_pretrained download files directly.",
+    )
+    parser.add_argument("--download_retries", type=int, default=5)
+    parser.add_argument("--download_max_workers", type=int, default=8)
     parser.add_argument("--num_images", type=int, default=NUM_IMAGES)
     parser.add_argument("--strict_num_images", action="store_true")
     parser.add_argument("--image_width", type=int, default=IMAGE_SIZE[0])
@@ -443,6 +513,10 @@ def main() -> None:
         dtype=args.dtype,
         use_flash_attention=args.flash_attn,
         hf_token=args.hf_token,
+        hf_endpoint=args.hf_endpoint,
+        pre_download=not args.skip_pre_download,
+        download_retries=args.download_retries,
+        download_max_workers=args.download_max_workers,
     )
 
     if has_single_input:

@@ -6,11 +6,13 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple, Union
 
 DEFAULT_INPUT = (
     # "eval_results/test_unify/test_unify_encoder_heat_configs_summary.json",
-    "eval_results/test_unify/test_unify_encoder_heat_model_end1.json",
+    "eval_results/test_unify/single_config/test_unify_encoder_sig_model_1.json",
+    "eval_results/test_unify/single_config/test_unify_encoder_sig_model_9.json",
+    # "eval_results/test_unify/test_unify_encoder_heat_model_end1.json",
     # "eval_results/test_unify/test_unify_encoder_heat_model_end2.json",
     # "eval_results/test_unify/test_unify_encoder_heat_model_end3.json",
     # "eval_results/test_unify/test_unify_encoder_heat_model_end4.json",
-    "eval_results/test_unify/test_unify_encoder_heat_model_end5.json"
+    # "eval_results/test_unify/test_unify_encoder_heat_model_end5.json"
 )
 
 InputPath = Union[str, Path]
