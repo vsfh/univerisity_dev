@@ -16,7 +16,7 @@ from transformers import AutoImageProcessor, AutoTokenizer
 
 from bbox.yolo_utils import bbox_iou, build_target, eval_iou_acc
 from dataset import DEFAULT_SUBSET_ANGLES, DEFAULT_SUBSET_HEIGHTS, ShiftedSatelliteDroneDataset
-from model import Encoder_heat
+from model import Encoder_heat, Encoder_test
 from train_uni import (
     DRONE_SIZE,
     PROJECTION_DIM,
@@ -35,7 +35,7 @@ from train_trans import (
 
 
 # --- Configuration ---
-MODEL_NAME = "google/siglip-base-patch16-224"
+MODEL_NAME = "google/siglip2-base-patch16-224"
 CACHE_DIR = "/media/data1/feihong/hf_cache"
 DEFAULT_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 DEFAULT_OUTPUT_DIR = "/media/data1/feihong/univerisity_dev/eval_results/test_unify"
@@ -357,8 +357,21 @@ def extract_encoder_heat_features(
     use_text: bool = True,
     use_angle: bool = True,
     use_ap: bool = True,
+    encoder_cls: type = Encoder_heat,
+    desc: str = "encoder_heat",
+    lora_rank: int = 8,
+    lora_alpha: float = 16.0,
+    lora_dropout: float = 0.05,
 ) -> FeatureBundle:
-    model = Encoder_heat(model_name=MODEL_NAME, proj_dim=768, usesg=True, useap=use_ap).to(device)
+    model = encoder_cls(
+        model_name=MODEL_NAME,
+        proj_dim=768,
+        usesg=True,
+        useap=use_ap,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+    ).to(device)
     load_checkpoint(model, checkpoint_path)
     model.eval()
 
@@ -384,7 +397,7 @@ def extract_encoder_heat_features(
     gallery_path_dict: Dict[str, str] = {}
 
     with torch.inference_mode():
-        for batch in tqdm(loader, desc="Extract/eval [encoder_heat]"):
+        for batch in tqdm(loader, desc=f"Extract/eval [{desc}]"):
             query_imgs = batch["target_pixel_values"].to(device, non_blocking=True)
             search_imgs = batch["search_pixel_values"].to(device, non_blocking=True)
             gt_bbox = batch["bbox"].to(device, non_blocking=True)
@@ -459,7 +472,7 @@ def extract_encoder_heat_features(
                 )
 
     if not query_feats or not gallery_feat_dict:
-        raise RuntimeError("No encoder_heat features were extracted.")
+        raise RuntimeError(f"No {desc} features were extracted.")
 
     gallery_labels = sorted(gallery_feat_dict.keys())
     return FeatureBundle(
@@ -770,7 +783,7 @@ def score_retrieval_and_uiou(
             sampled_negatives = rng.sample(negative_pool, int(candidate_size) - 1)
             candidate_indices = sampled_negatives + [gt_gallery_index]
 
-        if model_type == "encoder_heat":
+        if model_type in {"encoder_heat", "encoder_test"}:
             score_vec = score_encoder_heat_query(
                 bundle.query_feats[q_idx],
                 bundle.gallery_feats,
@@ -924,7 +937,8 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
     subset_heights = args.subset_heights if args.subset_heights else None
     subset_angles = args.subset_angles if args.subset_angles else None
 
-    if model_type == "encoder_heat":
+    if model_type in {"encoder_heat", "encoder_test"}:
+        encoder_cls = Encoder_test if model_type == "encoder_test" else Encoder_heat
         bundle = extract_encoder_heat_features(
             checkpoint_path=checkpoint_path,
             device=device,
@@ -938,6 +952,11 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
             use_text=args.encoder_heat_use_text,
             use_angle=args.encoder_heat_use_angle,
             use_ap=args.encoder_heat_use_ap,
+            encoder_cls=encoder_cls,
+            desc=model_type,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
         )
     elif model_type == "unify_geo":
         bundle = extract_unify_features(
@@ -992,6 +1011,17 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
         "checkpoint": checkpoint_path,
         "sat_size": {"height": int(sat_size[0]), "width": int(sat_size[1])},
         "candidate_size": args.candidate_size,
+        "encoder_use_text": bool(args.encoder_heat_use_text) if model_type in {"encoder_heat", "encoder_test"} else None,
+        "encoder_use_angle": bool(args.encoder_heat_use_angle) if model_type in {"encoder_heat", "encoder_test"} else None,
+        "lora": (
+            {
+                "rank": int(args.lora_rank),
+                "alpha": float(args.lora_alpha),
+                "dropout": float(args.lora_dropout),
+            }
+            if model_type in {"encoder_heat", "encoder_test"}
+            else None
+        ),
         "include_file": args.include_file,
         "subset_heights": subset_heights or DEFAULT_SUBSET_HEIGHTS,
         "subset_angles": subset_angles or DEFAULT_SUBSET_ANGLES,
@@ -1012,7 +1042,7 @@ def checkpoint_for_model(model_type: str, args: argparse.Namespace) -> str:
         if len(args.model_types) != 1:
             raise ValueError("--checkpoint can only be used with exactly one --model-types value.")
         return args.checkpoint
-    if model_type == "encoder_heat":
+    if model_type in {"encoder_heat", "encoder_test"}:
         return args.encoder_heat_checkpoint
     if model_type == "unify_geo":
         return args.unify_checkpoint
@@ -1069,7 +1099,7 @@ def parse_args() -> argparse.Namespace:
         "--model-types",
         nargs="+",
         default=["encoder_heat"],
-        choices=["encoder_heat", "unify_geo", "trans_geo"],
+        choices=["encoder_heat", "encoder_test", "unify_geo", "trans_geo"],
     )
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--encoder-heat-checkpoint", type=str, default=DEFAULT_ENCODER_HEAT_CHECKPOINT)
@@ -1082,6 +1112,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-encoder-heat-use-angle", dest="encoder_heat_use_angle", action="store_false")
     parser.add_argument("--encoder-heat-use-ap", action="store_true", default=True)
     parser.add_argument("--no-encoder-heat-use-ap", dest="encoder_heat_use_ap", action="store_false")
+    parser.add_argument("--lora-rank", type=int, default=8)
+    parser.add_argument("--lora-alpha", type=float, default=16.0)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--unify-checkpoint", type=str, default=DEFAULT_UNIFY_CHECKPOINT)
     parser.add_argument("--trans-checkpoint", type=str, default=DEFAULT_TRANS_CHECKPOINT)
     parser.add_argument("--device", type=str, default=DEFAULT_DEVICE)

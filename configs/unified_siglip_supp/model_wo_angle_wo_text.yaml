@@ -8,9 +8,13 @@ config:
   BATCH_SIZE: 16
   GRAD_ACCUMULATION_STEPS: 2
   LEARNING_RATE: 5.0e-5
+  MODEL_NAME: google/siglip2-base-patch16-224
   USE_AMP: true
   ENABLE_TF32: true
   ENCODER_TYPE: heat
+  LORA_RANK: 8
+  LORA_ALPHA: 16.0
+  LORA_DROPOUT: 0.05
   OPTIMIZE_OBJECTIVE: combined
   USE_ANGLE_INPUT: false
   USE_TEXT_INPUT: false

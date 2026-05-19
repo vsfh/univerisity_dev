@@ -4,17 +4,12 @@ set -euo pipefail
 cd /media/data1/feihong/univerisity_dev
 
 CONFIGS=(
-    # "configs/unified_siglip_supp/model_full.yaml"
-    # "configs/unified_siglip_supp/model_retrieval_only.yaml"
-    # "configs/unified_siglip_supp/model_bbox_only.yaml"
-    # "configs/unified_siglip_supp/model_wo_angle.yaml"
-    # "configs/unified_siglip_supp/model_wo_text.yaml"
-    # "configs/unified_siglip_supp/model_wo_angle_wo_text.yaml"    
-    "configs/unified_siglip_supp/end_num/model_end1.yaml"
-    "configs/unified_siglip_supp/end_num/model_end2.yaml"
-    "configs/unified_siglip_supp/end_num/model_end3.yaml"
-    "configs/unified_siglip_supp/end_num/model_end4.yaml"
-    "configs/unified_siglip_supp/end_num/model_end5.yaml"
+    # Encoder_heat without geo input.
+    "configs/unified_siglip_supp/single_config/model_heat_no_geo.yaml"
+    # Encoder_heat without input_ids.
+    "configs/unified_siglip_supp/single_config/model_heat_no_input_ids.yaml"
+    # Encoder_test with both geo and input_ids.
+    "configs/unified_siglip_supp/single_config/model_test_geo_input_ids.yaml"
 )
 
 for CONFIG_PATH in "${CONFIGS[@]}"; do

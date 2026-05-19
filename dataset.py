@@ -172,12 +172,11 @@ def _normalize_subset_values(
 
 
 def _sample_edge_biased(min_value: float, max_value: float, alpha: float = 0.7) -> float:
-	"""Sample in [min_value, max_value] with higher probability near both edges."""
+	"""Sample uniformly in [min_value, max_value]."""
+	del alpha
 	if max_value <= min_value:
 		return float(min_value)
-	edge_alpha = max(1e-3, float(alpha))
-	u = random.betavariate(edge_alpha, edge_alpha)
-	return float(min_value) + (float(max_value) - float(min_value)) * u
+	return random.uniform(float(min_value), float(max_value))
 
 
 def _build_center_bbox(
@@ -363,7 +362,7 @@ def _augment_satellite_image_with_bbox_640(
 
 	if mode == "train":
 		context_scale = 3.0
-		min_crop_w = 3840 // 2
+		min_crop_w = int(random.uniform(1920-900, 1920+900))
 	else:
 		ratio = max(1e-3, min(1.0, float(test_crop_ratio)))
 		context_scale = 3.0
