@@ -183,7 +183,7 @@ class Encoder_heat(nn.Module):
         self.heat_softmax_temperature = float(heat_softmax_temperature)
 
         self._freeze_backbone()
-        replaced = self._inject_lora_into_vision(
+        replaced = self._inject_lora(
             module=self.vision_model,
             rank=int(lora_rank),
             alpha=float(lora_alpha),
@@ -237,7 +237,7 @@ class Encoder_heat(nn.Module):
         for param in self.text_model.parameters():
             param.requires_grad = False
 
-    def _inject_lora_into_vision(
+    def _inject_lora(
         self,
         module: nn.Module,
         rank: int,
@@ -261,7 +261,7 @@ class Encoder_heat(nn.Module):
                 )
                 replaced += 1
                 continue
-            replaced += self._inject_lora_into_vision(
+            replaced += self._inject_lora(
                 module=child,
                 rank=rank,
                 alpha=alpha,
@@ -516,6 +516,14 @@ class Encoder_test(Encoder_heat):
                 f"Encoder_test requires text dim {self.text_feature_dim} "
                 f"to match vision dim {self.feature_dim}."
             )
+        text_replaced = self._inject_lora(
+            module=self.text_model,
+            rank=int(lora_rank),
+            alpha=float(lora_alpha),
+            dropout=float(lora_dropout),
+        )
+        if text_replaced <= 0:
+            raise ValueError("No text Linear layers were replaced by LoRA.")
 
         self.text_grounding_adapter = nn.Sequential(
             nn.LayerNorm(self.feature_dim),

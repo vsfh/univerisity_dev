@@ -100,8 +100,6 @@ class Config:
     HEATMAP_POS_WEIGHT = 8.0
     HEATMAP_CONFIDENCE_WEIGHT = 0.5
     HEATMAP_VIS_MAX_SAMPLES = 10
-    TEXT_ROI_LOSS_WEIGHT = 1.0
-    TEXT_ROI_TARGET_SCALE = 1.5
 
 
 def config_to_dict() -> Dict[str, Any]:
@@ -371,47 +369,6 @@ def build_heatmap_target(
     return target.unsqueeze(1).clamp(0.0, 1.0)
 
 
-def build_text_roi_target(
-    target_bbox: torch.Tensor,
-    heatmap_hw: Tuple[int, int],
-    image_wh: Tuple[int, int],
-    scale: float,
-) -> torch.Tensor:
-    grid_h, grid_w = int(heatmap_hw[0]), int(heatmap_hw[1])
-    image_w, image_h = float(image_wh[0]), float(image_wh[1])
-    device = target_bbox.device
-    dtype = target_bbox.dtype
-
-    x1 = torch.minimum(target_bbox[:, 0], target_bbox[:, 2]).clamp(0.0, image_w)
-    y1 = torch.minimum(target_bbox[:, 1], target_bbox[:, 3]).clamp(0.0, image_h)
-    x2 = torch.maximum(target_bbox[:, 0], target_bbox[:, 2]).clamp(0.0, image_w)
-    y2 = torch.maximum(target_bbox[:, 1], target_bbox[:, 3]).clamp(0.0, image_h)
-
-    center_x = (x1 + x2) * 0.5
-    center_y = (y1 + y2) * 0.5
-    half_w = ((x2 - x1) * 0.5 * float(scale)).clamp_min(image_w / max(grid_w, 1))
-    half_h = ((y2 - y1) * 0.5 * float(scale)).clamp_min(image_h / max(grid_h, 1))
-    roi_x1 = (center_x - half_w).clamp(0.0, image_w)
-    roi_y1 = (center_y - half_h).clamp(0.0, image_h)
-    roi_x2 = (center_x + half_w).clamp(0.0, image_w)
-    roi_y2 = (center_y + half_h).clamp(0.0, image_h)
-
-    ys = torch.arange(grid_h, device=device, dtype=dtype).view(1, grid_h, 1)
-    xs = torch.arange(grid_w, device=device, dtype=dtype).view(1, 1, grid_w)
-    x_img = (xs + 0.5) / max(float(grid_w), 1.0) * image_w
-    y_img = (ys + 0.5) / max(float(grid_h), 1.0) * image_h
-
-    inside_x = (x_img >= roi_x1.view(-1, 1, 1)) & (x_img <= roi_x2.view(-1, 1, 1))
-    inside_y = (y_img >= roi_y1.view(-1, 1, 1)) & (y_img <= roi_y2.view(-1, 1, 1))
-    target = (inside_x & inside_y).to(dtype=dtype)
-
-    center_x_idx = torch.floor(center_x / max(image_w, 1.0) * grid_w).long().clamp(0, grid_w - 1)
-    center_y_idx = torch.floor(center_y / max(image_h, 1.0) * grid_h).long().clamp(0, grid_h - 1)
-    batch_idx = torch.arange(target.shape[0], device=device)
-    target[batch_idx, center_y_idx, center_x_idx] = 1.0
-    return target.unsqueeze(1).clamp(0.0, 1.0)
-
-
 def parse_heatmap_loss_types(loss_type: Any) -> List[str]:
     if isinstance(loss_type, str):
         loss_types = loss_type.replace(",", "+").split("+")
@@ -493,28 +450,6 @@ def heatmap_loss_fn(
 
     if return_target:
         return loss, heatmap_target
-    return loss
-
-
-def text_roi_loss_fn(
-    text_heatmap: torch.Tensor,
-    target_bbox: torch.Tensor,
-    return_target: bool = False,
-):
-    roi_target = build_text_roi_target(
-        target_bbox=target_bbox,
-        heatmap_hw=text_heatmap.shape[-2:],
-        image_wh=(Config.UNIV_SAT_SIZE["width"], Config.UNIV_SAT_SIZE["height"]),
-        scale=Config.TEXT_ROI_TARGET_SCALE,
-    )
-    pred_prob = text_heatmap.float().flatten(1)
-    pred_prob = pred_prob / pred_prob.sum(dim=1, keepdim=True).clamp_min(1e-6)
-    target = roi_target.float().flatten(1)
-    inside_mass = (pred_prob * target).sum(dim=1).clamp_min(1e-8)
-    loss = -inside_mass.log().mean()
-
-    if return_target:
-        return loss, roi_target
     return loss
 
 
@@ -820,15 +755,14 @@ def validate(
 
         if useap:
             if fused_feats is not None:
-                img_text_loss = 0.7 * info_nce_loss(
+                image_retrieval_loss = 0.7 * info_nce_loss(
                     fused_feats, candidate_feats, positive_indices
                 )
-                img_text_loss += 0.3 * info_nce_loss(
+                image_retrieval_loss += 0.3 * info_nce_loss(
                     anchor_feats, candidate_feats, positive_indices
                 )
             else:
-                # No text branch: fall back to image-only retrieval objective.
-                img_text_loss = info_nce_loss(
+                image_retrieval_loss = info_nce_loss(
                     anchor_feats, candidate_feats, positive_indices
                 )
         else:
@@ -960,7 +894,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         processor_sat=processor_sat,
         tokenizer=tokenizer,
         split="train",
-        text_json_name=Config.TEXT_JSON_NAME,
     )
     train_dataloader = DataLoader(
         train_dataset,
@@ -976,7 +909,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         processor_sat=processor_sat,
         tokenizer=tokenizer,
         split="test",
-        text_json_name=Config.TEXT_JSON_NAME,
     )
     test_dataloader = DataLoader(
         test_dataset,
@@ -986,10 +918,11 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     )
     accelerator.print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")
 
-    optimizer = AdamW(model.parameters(), lr=Config.LEARNING_RATE)
-    trainable_param_count = sum(
-        param.numel() for param in model.parameters() if param.requires_grad
-    )
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    if not trainable_params:
+        raise ValueError("No trainable parameters found for optimizer.")
+    optimizer = AdamW(trainable_params, lr=Config.LEARNING_RATE)
+    trainable_param_count = sum(param.numel() for param in trainable_params)
     accelerator.print(
         f"Optimizer: lr={Config.LEARNING_RATE:.2e}, "
         f"trainable params={trainable_param_count:,}"
@@ -1128,22 +1061,9 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     positive_indices[row_indices_flat, global_positive_indices] = 0.92
 
 
-                    # if fused_feats is not None:
-                    #     img_text_loss = 0.7 * info_nce_loss(
-                    #         fused_feats, candidate_feats, positive_indices
-                    #     )
-                    #     img_text_loss += 0.3 * info_nce_loss(
-                    #         anchor_feats, candidate_feats, positive_indices
-                    #     )
-                    # else:
-                        # No text branch: fall back to image-only retrieval objective.
-                    img_text_loss = info_nce_loss(
+                    image_retrieval_loss = info_nce_loss(
                         anchor_feats, candidate_feats, positive_indices
                     )
-                    if input_ids is not None and text_feats is not None:
-                        text_loss = info_nce_loss(text_feats, candidate_feats.detach(), positive_indices)
-                        img_text_loss = img_text_loss + 0.05 * text_loss
-
 
                     # scheduled_bbox_weight, scheduled_retrieval_weight = get_loss_weights(
                     #     epoch, Config.COSINE_EPOCHS, end_num
@@ -1177,7 +1097,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 {
                     "bbox_loss": f"{bbox_loss.item():.4f}",
                     "heatmap_loss": f"{heatmap_loss.item():.4f}",
-                    "img_text_loss": f"{img_text_loss.item():.4f}",
+                    "retrieval_loss": f"{image_retrieval_loss.item():.4f}",
                     "retrieval_weight": f"{retrieval_weight:.4f}",
                     "bbox_weight": f"{bbox_weight:.4f}",
                 }
@@ -1189,7 +1109,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 writer.add_scalar("Loss/bbox_geo_step", loss_geo.item(), global_step)
                 writer.add_scalar("Loss/bbox_cls_step", loss_cls.item(), global_step)
                 writer.add_scalar("Loss/heatmap_step", heatmap_loss.item(), global_step)
-                writer.add_scalar("Loss/img_text_step", img_text_loss.item(), global_step)
+                writer.add_scalar("Loss/retrieval_step", image_retrieval_loss.item(), global_step)
                 writer.add_scalar("Weight/retrieval", retrieval_weight, global_step)
                 writer.add_scalar("Weight/bbox", bbox_weight, global_step)
                 writer.add_scalar(

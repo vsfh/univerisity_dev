@@ -5,9 +5,9 @@ cd /media/data1/feihong/univerisity_dev
 
 CONFIGS=(
     # Encoder_heat without geo input.
-    "configs/unified_siglip_supp/single_config/model_heat_no_geo.yaml"
+    # "configs/unified_siglip_supp/single_config/model_heat_no_geo.yaml"
     # Encoder_heat without input_ids.
-    "configs/unified_siglip_supp/single_config/model_heat_no_input_ids.yaml"
+    # "configs/unified_siglip_supp/single_config/model_heat_no_input_ids.yaml"
     # Encoder_test with both geo and input_ids.
     "configs/unified_siglip_supp/single_config/model_test_geo_input_ids.yaml"
 )
