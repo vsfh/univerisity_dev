@@ -11,14 +11,10 @@ config:
   MODEL_NAME: google/siglip2-base-patch16-224
   USE_AMP: true
   ENABLE_TF32: true
-<<<<<<< HEAD
   ENCODER_TYPE: heat
   LORA_RANK: 8
   LORA_ALPHA: 16.0
   LORA_DROPOUT: 0.05
-=======
-  ENCODER_TYPE: sig
->>>>>>> 3ecfc2908aaf5288bb8ba7b5c6e87ffdb44aa646
   OPTIMIZE_OBJECTIVE: combined
   USE_ANGLE_INPUT: true
   USE_TEXT_INPUT: false
