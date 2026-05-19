@@ -41,9 +41,11 @@ DEFAULT_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 DEFAULT_OUTPUT_DIR = "/media/data1/feihong/univerisity_dev/eval_results/test_unify"
 DEFAULT_INCLUDE_FILE = "/media/data1/feihong/ckpt/include1.json"
 DEFAULT_ENCODER_HEAT_CONFIG_DIR = "/media/data1/feihong/univerisity_dev/configs/unified_siglip_supp"
-DEFAULT_ENCODER_HEAT_CHECKPOINT = "/media/data1/feihong/ckpt/model_full/best_iou.pth"
-DEFAULT_UNIFY_CHECKPOINT = "/media/data1/feihong/ckpt/unify_geo/best_iou.pth"
-DEFAULT_TRANS_CHECKPOINT = "/media/data1/feihong/ckpt/trans_geo/best_iou.pth"
+DEFAULT_ENCODER_HEAT_CHECKPOINT = "/media/data1/feihong/ckpt/model_full/last.pth"
+DEFAULT_ENCODER_SIG_CHECKPOINT = "/media/data1/feihong/ckpt/model_sig/last.pth"
+DEFAULT_ENCODER_LORA_CHECKPOINT = "/media/data1/feihong/ckpt/model_lora/last.pth"
+DEFAULT_UNIFY_CHECKPOINT = "/media/data1/feihong/ckpt/unify_geo/last.pth"
+DEFAULT_TRANS_CHECKPOINT = "/media/data1/feihong/ckpt/trans_geo/last.pth"
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
 
@@ -60,6 +62,7 @@ class FeatureBundle:
     gallery_labels: List[str]
     gallery_satellite_paths: List[str]
     gallery_feats: torch.Tensor
+    query_text_feats: Optional[torch.Tensor] = None
     query_detail_feats: Optional[torch.Tensor] = None
     gallery_detail_feats: Optional[torch.Tensor] = None
     unify_logit_scale: Optional[float] = None
@@ -162,14 +165,13 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> None:
         state = state["state_dict"]
     if isinstance(state, dict):
         state = {str(k).replace("module.", ""): v for k, v in state.items()}
+        state = {
+            key: value
+            for key, value in state.items()
+            if not key.startswith("text_projector.")
+        }
 
-    result = model.load_state_dict(state, strict=False)
-    if result.missing_keys or result.unexpected_keys:
-        print(
-            "Checkpoint loaded with "
-            f"missing_keys={len(result.missing_keys)}, "
-            f"unexpected_keys={len(result.unexpected_keys)}"
-        )
+    model.load_state_dict(state, strict=True)
 
 
 def load_yaml(path: str) -> Dict[str, Any]:
@@ -258,21 +260,22 @@ def discover_encoder_heat_runs(config_dir: str, checkpoint_name: str) -> List[Di
     return runs
 
 
-def create_encoder_heat_loader(
+def create_encoder_loader(
     batch_size: int,
     num_workers: int,
     sat_size: Tuple[int, int],
     test_crop_ratio: float,
     subset_heights: Optional[Sequence[int]],
     subset_angles: Optional[Sequence[int]],
+    model_name: str,
 ) -> DataLoader:
-    processor = AutoImageProcessor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
+    processor = AutoImageProcessor.from_pretrained(model_name, cache_dir=CACHE_DIR)
     processor_sat = AutoImageProcessor.from_pretrained(
-        MODEL_NAME,
+        model_name,
         cache_dir=CACHE_DIR,
         size={"height": int(sat_size[0]), "width": int(sat_size[1])},
     )
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=CACHE_DIR)
     dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
         processor_sat=processor_sat,
@@ -291,6 +294,25 @@ def create_encoder_heat_loader(
         pin_memory=torch.cuda.is_available(),
         persistent_workers=num_workers > 0,
         prefetch_factor=4 if num_workers > 0 else None,
+    )
+
+
+def create_encoder_heat_loader(
+    batch_size: int,
+    num_workers: int,
+    sat_size: Tuple[int, int],
+    test_crop_ratio: float,
+    subset_heights: Optional[Sequence[int]],
+    subset_angles: Optional[Sequence[int]],
+) -> DataLoader:
+    return create_encoder_loader(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        sat_size=sat_size,
+        test_crop_ratio=test_crop_ratio,
+        subset_heights=subset_heights,
+        subset_angles=subset_angles,
+        model_name=MODEL_NAME,
     )
 
 
@@ -382,6 +404,72 @@ def extract_encoder_heat_features(
         test_crop_ratio=test_crop_ratio,
         subset_heights=subset_heights,
         subset_angles=subset_angles,
+        heatmap_confidence_weight=heatmap_confidence_weight,
+        use_text=use_text,
+        use_angle=use_angle,
+        use_ap=use_ap,
+        model_name=MODEL_NAME,
+    )
+
+
+def extract_encoder_features(
+    model_type: str,
+    checkpoint_path: str,
+    device: torch.device,
+    batch_size: int,
+    num_workers: int,
+    sat_size: Tuple[int, int],
+    test_crop_ratio: float,
+    subset_heights: Optional[Sequence[int]],
+    subset_angles: Optional[Sequence[int]],
+    heatmap_confidence_weight: float,
+    use_text: bool = True,
+    use_angle: bool = True,
+    use_ap: bool = True,
+    model_name: str = MODEL_NAME,
+    lora_rank: int = 8,
+    lora_alpha: float = 16.0,
+    lora_dropout: float = 0.05,
+) -> FeatureBundle:
+    if model_type == "encoder_sig":
+        model = Encoder_sig(
+            model_name=model_name,
+            proj_dim=768,
+            usesg=True,
+            useap=use_ap,
+            query_image_size=DRONE_SIZE,
+            search_image_size=(int(sat_size[0]), int(sat_size[1])),
+        ).to(device)
+    elif model_type == "encoder_lora":
+        model = Encoder_lora(
+            model_name=model_name,
+            proj_dim=768,
+            usesg=True,
+            useap=use_ap,
+            query_image_size=DRONE_SIZE,
+            search_image_size=(int(sat_size[0]), int(sat_size[1])),
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+        ).to(device)
+    else:
+        model = Encoder_heat(
+            model_name=model_name,
+            proj_dim=768,
+            usesg=True,
+            useap=use_ap,
+        ).to(device)
+    load_checkpoint(model, checkpoint_path)
+    model.eval()
+
+    loader = create_encoder_loader(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        sat_size=sat_size,
+        test_crop_ratio=test_crop_ratio,
+        subset_heights=subset_heights,
+        subset_angles=subset_angles,
+        model_name=model_name,
     )
     anchors_full = parse_anchors(device)
 
@@ -391,6 +479,7 @@ def extract_encoder_heat_features(
     query_satellite_paths: List[str] = []
     query_heights: List[int] = []
     query_angles: List[int] = []
+    query_text_feats: List[torch.Tensor] = []
     iou_values: List[float] = []
     center_distances: List[float] = []
     gallery_feat_dict: Dict[str, torch.Tensor] = {}
@@ -420,11 +509,25 @@ def extract_encoder_heat_features(
                 angle=geo,
                 attention_mask=attention_mask,
             )
-            pred_anchor, _, _, anchor_pooler, grid_feats, _, heatmap_logits = outputs
+            if len(outputs) != 9:
+                raise ValueError(f"Expected 9 model outputs, got {len(outputs)}.")
+            (
+                pred_anchor,
+                _,
+                text_feats,
+                anchor_pooler,
+                grid_feats,
+                _,
+                heatmap_logits,
+                _,
+                _,
+            ) = outputs
 
             query_batch = F.normalize(anchor_pooler, p=2, dim=1)
             gallery_grid_batch = F.normalize(grid_feats, p=2, dim=2)
             query_feats.append(query_batch.cpu())
+            if text_feats is not None:
+                query_text_feats.append(F.normalize(text_feats, p=2, dim=1).cpu())
 
             batch_labels = [_path_label(path) for path in batch["satellite_path"]]
             query_labels.extend(batch_labels)
@@ -451,7 +554,7 @@ def extract_encoder_heat_features(
                 heatmap_logits,
                 confidence_weight=heatmap_confidence_weight,
             )
-            image_wh = (int(search_imgs.shape[-1]), int(search_imgs.shape[-2]))
+            image_wh = (int(sat_size[1]), int(sat_size[0]))
             grid_wh = (int(pred_anchor.shape[-1]), int(pred_anchor.shape[-2]))
             _, best_anchor_gi_gj = build_target(gt_bbox, anchors_full, image_wh, grid_wh)
             _, _, _, _, pred_bbox_xyxy, target_bbox_xyxy = eval_iou_acc(
@@ -487,6 +590,7 @@ def extract_encoder_heat_features(
         gallery_labels=gallery_labels,
         gallery_satellite_paths=[gallery_path_dict.get(label, "") for label in gallery_labels],
         gallery_feats=torch.stack([gallery_feat_dict[label] for label in gallery_labels], dim=0),
+        query_text_feats=torch.cat(query_text_feats, dim=0) if query_text_feats else None,
     )
 
 
@@ -707,15 +811,41 @@ def extract_trans_features(
     )
 
 
+def score_grid_encoder_query(
+    query_feat: torch.Tensor,
+    gallery_feats: torch.Tensor,
+    candidate_indices: List[int],
+    device: torch.device,
+    text_feat: Optional[torch.Tensor] = None,
+    text_score_weight: float = 0.0,
+) -> torch.Tensor:
+    candidate_gallery = gallery_feats[candidate_indices].to(device)
+    query_feat = query_feat.to(device)
+    image_scores = torch.einsum("d,knd->kn", query_feat, candidate_gallery).max(dim=1)[0]
+    if text_feat is None or text_score_weight <= 0.0:
+        return image_scores
+
+    text_feat = text_feat.to(device)
+    text_scores = torch.einsum("d,knd->kn", text_feat, candidate_gallery).max(dim=1)[0]
+    return image_scores + float(text_score_weight) * text_scores
+
+
 def score_encoder_heat_query(
     query_feat: torch.Tensor,
     gallery_feats: torch.Tensor,
     candidate_indices: List[int],
     device: torch.device,
+    text_feat: Optional[torch.Tensor] = None,
+    text_score_weight: float = 0.0,
 ) -> torch.Tensor:
-    candidate_gallery = gallery_feats[candidate_indices].to(device)
-    query_feat = query_feat.to(device)
-    return torch.einsum("d,knd->kn", query_feat, candidate_gallery).max(dim=1)[0]
+    return score_grid_encoder_query(
+        query_feat=query_feat,
+        gallery_feats=gallery_feats,
+        candidate_indices=candidate_indices,
+        device=device,
+        text_feat=text_feat,
+        text_score_weight=text_score_weight,
+    )
 
 
 def score_unify_query(
@@ -751,6 +881,7 @@ def score_retrieval_and_uiou(
     candidate_size: Optional[int],
     unify_score_mode: str,
     sampling_seed: int,
+    encoder_heat_text_score_weight: float = 0.0,
 ) -> Dict[str, Any]:
     label_to_gallery_index = {label: idx for idx, label in enumerate(bundle.gallery_labels)}
     norm_gallery_labels = [_normalize_label(label) for label in bundle.gallery_labels]
@@ -789,6 +920,8 @@ def score_retrieval_and_uiou(
                 bundle.gallery_feats,
                 candidate_indices,
                 device,
+                text_feat=text_feat,
+                text_score_weight=encoder_heat_text_score_weight,
             )
         else:
             score_vec = score_unify_query(
@@ -958,6 +1091,43 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
         )
+    elif model_type == "encoder_sig":
+        bundle = extract_encoder_features(
+            model_type="encoder_sig",
+            checkpoint_path=checkpoint_path,
+            device=device,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            sat_size=sat_size,
+            test_crop_ratio=args.test_crop_ratio,
+            subset_heights=subset_heights,
+            subset_angles=subset_angles,
+            heatmap_confidence_weight=args.heatmap_confidence_weight,
+            use_text=args.encoder_sig_use_text,
+            use_angle=args.encoder_sig_use_angle,
+            use_ap=args.encoder_sig_use_ap,
+            model_name=args.encoder_sig_model_name,
+        )
+    elif model_type == "encoder_lora":
+        bundle = extract_encoder_features(
+            model_type="encoder_lora",
+            checkpoint_path=checkpoint_path,
+            device=device,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            sat_size=sat_size,
+            test_crop_ratio=args.test_crop_ratio,
+            subset_heights=subset_heights,
+            subset_angles=subset_angles,
+            heatmap_confidence_weight=args.heatmap_confidence_weight,
+            use_text=args.encoder_lora_use_text,
+            use_angle=args.encoder_lora_use_angle,
+            use_ap=args.encoder_lora_use_ap,
+            model_name=args.encoder_sig_model_name,
+            lora_rank=args.encoder_lora_rank,
+            lora_alpha=args.encoder_lora_alpha,
+            lora_dropout=args.encoder_lora_dropout,
+        )
     elif model_type == "unify_geo":
         bundle = extract_unify_features(
             checkpoint_path=checkpoint_path,
@@ -1001,6 +1171,7 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
         candidate_size=args.candidate_size,
         unify_score_mode=args.unify_score_mode,
         sampling_seed=args.seed,
+        encoder_heat_text_score_weight=args.encoder_heat_text_score_weight,
     )
     records = scored.pop("query_records")
     per_subset, per_height, per_angle = group_summaries(records)
@@ -1044,6 +1215,10 @@ def checkpoint_for_model(model_type: str, args: argparse.Namespace) -> str:
         return args.checkpoint
     if model_type in {"encoder_heat", "encoder_test"}:
         return args.encoder_heat_checkpoint
+    if model_type == "encoder_sig":
+        return args.encoder_sig_checkpoint
+    if model_type == "encoder_lora":
+        return args.encoder_lora_checkpoint
     if model_type == "unify_geo":
         return args.unify_checkpoint
     if model_type == "trans_geo":
@@ -1103,6 +1278,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--encoder-heat-checkpoint", type=str, default=DEFAULT_ENCODER_HEAT_CHECKPOINT)
+    parser.add_argument("--encoder-sig-checkpoint", type=str, default=DEFAULT_ENCODER_SIG_CHECKPOINT)
+    parser.add_argument("--encoder-lora-checkpoint", type=str, default=DEFAULT_ENCODER_LORA_CHECKPOINT)
+    parser.add_argument("--encoder-sig-model-name", type=str, default=SIGLIP2_MODEL_NAME)
+    parser.add_argument("--encoder-lora-rank", type=int, default=8)
+    parser.add_argument("--encoder-lora-alpha", type=float, default=16.0)
+    parser.add_argument("--encoder-lora-dropout", type=float, default=0.05)
     parser.add_argument("--encoder-heat-config-dir", type=str, default=DEFAULT_ENCODER_HEAT_CONFIG_DIR)
     parser.add_argument("--eval-encoder-heat-configs", action="store_true")
     parser.add_argument("--encoder-heat-checkpoint-name", type=str, default="last.pth")
@@ -1182,6 +1363,7 @@ def main() -> None:
                 "use_angle": bool(run["use_angle"]),
                 "use_ap": bool(run["use_ap"]),
                 "heatmap_confidence_weight": float(run["heatmap_confidence_weight"]),
+                "text_score_weight": float(args.encoder_heat_text_score_weight),
             }
             out_file = save_metrics(metrics, args.output_dir, name_suffix=str(run["config_name"]))
             print_summary(metrics, out_file)

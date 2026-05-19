@@ -11,12 +11,23 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 
 # --- Configuration ---
 MODEL_NAME = "Qwen/Qwen3-VL-4B-Instruct"
+# gemma4
 IMAGE_SIZE = (256, 256)
 NUM_PATCHES = 32
 ANGLE_ORDER = (0, 45, 90, 135, 180, 225, 270, 315)
 DEFAULT_IMAGE_ROOT = "/media/data1/feihong/drone_img"
 CACHE_DIR = "/media/data1/feihong/hf_cache"
 DEFAULT_GPU_ID = 1
+RETRIEVAL_PROMPT = (
+	"All images show the same place from drone views.\n\n"
+	"Write a satellite-retrieval query as 8-12 comma-separated noun phrases. "
+	"Use only stable visual cues visible from above: roof geometry, footprint shape, "
+	"courtyard/open space, sports field/water/parking, road layout, tree belt, "
+	"and relative positions.\n\n"
+	"Avoid generic words unless paired with a distinctive shape or location. "
+	"Avoid markdown, headings, full sentences, and uncertain claims. "
+	"Output only the comma-separated phrases."
+)
 
 
 def _patch_sort_key(path_str: str) -> Tuple[int, int, str]:
@@ -153,59 +164,30 @@ def generate_unified_description_from_32_drone_images(
 	max_new_tokens_stage2: int = 96,
 ) -> Dict[str, List[str] | str]:
 	"""
-	Mimic a Fig.4-like two-stage text generation pipeline.
+	Generate a candidate-independent retrieval query from 32 drone patches.
 
-	Stage 1: generate chunk-level descriptions from 32 drone patches.
-	Stage 2: fuse chunk-level text into one unified description.
+	The output is intentionally short and phrase-based so it can act as a
+	satellite retrieval signal instead of a generic visual caption.
 	"""
 	if chunk_size <= 0:
 		raise ValueError("chunk_size must be positive.")
+	del chunk_size, max_new_tokens_stage2
 
 	image_paths = list(image_paths)
 	_validate_images(image_paths)
 
-	stage1_prompt = (
-		"All images are 256x256 drone patches of the same region. "
-		"Describe stable, distinctive details of the target area, emphasizing roof "
-		"patterns, geometry, materials, and nearby context. Avoid uncertain claims. "
-		"Return 4-6 concise bullet points."
-	)
-
-	chunk_descriptions: List[str] = []
-	for start in range(0, len(image_paths), chunk_size):
-		chunk = image_paths[start : start + chunk_size]
-		message = _build_message(stage1_prompt, chunk)
-		chunk_text = _generate(
-			model=model,
-			processor=processor,
-			messages=[message],
-			max_new_tokens=max_new_tokens_stage1,
-			temperature=0.0,
-		)
-		chunk_descriptions.append(chunk_text)
-
-	fused_notes = "\n".join(
-		[f"Chunk {idx + 1}: {desc}" for idx, desc in enumerate(chunk_descriptions)]
-	)
-	stage2_prompt = (
-		"Fuse the chunk descriptions into one unified geo-localization description. "
-		"Output two short parts in plain text: "
-		"(1) building profile in <=32 tokens as noun phrases; "
-		"(2) surrounding environment in <=32 tokens. "
-		"Do not include headings, markdown, or explanations.\n\n"
-		f"Chunk descriptions:\n{fused_notes}"
-	)
-
+	message = _build_message(RETRIEVAL_PROMPT, image_paths)
 	unified_description = _generate(
 		model=model,
 		processor=processor,
-		messages=[{"role": "user", "content": [{"type": "text", "text": stage2_prompt}]}],
-		max_new_tokens=max_new_tokens_stage2,
+		messages=[message],
+		max_new_tokens=max_new_tokens_stage1,
 		temperature=0.0,
 	)
 
 	return {
-		"chunk_descriptions": chunk_descriptions,
+		"chunk_descriptions": [],
+		"prompt": RETRIEVAL_PROMPT,
 		"unified_description": unified_description,
 	}
 
@@ -319,7 +301,7 @@ def main() -> None:
 	parser.add_argument("--sample_id", type=str, default=None)
 	parser.add_argument("--one_image", type=str, default=None)
 	parser.add_argument("--default_image_root", type=str, default=DEFAULT_IMAGE_ROOT)
-	parser.add_argument("--output", type=str, default="udes_version1.json")
+	parser.add_argument("--output", type=str, default="distinctive_description.json")
 	parser.add_argument("--model_name", type=str, default=MODEL_NAME)
 	parser.add_argument("--cache_dir", type=str, default=CACHE_DIR)
 	parser.add_argument(
@@ -362,7 +344,7 @@ def main() -> None:
 		print(result["unified_description"])
 		return
 
-	sample_dirs = list_sample_dirs(args.default_image_root)[:1652][::-1]
+	sample_dirs = list_sample_dirs(args.default_image_root)
 	if Path(args.output).is_absolute():
 		output_name = Path(args.output).name
 	else:
@@ -394,7 +376,7 @@ def main() -> None:
 		"num_failed": len(failed_samples),
 		"failed_samples": failed_samples,
 	}
-	summary_path = Path(args.default_image_root).resolve() / "unified_description_version1.json"
+	summary_path = Path(args.default_image_root).resolve() / "distinctive_description.json"
 	with open(summary_path, "w", encoding="utf-8") as f:
 		json.dump(summary, f, indent=2, ensure_ascii=False)
 

@@ -198,7 +198,47 @@ def add_heatmap_to_confidence(
     )
 
 
-def build_model(model_type: str) -> torch.nn.Module:
+def load_checkpoint_state(checkpoint_path: str) -> Dict[str, torch.Tensor]:
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    state = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+
+    if isinstance(state, dict):
+        return {k.replace("module.", ""): v for k, v in state.items()}
+
+    raise TypeError(f"Unsupported checkpoint format: {type(state)!r}")
+
+
+def _infer_smgeo_kwargs(state: Optional[Dict[str, torch.Tensor]]) -> Dict[str, int]:
+    if not state:
+        return {}
+
+    kwargs: Dict[str, int] = {}
+    patch_weight = state.get("backbone.query_patch.proj.weight")
+    if isinstance(patch_weight, torch.Tensor) and patch_weight.ndim == 4:
+        kwargs["embed_dim"] = int(patch_weight.shape[0])
+        kwargs["patch_size"] = int(patch_weight.shape[-1])
+
+    expert_counts = {
+        int(tensor.shape[0])
+        for key, tensor in state.items()
+        if key.endswith("ffn.router.weight")
+        and isinstance(tensor, torch.Tensor)
+        and tensor.ndim == 2
+    }
+    if len(expert_counts) == 1:
+        kwargs["num_experts"] = expert_counts.pop()
+
+    return kwargs
+
+
+def build_model(
+    model_type: str,
+    checkpoint_state: Optional[Dict[str, torch.Tensor]] = None,
+) -> torch.nn.Module:
     model_type = _canonical_model_type(model_type)
     if model_type == "siglip":
         return SigLIPModel(model_name=MODEL_NAME_SIGLIP, proj_dim=768)
@@ -213,7 +253,10 @@ def build_model(model_type: str) -> torch.nn.Module:
     if model_type == "sample4geo":
         return SampleGeoLite(pretrained=False)
     if model_type == "smgeo":
-        return SMGeoLite()
+        kwargs = _infer_smgeo_kwargs(checkpoint_state)
+        if kwargs:
+            print(f"Inferred SMGeoLite checkpoint config: {kwargs}")
+        return SMGeoLite(**kwargs)
     if model_type == "ocg":
         return OCGNetLite(pretrained_backbone=False)
     if model_type == "trogeolite":
@@ -221,18 +264,33 @@ def build_model(model_type: str) -> torch.nn.Module:
     raise ValueError(f"Unknown model type: {model_type}")
 
 
-def load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> None:
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+def load_checkpoint(
+    model: torch.nn.Module,
+    checkpoint_path: str,
+    checkpoint_state: Optional[Dict[str, torch.Tensor]] = None,
+) -> None:
+    state = checkpoint_state or load_checkpoint_state(checkpoint_path)
+    model_state = model.state_dict()
+    compatible_state: Dict[str, torch.Tensor] = {}
+    skipped_shapes: List[Tuple[str, Tuple[int, ...], Tuple[int, ...]]] = []
 
-    state = torch.load(checkpoint_path, map_location="cpu")
-    if isinstance(state, dict) and "state_dict" in state:
-        state = state["state_dict"]
+    for key, value in state.items():
+        if (
+            key in model_state
+            and isinstance(value, torch.Tensor)
+            and model_state[key].shape != value.shape
+        ):
+            skipped_shapes.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+            continue
+        compatible_state[key] = value
 
-    if isinstance(state, dict):
-        state = {k.replace("module.", ""): v for k, v in state.items()}
-
-    model.load_state_dict(state, strict=False)
+    model.load_state_dict(compatible_state, strict=False)
+    if skipped_shapes:
+        print(f"Skipped {len(skipped_shapes)} checkpoint tensors with incompatible shapes:")
+        for key, checkpoint_shape, model_shape in skipped_shapes[:10]:
+            print(f"  {key}: checkpoint={checkpoint_shape}, model={model_shape}")
+        if len(skipped_shapes) > 10:
+            print(f"  ... {len(skipped_shapes) - 10} more")
 
 
 def _load_drone_name_filter(txt_path: Optional[str]) -> Optional[Set[str]]:
@@ -495,9 +553,9 @@ def visualize_batch_with_prediction(
 def evaluate(config: EvalConfig) -> Dict[str, Any]:
     model_type = _canonical_model_type(config.model_type)
 
-
-    model = build_model(model_type).to(config.device)
-    load_checkpoint(model, config.checkpoint_path)
+    checkpoint_state = load_checkpoint_state(config.checkpoint_path)
+    model = build_model(model_type, checkpoint_state=checkpoint_state).to(config.device)
+    load_checkpoint(model, config.checkpoint_path, checkpoint_state=checkpoint_state)
     model.eval()
 
     loader = create_test_loader(config)

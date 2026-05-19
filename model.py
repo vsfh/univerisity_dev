@@ -478,10 +478,12 @@ class Encoder_heat(nn.Module):
             pred_anchor,
             None,
             text_feats,
-            anchor_pooler,
+            anchor_pooler_x,
             sat_feature_2d_pool,
-            fused_feats,
-            heatmap_out,
+            None,
+            self._resize_heatmap_to_pred(heatmap_logits, pred_anchor, apply_softmax=True),
+            self._resize_heatmap_to_pred(text_heatmap_logits, pred_anchor, apply_softmax=True),
+            self._resize_heatmap_to_pred(roi_mask, pred_anchor, apply_softmax=False),
         )
 
 

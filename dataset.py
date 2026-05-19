@@ -653,7 +653,8 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		return None
 
 	def _load_unified_text(self, drone_dir: Path) -> Optional[str]:
-		text_path = drone_dir / "udes_version1.json"
+		# text_path = drone_dir / "udes_version1.json"
+		text_path = drone_dir / "distinctive_description.json"
 		if not text_path.exists():
 			return None
 
