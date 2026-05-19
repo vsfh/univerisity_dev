@@ -14,29 +14,29 @@ COMMON_ARGS=(
     --lora-dropout 0.05
 )
 
-echo "============================================================"
-echo "Testing Encoder_heat without geo input"
-echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
-echo "============================================================"
-python test_unify.py \
-    --model-types encoder_heat \
-    --checkpoint "/media/data1/feihong/ckpt/model_heat_no_geo/${CHECKPOINT_NAME}" \
-    --no-encoder-heat-use-angle \
-    --no-encoder-heat-use-text \
-    "${COMMON_ARGS[@]}" \
-    "$@"
+# echo "============================================================"
+# echo "Testing Encoder_heat without geo input"
+# echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
+# echo "============================================================"
+# python test_unify.py \
+#     --model-types encoder_heat \
+#     --checkpoint "/media/data1/feihong/ckpt/model_heat_no_geo/${CHECKPOINT_NAME}" \
+#     --no-encoder-heat-use-angle \
+#     --no-encoder-heat-use-text \
+#     "${COMMON_ARGS[@]}" \
+#     "$@"
 
-echo "============================================================"
-echo "Testing Encoder_heat without input_ids"
-echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
-echo "============================================================"
-python test_unify.py \
-    --model-types encoder_heat \
-    --checkpoint "/media/data1/feihong/ckpt/model_heat_no_input_ids/${CHECKPOINT_NAME}" \
-    --encoder-heat-use-angle \
-    --no-encoder-heat-use-text \
-    "${COMMON_ARGS[@]}" \
-    "$@"
+# echo "============================================================"
+# echo "Testing Encoder_heat without input_ids"
+# echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
+# echo "============================================================"
+# python test_unify.py \
+#     --model-types encoder_heat \
+#     --checkpoint "/media/data1/feihong/ckpt/model_heat_no_input_ids/${CHECKPOINT_NAME}" \
+#     --encoder-heat-use-angle \
+#     --no-encoder-heat-use-text \
+#     "${COMMON_ARGS[@]}" \
+#     "$@"
 
 echo "============================================================"
 echo "Testing Encoder_test with geo and input_ids"

@@ -42,8 +42,6 @@ DEFAULT_OUTPUT_DIR = "/media/data1/feihong/univerisity_dev/eval_results/test_uni
 DEFAULT_INCLUDE_FILE = "/media/data1/feihong/ckpt/include1.json"
 DEFAULT_ENCODER_HEAT_CONFIG_DIR = "/media/data1/feihong/univerisity_dev/configs/unified_siglip_supp"
 DEFAULT_ENCODER_HEAT_CHECKPOINT = "/media/data1/feihong/ckpt/model_full/last.pth"
-DEFAULT_ENCODER_SIG_CHECKPOINT = "/media/data1/feihong/ckpt/model_sig/last.pth"
-DEFAULT_ENCODER_LORA_CHECKPOINT = "/media/data1/feihong/ckpt/model_lora/last.pth"
 DEFAULT_UNIFY_CHECKPOINT = "/media/data1/feihong/ckpt/unify_geo/last.pth"
 DEFAULT_TRANS_CHECKPOINT = "/media/data1/feihong/ckpt/trans_geo/last.pth"
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
@@ -163,6 +161,8 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> None:
     state = torch.load(checkpoint_path, map_location="cpu")
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
+    elif isinstance(state, dict) and "model" in state:
+        state = state["model"]
     if isinstance(state, dict):
         state = {str(k).replace("module.", ""): v for k, v in state.items()}
         state = {
@@ -397,71 +397,6 @@ def extract_encoder_heat_features(
     load_checkpoint(model, checkpoint_path)
     model.eval()
 
-    loader = create_encoder_heat_loader(
-        batch_size=batch_size,
-        num_workers=num_workers,
-        sat_size=sat_size,
-        test_crop_ratio=test_crop_ratio,
-        subset_heights=subset_heights,
-        subset_angles=subset_angles,
-        heatmap_confidence_weight=heatmap_confidence_weight,
-        use_text=use_text,
-        use_angle=use_angle,
-        use_ap=use_ap,
-        model_name=MODEL_NAME,
-    )
-
-
-def extract_encoder_features(
-    model_type: str,
-    checkpoint_path: str,
-    device: torch.device,
-    batch_size: int,
-    num_workers: int,
-    sat_size: Tuple[int, int],
-    test_crop_ratio: float,
-    subset_heights: Optional[Sequence[int]],
-    subset_angles: Optional[Sequence[int]],
-    heatmap_confidence_weight: float,
-    use_text: bool = True,
-    use_angle: bool = True,
-    use_ap: bool = True,
-    model_name: str = MODEL_NAME,
-    lora_rank: int = 8,
-    lora_alpha: float = 16.0,
-    lora_dropout: float = 0.05,
-) -> FeatureBundle:
-    if model_type == "encoder_sig":
-        model = Encoder_sig(
-            model_name=model_name,
-            proj_dim=768,
-            usesg=True,
-            useap=use_ap,
-            query_image_size=DRONE_SIZE,
-            search_image_size=(int(sat_size[0]), int(sat_size[1])),
-        ).to(device)
-    elif model_type == "encoder_lora":
-        model = Encoder_lora(
-            model_name=model_name,
-            proj_dim=768,
-            usesg=True,
-            useap=use_ap,
-            query_image_size=DRONE_SIZE,
-            search_image_size=(int(sat_size[0]), int(sat_size[1])),
-            lora_rank=lora_rank,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-        ).to(device)
-    else:
-        model = Encoder_heat(
-            model_name=model_name,
-            proj_dim=768,
-            usesg=True,
-            useap=use_ap,
-        ).to(device)
-    load_checkpoint(model, checkpoint_path)
-    model.eval()
-
     loader = create_encoder_loader(
         batch_size=batch_size,
         num_workers=num_workers,
@@ -469,7 +404,7 @@ def extract_encoder_features(
         test_crop_ratio=test_crop_ratio,
         subset_heights=subset_heights,
         subset_angles=subset_angles,
-        model_name=model_name,
+        model_name=MODEL_NAME,
     )
     anchors_full = parse_anchors(device)
 
@@ -509,8 +444,8 @@ def extract_encoder_features(
                 angle=geo,
                 attention_mask=attention_mask,
             )
-            if len(outputs) != 9:
-                raise ValueError(f"Expected 9 model outputs, got {len(outputs)}.")
+            if len(outputs) != 7:
+                raise ValueError(f"Expected 7 model outputs, got {len(outputs)}.")
             (
                 pred_anchor,
                 _,
@@ -519,8 +454,6 @@ def extract_encoder_features(
                 grid_feats,
                 _,
                 heatmap_logits,
-                _,
-                _,
             ) = outputs
 
             query_batch = F.normalize(anchor_pooler, p=2, dim=1)
@@ -915,6 +848,11 @@ def score_retrieval_and_uiou(
             candidate_indices = sampled_negatives + [gt_gallery_index]
 
         if model_type in {"encoder_heat", "encoder_test"}:
+            text_feat = (
+                bundle.query_text_feats[q_idx]
+                if bundle.query_text_feats is not None
+                else None
+            )
             score_vec = score_encoder_heat_query(
                 bundle.query_feats[q_idx],
                 bundle.gallery_feats,
@@ -1091,43 +1029,6 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
         )
-    elif model_type == "encoder_sig":
-        bundle = extract_encoder_features(
-            model_type="encoder_sig",
-            checkpoint_path=checkpoint_path,
-            device=device,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            sat_size=sat_size,
-            test_crop_ratio=args.test_crop_ratio,
-            subset_heights=subset_heights,
-            subset_angles=subset_angles,
-            heatmap_confidence_weight=args.heatmap_confidence_weight,
-            use_text=args.encoder_sig_use_text,
-            use_angle=args.encoder_sig_use_angle,
-            use_ap=args.encoder_sig_use_ap,
-            model_name=args.encoder_sig_model_name,
-        )
-    elif model_type == "encoder_lora":
-        bundle = extract_encoder_features(
-            model_type="encoder_lora",
-            checkpoint_path=checkpoint_path,
-            device=device,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            sat_size=sat_size,
-            test_crop_ratio=args.test_crop_ratio,
-            subset_heights=subset_heights,
-            subset_angles=subset_angles,
-            heatmap_confidence_weight=args.heatmap_confidence_weight,
-            use_text=args.encoder_lora_use_text,
-            use_angle=args.encoder_lora_use_angle,
-            use_ap=args.encoder_lora_use_ap,
-            model_name=args.encoder_sig_model_name,
-            lora_rank=args.encoder_lora_rank,
-            lora_alpha=args.encoder_lora_alpha,
-            lora_dropout=args.encoder_lora_dropout,
-        )
     elif model_type == "unify_geo":
         bundle = extract_unify_features(
             checkpoint_path=checkpoint_path,
@@ -1215,10 +1116,6 @@ def checkpoint_for_model(model_type: str, args: argparse.Namespace) -> str:
         return args.checkpoint
     if model_type in {"encoder_heat", "encoder_test"}:
         return args.encoder_heat_checkpoint
-    if model_type == "encoder_sig":
-        return args.encoder_sig_checkpoint
-    if model_type == "encoder_lora":
-        return args.encoder_lora_checkpoint
     if model_type == "unify_geo":
         return args.unify_checkpoint
     if model_type == "trans_geo":
@@ -1278,12 +1175,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--encoder-heat-checkpoint", type=str, default=DEFAULT_ENCODER_HEAT_CHECKPOINT)
-    parser.add_argument("--encoder-sig-checkpoint", type=str, default=DEFAULT_ENCODER_SIG_CHECKPOINT)
-    parser.add_argument("--encoder-lora-checkpoint", type=str, default=DEFAULT_ENCODER_LORA_CHECKPOINT)
-    parser.add_argument("--encoder-sig-model-name", type=str, default=SIGLIP2_MODEL_NAME)
-    parser.add_argument("--encoder-lora-rank", type=int, default=8)
-    parser.add_argument("--encoder-lora-alpha", type=float, default=16.0)
-    parser.add_argument("--encoder-lora-dropout", type=float, default=0.05)
     parser.add_argument("--encoder-heat-config-dir", type=str, default=DEFAULT_ENCODER_HEAT_CONFIG_DIR)
     parser.add_argument("--eval-encoder-heat-configs", action="store_true")
     parser.add_argument("--encoder-heat-checkpoint-name", type=str, default="last.pth")
@@ -1316,6 +1207,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-file", type=str, default=DEFAULT_INCLUDE_FILE)
     parser.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--heatmap-confidence-weight", type=float, default=0.5)
+    parser.add_argument("--encoder-heat-text-score-weight", type=float, default=0.0)
     parser.add_argument("--unify-score-mode", choices=["rerank", "global"], default="rerank")
     parser.add_argument("--base-dim", type=int, default=96)
     parser.add_argument("--proj-dim", type=int, default=PROJECTION_DIM)
