@@ -1,3 +1,4 @@
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -531,13 +532,17 @@ class Encoder_test(Encoder_heat):
             nn.GELU(),
             nn.Linear(self.feature_dim, self.feature_dim),
         )
-        self.text_context_scale = nn.Parameter(torch.tensor(0.55))
-        self.text_heat_scale = nn.Parameter(torch.tensor(0.55))
+        self.text_roi_gate = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
         self.text_adapter_residual_scale = 0.1
-        self.max_text_context_scale = 0.2
-        self.max_text_heat_scale = 0.2
+        self.max_text_roi_scale = 0.5
         nn.init.zeros_(self.text_grounding_adapter[-1].weight)
         nn.init.zeros_(self.text_grounding_adapter[-1].bias)
+        nn.init.zeros_(self.text_roi_gate[-1].weight)
+        nn.init.constant_(self.text_roi_gate[-1].bias, -4.0)
 
     def _bounded_text_scale(self, raw_scale: torch.Tensor, max_abs: float) -> torch.Tensor:
         return float(max_abs) * torch.tanh(raw_scale)
@@ -576,6 +581,43 @@ class Encoder_test(Encoder_heat):
         conv_input = sat_features.reshape(1, batch_size * channels, height, width)
         conv_kernel = text_kernel.reshape(batch_size, channels, 1, 1)
         return F.conv2d(conv_input, conv_kernel, groups=batch_size).view(batch_size, 1, height, width)
+
+    def _build_text_roi_gate(
+        self,
+        text_roi: torch.Tensor,
+        visual_heatmap: torch.Tensor,
+        geo: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if text_roi.shape != visual_heatmap.shape:
+            raise ValueError(
+                f"Expected text_roi and visual_heatmap to share shape, got "
+                f"{tuple(text_roi.shape)} and {tuple(visual_heatmap.shape)}."
+            )
+        if text_roi.ndim != 4 or text_roi.shape[1] != 1:
+            raise ValueError(f"Expected ROI shape (B, 1, H, W), got {tuple(text_roi.shape)}.")
+
+        batch_size = text_roi.shape[0]
+        text_prob = text_roi.detach().flatten(1).float()
+        visual_prob = visual_heatmap.detach().flatten(1).float()
+        text_prob = text_prob / text_prob.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        visual_prob = visual_prob / visual_prob.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+        token_count = float(text_prob.shape[1])
+        text_entropy = -(text_prob * text_prob.clamp_min(1e-8).log()).sum(dim=1, keepdim=True)
+        text_entropy = text_entropy / max(math.log(max(token_count, 2.0)), 1e-6)
+        visual_peak = visual_prob.amax(dim=1, keepdim=True)
+        overlap = (text_prob * visual_prob).sum(dim=1, keepdim=True) * token_count
+
+        if geo is None:
+            height = text_prob.new_zeros(batch_size, 1)
+        else:
+            if geo.ndim != 2 or geo.shape != (batch_size, 3):
+                raise ValueError(f"Expected geo shape {(batch_size, 3)}, got {tuple(geo.shape)}.")
+            height = geo[:, 2:3].detach().to(device=text_prob.device, dtype=text_prob.dtype)
+
+        gate_input = torch.cat([text_entropy, visual_peak, overlap, height], dim=1)
+        gate = torch.sigmoid(self.text_roi_gate(gate_input.to(device=text_roi.device, dtype=text_roi.dtype)))
+        return gate.view(batch_size, 1, 1, 1) * float(self.max_text_roi_scale)
 
     def forward(
         self,
@@ -625,28 +667,20 @@ class Encoder_test(Encoder_heat):
         sat_features_2d = sat_feats.permute(0, 2, 1).reshape(batch_size, self.feature_dim, grid_h, grid_w)
 
         anchor_context = self._anchor_context(anchor_feats, angle)
-        if text_grounding is not None:
-            text_context = text_grounding[:, None, :].to(dtype=anchor_context.dtype)
-            text_context_scale = self._bounded_text_scale(
-                self.text_context_scale,
-                self.max_text_context_scale,
-            ).to(dtype=anchor_context.dtype)
-            anchor_context = anchor_context + text_context_scale * text_context
-
         heatmap_logits = self._dynamic_heatmap(anchor_feats, sat_features_2d, angle)
         text_heatmap_logits = self._text_dynamic_heatmap(text_grounding, sat_features_2d)
-        if text_heatmap_logits is not None:
-            text_heat_scale = self._bounded_text_scale(
-                self.text_heat_scale,
-                self.max_text_heat_scale,
-            ).to(dtype=heatmap_logits.dtype)
-            heatmap_logits = (
-                heatmap_logits
-                + text_heat_scale * text_heatmap_logits
-            )
         heatmap = self._spatial_softmax(heatmap_logits)
 
         heat_gate = heatmap * heatmap.shape[-2] * heatmap.shape[-1] / 2
+        if text_heatmap_logits is not None:
+            text_roi = self._spatial_softmax(text_heatmap_logits)
+            text_roi = text_roi / text_roi.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+            text_roi_gate = self._build_text_roi_gate(
+                text_roi=text_roi,
+                visual_heatmap=heatmap,
+                geo=angle,
+            )
+            heat_gate = heat_gate * (1.0 + text_roi_gate.to(dtype=heat_gate.dtype) * text_roi.to(dtype=heat_gate.dtype))
         guided_sat_features = self.heat_fuse(
             torch.cat([sat_features_2d, heat_gate], dim=1)
         )
