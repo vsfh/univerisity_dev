@@ -1,4 +1,3 @@
-import math
 from typing import Optional, Tuple
 
 import torch
@@ -517,6 +516,9 @@ class Encoder_test(Encoder_heat):
                 f"Encoder_test requires text dim {self.text_feature_dim} "
                 f"to match vision dim {self.feature_dim}."
             )
+        self.refine_topk = 9
+        self.text_candidate_weight = 0.25
+
         text_replaced = self._inject_lora(
             module=self.text_model,
             rank=int(lora_rank),
@@ -526,34 +528,24 @@ class Encoder_test(Encoder_heat):
         if text_replaced <= 0:
             raise ValueError("No text Linear layers were replaced by LoRA.")
 
-        self.text_grounding_adapter = nn.Sequential(
-            nn.LayerNorm(self.feature_dim),
-            nn.Linear(self.feature_dim, self.feature_dim),
+        self.refine_mlp = nn.Sequential(
+            nn.LayerNorm(self.feature_dim * 3 + 10),
+            nn.Linear(self.feature_dim * 3 + 10, self.feature_dim),
             nn.GELU(),
-            nn.Linear(self.feature_dim, self.feature_dim),
-        )
-        self.text_roi_gate = nn.Sequential(
-            nn.Linear(4, 32),
+            nn.Linear(self.feature_dim, self.feature_dim // 2),
             nn.GELU(),
-            nn.Linear(32, 1),
+            nn.Linear(self.feature_dim // 2, 5),
         )
-        self.text_adapter_residual_scale = 0.1
-        self.max_text_roi_scale = 0.5
-        nn.init.zeros_(self.text_grounding_adapter[-1].weight)
-        nn.init.zeros_(self.text_grounding_adapter[-1].bias)
-        nn.init.zeros_(self.text_roi_gate[-1].weight)
-        nn.init.constant_(self.text_roi_gate[-1].bias, -4.0)
+        nn.init.zeros_(self.refine_mlp[-1].weight)
+        nn.init.zeros_(self.refine_mlp[-1].bias)
 
-    def _bounded_text_scale(self, raw_scale: torch.Tensor, max_abs: float) -> torch.Tensor:
-        return float(max_abs) * torch.tanh(raw_scale)
-
-    def _project_text(
+    def _encode_text_features(
         self,
         input_ids: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor:
         if input_ids is None:
-            return None
+            raise ValueError("Encoder_test requires input_ids for text-guided refinement.")
         text_outputs = self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -564,9 +556,9 @@ class Encoder_test(Encoder_heat):
         self,
         text_feats: Optional[torch.Tensor],
         sat_features_2d: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor:
         if text_feats is None:
-            return None
+            raise ValueError("Encoder_test text heatmap requires text_feats.")
 
         batch_size, channels, height, width = sat_features_2d.shape
         if text_feats.shape != (batch_size, channels):
@@ -582,42 +574,131 @@ class Encoder_test(Encoder_heat):
         conv_kernel = text_kernel.reshape(batch_size, channels, 1, 1)
         return F.conv2d(conv_input, conv_kernel, groups=batch_size).view(batch_size, 1, height, width)
 
-    def _build_text_roi_gate(
+    def _height_size_prior(
         self,
-        text_roi: torch.Tensor,
-        visual_heatmap: torch.Tensor,
-        geo: Optional[torch.Tensor],
+        geo: torch.Tensor,
+        image_wh: Tuple[int, int],
     ) -> torch.Tensor:
-        if text_roi.shape != visual_heatmap.shape:
+        if geo.ndim != 2 or geo.shape[1] != 3:
+            raise ValueError(f"Expected geo shape (B, 3), got {tuple(geo.shape)}.")
+
+        image_w, image_h = image_wh
+        heights = geo[:, 2].to(dtype=torch.float32).clamp_min(0.0) * 300.0
+        table_h = torch.tensor([150.0, 200.0, 250.0, 300.0], device=geo.device)
+        table_s = torch.tensor([165.0, 207.0, 263.5, 339.0], device=geo.device)
+        bucket = torch.bucketize(heights, table_h).clamp(1, table_h.numel() - 1)
+        h0 = table_h[bucket - 1]
+        h1 = table_h[bucket]
+        s0 = table_s[bucket - 1]
+        s1 = table_s[bucket]
+        ratio = ((heights - h0) / (h1 - h0).clamp_min(1e-6)).clamp(0.0, 1.0)
+        size_orig = s0 + ratio * (s1 - s0)
+        scale = min(float(image_w) / 3840.0, float(image_h) / 2160.0)
+        size = size_orig * scale
+        return size.to(device=geo.device, dtype=geo.dtype).unsqueeze(1).repeat(1, 2)
+
+    def _sample_candidate_features(
+        self,
+        feature_map: torch.Tensor,
+        xs: torch.Tensor,
+        ys: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, _, height, width = feature_map.shape
+        grid_x = ((xs.to(dtype=feature_map.dtype) + 0.5) / float(width)) * 2.0 - 1.0
+        grid_y = ((ys.to(dtype=feature_map.dtype) + 0.5) / float(height)) * 2.0 - 1.0
+        grid = torch.stack([grid_x, grid_y], dim=-1).view(batch_size, -1, 1, 2)
+        sampled = F.grid_sample(
+            feature_map,
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        )
+        return sampled.squeeze(-1).transpose(1, 2).contiguous()
+
+    def _refine_bbox_from_heatmap(
+        self,
+        text_heatmap: torch.Tensor,
+        visual_heatmap: torch.Tensor,
+        text_feats: torch.Tensor,
+        anchor_pooler: torch.Tensor,
+        sat_features_2d: torch.Tensor,
+        geo: torch.Tensor,
+        image_wh: Tuple[int, int],
+    ) -> dict:
+        if text_heatmap.shape != visual_heatmap.shape:
             raise ValueError(
-                f"Expected text_roi and visual_heatmap to share shape, got "
-                f"{tuple(text_roi.shape)} and {tuple(visual_heatmap.shape)}."
+                f"Expected text and visual heatmaps to share shape, got "
+                f"{tuple(text_heatmap.shape)} and {tuple(visual_heatmap.shape)}."
             )
-        if text_roi.ndim != 4 or text_roi.shape[1] != 1:
-            raise ValueError(f"Expected ROI shape (B, 1, H, W), got {tuple(text_roi.shape)}.")
+        if text_heatmap.ndim != 4 or text_heatmap.shape[1] != 1:
+            raise ValueError(f"Expected heatmap shape (B, 1, H, W), got {tuple(text_heatmap.shape)}.")
 
-        batch_size = text_roi.shape[0]
-        text_prob = text_roi.detach().flatten(1).float()
-        visual_prob = visual_heatmap.detach().flatten(1).float()
-        text_prob = text_prob / text_prob.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        visual_prob = visual_prob / visual_prob.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        batch_size, _, grid_h, grid_w = visual_heatmap.shape
+        image_w, image_h = image_wh
+        topk = min(int(self.refine_topk), grid_h * grid_w)
 
-        token_count = float(text_prob.shape[1])
-        text_entropy = -(text_prob * text_prob.clamp_min(1e-8).log()).sum(dim=1, keepdim=True)
-        text_entropy = text_entropy / max(math.log(max(token_count, 2.0)), 1e-6)
-        visual_peak = visual_prob.amax(dim=1, keepdim=True)
-        overlap = (text_prob * visual_prob).sum(dim=1, keepdim=True) * token_count
+        visual_prob = visual_heatmap.flatten(1)
+        text_prob = text_heatmap.flatten(1)
+        combined_prob = visual_prob + float(self.text_candidate_weight) * text_prob
+        topk_scores, topk_indices = combined_prob.topk(topk, dim=1)
+        ys = torch.div(topk_indices, grid_w, rounding_mode="floor")
+        xs = topk_indices % grid_w
 
-        if geo is None:
-            height = text_prob.new_zeros(batch_size, 1)
-        else:
-            if geo.ndim != 2 or geo.shape != (batch_size, 3):
-                raise ValueError(f"Expected geo shape {(batch_size, 3)}, got {tuple(geo.shape)}.")
-            height = geo[:, 2:3].detach().to(device=text_prob.device, dtype=text_prob.dtype)
+        local_feats = self._sample_candidate_features(sat_features_2d, xs, ys)
+        anchor_ctx = anchor_pooler.unsqueeze(1).expand(-1, topk, -1).to(dtype=local_feats.dtype)
+        text_ctx = text_feats.unsqueeze(1).expand(-1, topk, -1).to(dtype=local_feats.dtype)
 
-        gate_input = torch.cat([text_entropy, visual_peak, overlap, height], dim=1)
-        gate = torch.sigmoid(self.text_roi_gate(gate_input.to(device=text_roi.device, dtype=text_roi.dtype)))
-        return gate.view(batch_size, 1, 1, 1) * float(self.max_text_roi_scale)
+        base_wh = self._height_size_prior(geo, image_wh).to(device=local_feats.device, dtype=local_feats.dtype)
+        base_wh = base_wh.unsqueeze(1).expand(-1, topk, -1)
+        center_x = (xs.to(dtype=local_feats.dtype) + 0.5) / float(grid_w) * float(image_w)
+        center_y = (ys.to(dtype=local_feats.dtype) + 0.5) / float(grid_h) * float(image_h)
+        centers = torch.stack([center_x, center_y], dim=-1)
+
+        xy_norm = torch.stack([center_x / float(image_w), center_y / float(image_h)], dim=-1)
+        wh_norm = torch.stack([base_wh[..., 0] / float(image_w), base_wh[..., 1] / float(image_h)], dim=-1)
+        gathered_visual = visual_prob.gather(1, topk_indices).unsqueeze(-1).to(dtype=local_feats.dtype)
+        gathered_text = text_prob.gather(1, topk_indices).unsqueeze(-1).to(dtype=local_feats.dtype)
+        geo_ctx = geo.to(device=local_feats.device, dtype=local_feats.dtype).unsqueeze(1).expand(-1, topk, -1)
+
+        refine_input = torch.cat(
+            [
+                local_feats,
+                anchor_ctx,
+                text_ctx,
+                geo_ctx,
+                xy_norm,
+                wh_norm,
+                gathered_visual,
+                gathered_text,
+                topk_scores.unsqueeze(-1).to(dtype=local_feats.dtype),
+            ],
+            dim=-1,
+        )
+        raw = self.refine_mlp(refine_input)
+        offset = torch.tanh(raw[..., :2]) * base_wh * 0.35
+        refined_wh = base_wh * torch.exp(torch.tanh(raw[..., 2:4]) * 0.6)
+        refined_centers = centers + offset
+
+        x1y1 = refined_centers - refined_wh / 2.0
+        x2y2 = refined_centers + refined_wh / 2.0
+        x1 = x1y1[..., 0].clamp(min=0.0, max=max(float(image_w) - 1.0, 0.0))
+        y1 = x1y1[..., 1].clamp(min=0.0, max=max(float(image_h) - 1.0, 0.0))
+        x2 = x2y2[..., 0].clamp(min=1.0, max=float(image_w))
+        y2 = x2y2[..., 1].clamp(min=1.0, max=float(image_h))
+        x2 = torch.maximum(x2, x1 + 1.0).clamp(max=float(image_w))
+        y2 = torch.maximum(y2, y1 + 1.0).clamp(max=float(image_h))
+        candidates = torch.stack([x1, y1, x2, y2], dim=-1)
+
+        candidate_logits = raw[..., 4] + topk_scores.clamp_min(1e-8).log().to(dtype=raw.dtype)
+        best_idx = candidate_logits.argmax(dim=1)
+        batch_idx = torch.arange(batch_size, device=candidates.device)
+        return {
+            "bbox": candidates[batch_idx, best_idx],
+            "candidates": candidates,
+            "logits": candidate_logits,
+            "topk_indices": topk_indices,
+        }
 
     def forward(
         self,
@@ -629,6 +710,8 @@ class Encoder_test(Encoder_heat):
     ):
         batch_size = anchor_pixel_values.shape[0]
         self._validate_geo(angle, batch_size)
+        if angle is None:
+            raise ValueError("Encoder_test requires angle/height geo features for height-aware refinement.")
 
         anchor_output = self._vision_forward(anchor_pixel_values)
         anchor_feats = anchor_output.last_hidden_state
@@ -637,18 +720,7 @@ class Encoder_test(Encoder_heat):
 
         anchor_pooler = self.attnPooling(anchor_feats, 1)[:, 0, :]
         anchor_pooler = F.normalize(anchor_pooler, p=2, dim=1)
-        text_feats = self._project_text(input_ids, attention_mask)
-        text_grounding = (
-            F.normalize(
-                text_feats
-                + self.text_adapter_residual_scale * self.text_grounding_adapter(text_feats),
-                p=2,
-                dim=1,
-            )
-            if text_feats is not None
-            else None
-        )
-        fused_feats = None
+        text_feats = self._encode_text_features(input_ids, attention_mask)
 
         sat_output = self._vision_forward(
             search_pixel_values,
@@ -668,19 +740,11 @@ class Encoder_test(Encoder_heat):
 
         anchor_context = self._anchor_context(anchor_feats, angle)
         heatmap_logits = self._dynamic_heatmap(anchor_feats, sat_features_2d, angle)
-        text_heatmap_logits = self._text_dynamic_heatmap(text_grounding, sat_features_2d)
+        text_heatmap_logits = self._text_dynamic_heatmap(text_feats, sat_features_2d)
         heatmap = self._spatial_softmax(heatmap_logits)
+        text_heatmap = self._spatial_softmax(text_heatmap_logits)
 
         heat_gate = heatmap * heatmap.shape[-2] * heatmap.shape[-1] / 2
-        if text_heatmap_logits is not None:
-            text_roi = self._spatial_softmax(text_heatmap_logits)
-            text_roi = text_roi / text_roi.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
-            text_roi_gate = self._build_text_roi_gate(
-                text_roi=text_roi,
-                visual_heatmap=heatmap,
-                geo=angle,
-            )
-            heat_gate = heat_gate * (1.0 + text_roi_gate.to(dtype=heat_gate.dtype) * text_roi.to(dtype=heat_gate.dtype))
         guided_sat_features = self.heat_fuse(
             torch.cat([sat_features_2d, heat_gate], dim=1)
         )
@@ -691,6 +755,15 @@ class Encoder_test(Encoder_heat):
             context=anchor_context,
         )
         pred_anchor = self.bbox_fcn_out(fused_features)
+        refine_outputs = self._refine_bbox_from_heatmap(
+            text_heatmap=text_heatmap,
+            visual_heatmap=heatmap,
+            text_feats=text_feats,
+            anchor_pooler=anchor_pooler,
+            sat_features_2d=guided_sat_features,
+            geo=angle,
+            image_wh=(int(search_pixel_values.shape[-1]), int(search_pixel_values.shape[-2])),
+        )
 
         heatmap_out = heatmap
         if heatmap_out.shape[-2:] != pred_anchor.shape[-2:]:
@@ -708,6 +781,6 @@ class Encoder_test(Encoder_heat):
             text_feats,
             anchor_pooler,
             sat_feature_2d_pool,
-            fused_feats,
+            refine_outputs,
             heatmap_out,
         )

@@ -452,7 +452,7 @@ def extract_encoder_heat_features(
                 text_feats,
                 anchor_pooler,
                 grid_feats,
-                _,
+                refine_outputs,
                 heatmap_logits,
             ) = outputs
 
@@ -499,6 +499,9 @@ def extract_encoder_heat_features(
                 image_wh,
                 iou_threshold_list=[0.5, 0.25],
             )
+            if isinstance(refine_outputs, dict) and "bbox" in refine_outputs:
+                pred_bbox_xyxy = refine_outputs["bbox"].to(device=gt_bbox.device, dtype=gt_bbox.dtype)
+                target_bbox_xyxy = gt_bbox
 
             ious = bbox_iou(pred_bbox_xyxy, target_bbox_xyxy, x1y1x2y2=True)
             for idx in range(pred_bbox_xyxy.shape[0]):

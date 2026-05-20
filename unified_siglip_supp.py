@@ -27,6 +27,7 @@ import yaml
 
 from model import Encoder_heat, Encoder_test
 from bbox.yolo_utils import (
+    bbox_iou,
     get_tensor_anchors,
     build_target,
     yolo_loss,
@@ -100,6 +101,9 @@ class Config:
     HEATMAP_POS_WEIGHT = 8.0
     HEATMAP_CONFIDENCE_WEIGHT = 0.5
     HEATMAP_VIS_MAX_SAMPLES = 10
+    USE_REFINE_LOSS = True
+    REFINE_LOSS_WEIGHT = 0.25
+    REFINE_SCORE_LOSS_WEIGHT = 0.2
 
 
 def config_to_dict() -> Dict[str, Any]:
@@ -453,6 +457,45 @@ def heatmap_loss_fn(
     return loss
 
 
+def refine_bbox_loss_fn(
+    refine_outputs: Any,
+    target_bbox: torch.Tensor,
+    image_wh: Tuple[int, int],
+) -> torch.Tensor:
+    if not isinstance(refine_outputs, dict):
+        return target_bbox.new_zeros(())
+    if "candidates" not in refine_outputs or "logits" not in refine_outputs:
+        raise ValueError("refine_outputs must contain 'candidates' and 'logits'.")
+
+    candidates = refine_outputs["candidates"]
+    logits = refine_outputs["logits"]
+    if candidates.ndim != 3 or candidates.shape[-1] != 4:
+        raise ValueError(f"Expected refine candidates shape (B, K, 4), got {tuple(candidates.shape)}.")
+    if logits.ndim != 2 or logits.shape != candidates.shape[:2]:
+        raise ValueError(f"Expected refine logits shape {tuple(candidates.shape[:2])}, got {tuple(logits.shape)}.")
+    if target_bbox.ndim != 2 or target_bbox.shape != (candidates.shape[0], 4):
+        raise ValueError(f"Expected target bbox shape {(candidates.shape[0], 4)}, got {tuple(target_bbox.shape)}.")
+
+    batch_size, topk, _ = candidates.shape
+    image_w, image_h = image_wh
+    norm = candidates.new_tensor([float(image_w), float(image_h), float(image_w), float(image_h)])
+    candidates_norm = candidates / norm
+    target_norm = target_bbox.to(device=candidates.device, dtype=candidates.dtype) / norm
+    target_expand = target_norm.unsqueeze(1).expand(-1, topk, -1)
+
+    l1 = F.smooth_l1_loss(candidates_norm, target_expand, reduction="none").mean(dim=-1)
+    flat_candidates = candidates.reshape(batch_size * topk, 4)
+    flat_target = target_bbox.to(device=candidates.device, dtype=candidates.dtype).unsqueeze(1).expand(-1, topk, -1)
+    iou = bbox_iou(flat_candidates, flat_target.reshape(batch_size * topk, 4), x1y1x2y2=True)
+    candidate_loss = l1 + (1.0 - iou.view(batch_size, topk))
+
+    best_idx = candidate_loss.detach().argmin(dim=1)
+    batch_idx = torch.arange(batch_size, device=candidates.device)
+    selected_loss = candidate_loss[batch_idx, best_idx].mean()
+    score_loss = F.cross_entropy(logits.float(), best_idx)
+    return selected_loss + float(Config.REFINE_SCORE_LOSS_WEIGHT) * score_loss
+
+
 def add_heatmap_to_confidence(
     pred_anchor: torch.Tensor,
     heatmap_logits: Optional[torch.Tensor],
@@ -738,6 +781,17 @@ def validate(
             img_size,
             iou_threshold_list=[0.5, 0.25],
         )
+        if isinstance(fused_feats, dict) and "bbox" in fused_feats:
+            refined_iou = bbox_iou(
+                fused_feats["bbox"].to(device=ori_gt_bbox.device, dtype=ori_gt_bbox.dtype),
+                ori_gt_bbox,
+                x1y1x2y2=True,
+            )
+            accu_list = [
+                (refined_iou > 0.5).float().mean(),
+                (refined_iou > 0.25).float().mean(),
+            ]
+            iou = refined_iou.mean()
 
         candidate_feats = grid_feats.reshape(-1, Config.PROJECTION_DIM)
         positive_indices = torch.zeros(B, B * 9, device=accelerator.device)
@@ -754,7 +808,7 @@ def validate(
         positive_indices[row_indices_flat, global_positive_indices] = 0.95
 
         if useap:
-            if fused_feats is not None:
+            if isinstance(fused_feats, torch.Tensor):
                 image_retrieval_loss = 0.7 * info_nce_loss(
                     fused_feats, candidate_feats, positive_indices
                 )
@@ -766,7 +820,7 @@ def validate(
                     anchor_feats, candidate_feats, positive_indices
                 )
         else:
-            scorer_input = fused_feats if fused_feats is not None else anchor_feats
+            scorer_input = fused_feats if isinstance(fused_feats, torch.Tensor) else anchor_feats
             scores = model.scorer(scorer_input, candidate_feats)
             image_retrieval_loss = F.cross_entropy(scores, positive_indices)
 
@@ -948,6 +1002,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         total_loss = 0
         total_bbox_loss = 0
         total_heatmap_loss = 0
+        total_refine_loss = 0
         last_heatmap_logits = None
         last_target_bbox = None
         last_heatmap_target = None
@@ -1035,6 +1090,20 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                         heatmap_loss = bbox_loss.new_zeros(())
                         heatmap_target = None
 
+                    if (
+                        Config.USE_REFINE_LOSS
+                        and Config.ENCODER_TYPE == "test"
+                        and isinstance(fused_feats, dict)
+                    ):
+                        refine_loss = refine_bbox_loss_fn(
+                            fused_feats,
+                            target_bbox,
+                            (Config.UNIV_SAT_SIZE["width"], Config.UNIV_SAT_SIZE["height"]),
+                        )
+                        bbox_loss = bbox_loss + Config.REFINE_LOSS_WEIGHT * refine_loss
+                    else:
+                        refine_loss = bbox_loss.new_zeros(())
+
                     if heatmap_logits is not None:
                         last_heatmap_logits = heatmap_logits.detach()
                         last_target_bbox = target_bbox.detach()
@@ -1092,11 +1161,13 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
             total_loss += loss.item()
             total_bbox_loss += bbox_loss.item()
             total_heatmap_loss += heatmap_loss.item()
+            total_refine_loss += refine_loss.item()
             global_step = epoch * len(train_dataloader) + i
             progress_bar.set_postfix(
                 {
                     "bbox_loss": f"{bbox_loss.item():.4f}",
                     "heatmap_loss": f"{heatmap_loss.item():.4f}",
+                    "refine_loss": f"{refine_loss.item():.4f}",
                     "retrieval_loss": f"{image_retrieval_loss.item():.4f}",
                     "retrieval_weight": f"{retrieval_weight:.4f}",
                     "bbox_weight": f"{bbox_weight:.4f}",
@@ -1109,6 +1180,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 writer.add_scalar("Loss/bbox_geo_step", loss_geo.item(), global_step)
                 writer.add_scalar("Loss/bbox_cls_step", loss_cls.item(), global_step)
                 writer.add_scalar("Loss/heatmap_step", heatmap_loss.item(), global_step)
+                writer.add_scalar("Loss/refine_step", refine_loss.item(), global_step)
                 writer.add_scalar("Loss/retrieval_step", image_retrieval_loss.item(), global_step)
                 writer.add_scalar("Weight/retrieval", retrieval_weight, global_step)
                 writer.add_scalar("Weight/bbox", bbox_weight, global_step)
@@ -1127,6 +1199,9 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 )
                 clearml_logger.report_scalar(
                     "train", "heatmap_loss", heatmap_loss.item(), global_step
+                )
+                clearml_logger.report_scalar(
+                    "train", "refine_loss", refine_loss.item(), global_step
                 )
                 clearml_logger.report_scalar(
                     "train", "image_retrieval_loss", image_retrieval_loss.item(), global_step
@@ -1150,6 +1225,11 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
             writer.add_scalar(
                 "Loss/heatmap_epoch",
                 total_heatmap_loss / len(train_dataloader),
+                epoch,
+            )
+            writer.add_scalar(
+                "Loss/refine_epoch",
+                total_refine_loss / len(train_dataloader),
                 epoch,
             )
             writer.add_scalar("lr/learning_rate", optimizer.param_groups[0]["lr"], epoch)
