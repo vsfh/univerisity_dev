@@ -398,9 +398,9 @@ def yolo_loss(
     anchor_count = predictions.shape[1]
     grid_h = predictions.shape[3]
     grid_w = predictions.shape[4]
-    best_anchor = best_anchor_gi_gj[:, 0].long().clamp_(0, anchor_count - 1)
-    gi = best_anchor_gi_gj[:, 1].long().clamp_(0, grid_w - 1)
-    gj = best_anchor_gi_gj[:, 2].long().clamp_(0, grid_h - 1)
+    best_anchor = best_anchor_gi_gj[:, 0].long().clamp(0, anchor_count - 1)
+    gi = best_anchor_gi_gj[:, 1].long().clamp(0, grid_w - 1)
+    gj = best_anchor_gi_gj[:, 2].long().clamp(0, grid_h - 1)
     stride_x = image_w / float(grid_w)
     stride_y = image_h / float(grid_h)
     scaled_anchors = anchors_full.clone()

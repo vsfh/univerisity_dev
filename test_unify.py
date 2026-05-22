@@ -39,7 +39,7 @@ MODEL_NAME = "google/siglip2-base-patch16-224"
 CACHE_DIR = "/media/data1/feihong/hf_cache"
 DEFAULT_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 DEFAULT_OUTPUT_DIR = "/media/data1/feihong/univerisity_dev/eval_results/test_unify"
-DEFAULT_INCLUDE_FILE = "/media/data1/feihong/ckpt/include1.json"
+DEFAULT_INCLUDE_FILE = "/media/data1/feihong/ckpt/include2.json"
 DEFAULT_ENCODER_HEAT_CONFIG_DIR = "/media/data1/feihong/univerisity_dev/configs/unified_siglip_supp"
 DEFAULT_ENCODER_HEAT_CHECKPOINT = "/media/data1/feihong/ckpt/model_full/last.pth"
 DEFAULT_UNIFY_CHECKPOINT = "/media/data1/feihong/ckpt/unify_geo/last.pth"
@@ -1012,6 +1012,11 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
     subset_angles = args.subset_angles if args.subset_angles else None
 
     if model_type in {"encoder_heat", "encoder_test"}:
+        if model_type == "encoder_test":
+            if not args.encoder_heat_use_text:
+                raise ValueError("encoder_test requires --encoder-heat-use-text.")
+            if not args.encoder_heat_use_angle:
+                raise ValueError("encoder_test requires --encoder-heat-use-angle.")
         encoder_cls = Encoder_test if model_type == "encoder_test" else Encoder_heat
         bundle = extract_encoder_heat_features(
             checkpoint_path=checkpoint_path,
@@ -1086,8 +1091,13 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
         "checkpoint": checkpoint_path,
         "sat_size": {"height": int(sat_size[0]), "width": int(sat_size[1])},
         "candidate_size": args.candidate_size,
+        "test_crop_ratio": float(args.test_crop_ratio),
+        "seed": int(args.seed),
         "encoder_use_text": bool(args.encoder_heat_use_text) if model_type in {"encoder_heat", "encoder_test"} else None,
         "encoder_use_angle": bool(args.encoder_heat_use_angle) if model_type in {"encoder_heat", "encoder_test"} else None,
+        "encoder_heat_use_ap": bool(args.encoder_heat_use_ap) if model_type in {"encoder_heat", "encoder_test"} else None,
+        "heatmap_confidence_weight": float(args.heatmap_confidence_weight) if model_type in {"encoder_heat", "encoder_test"} else None,
+        "encoder_heat_text_score_weight": float(args.encoder_heat_text_score_weight) if model_type in {"encoder_heat", "encoder_test"} else None,
         "lora": (
             {
                 "rank": int(args.lora_rank),
@@ -1211,6 +1221,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--heatmap-confidence-weight", type=float, default=0.5)
     parser.add_argument("--encoder-heat-text-score-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--output-suffix",
+        type=str,
+        default=None,
+        help="Optional suffix for the saved metrics filename. Defaults to checkpoint directory name.",
+    )
     parser.add_argument("--unify-score-mode", choices=["rerank", "global"], default="rerank")
     parser.add_argument("--base-dim", type=int, default=96)
     parser.add_argument("--proj-dim", type=int, default=PROJECTION_DIM)
@@ -1274,7 +1290,7 @@ def main() -> None:
     for model_type in args.model_types:
         checkpoint_path = checkpoint_for_model(model_type, args)
         metrics = evaluate_model(model_type, checkpoint_path, args)
-        out_file = save_metrics(metrics, args.output_dir)
+        out_file = save_metrics(metrics, args.output_dir, name_suffix=args.output_suffix)
         print_summary(metrics, out_file)
         all_results.append(metrics)
 

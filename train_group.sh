@@ -8,7 +8,7 @@ CONFIGS=(
     # "configs/unified_siglip_supp/single_config/model_heat_no_geo.yaml"
     # Encoder_heat without input_ids.
     # "configs/unified_siglip_supp/single_config/model_heat_no_input_ids.yaml"
-    # Encoder_test with text-guided height-aware refinement.
+    # Encoder_test with text hidden-state anchor supervision.
     "configs/unified_siglip_supp/single_config/model_test_geo_input_ids.yaml"
 )
 

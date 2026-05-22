@@ -13,13 +13,13 @@ from torch.utils.data import Dataset
 
 # --- Configuration ---
 TRAIN_SATELLITE_ROOT = "/media/data1/feihong/image_2048"
-TEST_SATELLITE_ROOT = "/media/data1/feihong/img_test_1"
+TEST_SATELLITE_ROOT = "/media/data1/feihong/img_test_2"
 DRONE_IMAGE_ROOT = "/media/data1/feihong/drone_img"
-BBOX_FILE = "/media/data1/feihong/ckpt/bbox_test_1.json"
+BBOX_FILE = "/media/data1/feihong/ckpt/bbox_test_2.json"
 TRAIN_MAX_SATELLITE_ID = 1065
 TRAIN_SPLIT_FILE = "/media/data1/feihong/ckpt/train.txt"
 VAL_SPLIT_FILE = "/media/data1/feihong/ckpt/val.txt"
-TEST_SPLIT_FILE = "/media/data1/feihong/ckpt/test_1.txt"
+TEST_SPLIT_FILE = "/media/data1/feihong/ckpt/test_2.txt"
 VAL_SPLIT_COUNT = 20
 TEST_SPLIT_COUNT = 400
 MAX_TEXT_LENGTH = 64

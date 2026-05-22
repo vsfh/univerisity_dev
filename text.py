@@ -69,7 +69,7 @@ class Config:
     MAX_TEXT_LENGTH = 128
 
     NUM_EPOCHS = 20
-    BATCH_SIZE = 2
+    BATCH_SIZE = 15
     GRAD_ACCUMULATION_STEPS = 8
     NUM_WORKERS_TRAIN = 4
     NUM_WORKERS_VAL = 2
@@ -87,6 +87,7 @@ class Config:
 
     HEAD_DIM = 768
     RETRIEVAL_DIM = 768
+    USE_RETRIEVAL_PROJECTOR = False
     HEAT_SOFTMAX_TEMPERATURE = 1.0
     HEATMAP_CONFIDENCE_WEIGHT = 0.5
     BBOX_LOSS_WEIGHT = 0.1
@@ -102,6 +103,11 @@ class Config:
     HEATMAP_POS_WEIGHT = 8.0
 
     USE_GEO_INPUT = True
+    USE_LORA = True
+    LORA_RANK = 8
+    LORA_ALPHA = 16.0
+    LORA_DROPOUT = 0.05
+    BACKBONE_GRADIENT_CHECKPOINTING = True
     VALIDATE_EVERY_EPOCH = False
 
 
@@ -339,6 +345,42 @@ def text_vlm_collate_fn(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+class LoRALinear(nn.Module):
+    def __init__(
+        self,
+        base: nn.Linear,
+        rank: int,
+        alpha: float,
+        dropout: float,
+    ):
+        super().__init__()
+        if rank <= 0:
+            raise ValueError(f"LoRA rank must be positive, got {rank}.")
+
+        self.base = base
+        for param in self.base.parameters():
+            param.requires_grad = False
+
+        self.lora_a = nn.Linear(base.in_features, rank, bias=False)
+        self.lora_b = nn.Linear(rank, base.out_features, bias=False)
+        self.dropout = nn.Dropout(float(dropout))
+        self.scaling = float(alpha) / float(rank)
+
+        nn.init.kaiming_uniform_(self.lora_a.weight, a=5**0.5)
+        nn.init.zeros_(self.lora_b.weight)
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.base.weight
+
+    @property
+    def bias(self) -> Optional[torch.Tensor]:
+        return self.base.bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.base(x) + self.lora_b(self.lora_a(self.dropout(x))) * self.scaling
+
+
 class TextQwenVLRetrievalGrounding(nn.Module):
     def __init__(
         self,
@@ -358,20 +400,40 @@ class TextQwenVLRetrievalGrounding(nn.Module):
         self.vlm.config.output_hidden_states = False
         for param in self.vlm.parameters():
             param.requires_grad = False
+        self.lora_layer_count = 0
+        if Config.USE_LORA:
+            self.lora_layer_count = self._inject_lora(
+                self.vlm.model,
+                rank=int(Config.LORA_RANK),
+                alpha=float(Config.LORA_ALPHA),
+                dropout=float(Config.LORA_DROPOUT),
+            )
+            if self.lora_layer_count <= 0:
+                raise ValueError("No Qwen3-VL backbone Linear layers were replaced by LoRA.")
+            self.vlm.config.use_cache = False
+            self.vlm.model.config.use_cache = False
+            if Config.BACKBONE_GRADIENT_CHECKPOINTING:
+                self.vlm.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
 
         self.hidden_dim = int(self.vlm.config.text_config.hidden_size)
         self.head_dim = int(head_dim)
         self.retrieval_dim = int(retrieval_dim)
         self.heat_softmax_temperature = float(heat_softmax_temperature)
 
-        self.text_retrieval_proj = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim),
-            nn.Linear(self.hidden_dim, self.retrieval_dim),
-        )
-        self.image_retrieval_proj = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim),
-            nn.Linear(self.hidden_dim, self.retrieval_dim),
-        )
+        if Config.USE_RETRIEVAL_PROJECTOR:
+            self.text_retrieval_proj = nn.Sequential(
+                nn.LayerNorm(self.hidden_dim),
+                nn.Linear(self.hidden_dim, self.retrieval_dim),
+            )
+            self.image_retrieval_proj = nn.Sequential(
+                nn.LayerNorm(self.hidden_dim),
+                nn.Linear(self.hidden_dim, self.retrieval_dim),
+            )
+        else:
+            self.text_retrieval_proj = None
+            self.image_retrieval_proj = None
         self.text_ground_proj = nn.Sequential(
             nn.LayerNorm(self.hidden_dim),
             nn.Linear(self.hidden_dim, self.head_dim),
@@ -411,6 +473,38 @@ class TextQwenVLRetrievalGrounding(nn.Module):
         nn.init.zeros_(self.bbox_pos_proj.weight)
         nn.init.zeros_(self.bbox_pos_proj.bias)
 
+    def _inject_lora(
+        self,
+        module: nn.Module,
+        rank: int,
+        alpha: float,
+        dropout: float,
+    ) -> int:
+        replaced = 0
+        for child_name, child in list(module.named_children()):
+            if isinstance(child, LoRALinear):
+                continue
+            if isinstance(child, nn.Linear):
+                setattr(
+                    module,
+                    child_name,
+                    LoRALinear(
+                        base=child,
+                        rank=rank,
+                        alpha=alpha,
+                        dropout=dropout,
+                    ),
+                )
+                replaced += 1
+                continue
+            replaced += self._inject_lora(
+                child,
+                rank=rank,
+                alpha=alpha,
+                dropout=dropout,
+            )
+        return replaced
+
     def _pool_text(self, hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         if hidden_state.ndim != 3:
             raise ValueError(f"Expected text hidden_state shape (B, L, C), got {tuple(hidden_state.shape)}.")
@@ -422,6 +516,7 @@ class TextQwenVLRetrievalGrounding(nn.Module):
         outputs = self.vlm.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            use_cache=False,
             return_dict=True,
         )
         hidden_state = outputs.last_hidden_state
@@ -467,7 +562,7 @@ class TextQwenVLRetrievalGrounding(nn.Module):
             self.hidden_dim,
             grid_h_int,
             grid_w_int,
-        )
+        ).contiguous()
         return sat_tokens, sat_features_2d
 
     def _build_position_embedding(self, feature_map: torch.Tensor) -> torch.Tensor:
@@ -502,18 +597,25 @@ class TextQwenVLRetrievalGrounding(nn.Module):
     ):
         batch_size = input_ids.shape[0]
 
-        with torch.no_grad():
-            text_pooled = self._encode_text(input_ids=input_ids, attention_mask=attention_mask)
-            _, sat_features_2d = self._encode_satellite(
-                pixel_values=search_pixel_values,
-                image_grid_thw=image_grid_thw,
-                batch_size=batch_size,
-            )
+        text_pooled = self._encode_text(input_ids=input_ids, attention_mask=attention_mask)
+        _, sat_features_2d = self._encode_satellite(
+            pixel_values=search_pixel_values,
+            image_grid_thw=image_grid_thw,
+            batch_size=batch_size,
+        )
 
-        text_feats = F.normalize(self.text_retrieval_proj(text_pooled.float()), p=2, dim=1)
-        sat_retrieval_2d = self.image_retrieval_proj(
-            sat_features_2d.permute(0, 2, 3, 1).float()
-        ).permute(0, 3, 1, 2)
+        if Config.USE_RETRIEVAL_PROJECTOR:
+            if self.text_retrieval_proj is None or self.image_retrieval_proj is None:
+                raise ValueError("Retrieval projector is enabled but projector modules are missing.")
+            text_feats = self.text_retrieval_proj(text_pooled.float())
+            sat_retrieval_2d = self.image_retrieval_proj(
+                sat_features_2d.permute(0, 2, 3, 1).contiguous().float()
+            ).permute(0, 3, 1, 2).contiguous()
+        else:
+            text_feats = text_pooled.float()
+            sat_retrieval_2d = sat_features_2d.float().contiguous()
+
+        text_feats = F.normalize(text_feats, p=2, dim=1)
         sat_feature_2d_pool = F.adaptive_avg_pool2d(sat_retrieval_2d, (3, 3)).flatten(2).transpose(1, 2)
         sat_feature_2d_pool = F.normalize(sat_feature_2d_pool, p=2, dim=2)
 
@@ -521,7 +623,7 @@ class TextQwenVLRetrievalGrounding(nn.Module):
         if geo is not None:
             text_ground = self.angle_film(text_ground, geo)
 
-        sat_ground_2d = self.sat_ground_proj(sat_features_2d.float())
+        sat_ground_2d = self.sat_ground_proj(sat_features_2d.float().contiguous())
         heatmap_logits = self._text_heatmap(text_ground, sat_ground_2d)
         heatmap = self._spatial_softmax(heatmap_logits)
 
@@ -867,6 +969,12 @@ def train(save_dir: str) -> None:
         head_dim=Config.HEAD_DIM,
         retrieval_dim=Config.RETRIEVAL_DIM,
         heat_softmax_temperature=Config.HEAT_SOFTMAX_TEMPERATURE,
+    )
+    accelerator.print(
+        f"Backbone LoRA: enabled={Config.USE_LORA}, "
+        f"layers={model.lora_layer_count}, "
+        f"rank={Config.LORA_RANK}, alpha={Config.LORA_ALPHA}, "
+        f"retrieval_projector={Config.USE_RETRIEVAL_PROJECTOR}"
     )
     anchors_full = get_tensor_anchors(accelerator.device)
 

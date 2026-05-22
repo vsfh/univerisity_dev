@@ -101,9 +101,12 @@ class Config:
     HEATMAP_POS_WEIGHT = 8.0
     HEATMAP_CONFIDENCE_WEIGHT = 0.5
     HEATMAP_VIS_MAX_SAMPLES = 10
-    USE_REFINE_LOSS = True
+    USE_REFINE_LOSS = False
     REFINE_LOSS_WEIGHT = 0.25
     REFINE_SCORE_LOSS_WEIGHT = 0.2
+    USE_TEXT_ANCHOR_LOSS = False
+    TEXT_ANCHOR_LOSS_WEIGHT = 0.5
+    TEXT_POOLER_ALIGN_LOSS_WEIGHT = 0.05
 
 
 def config_to_dict() -> Dict[str, Any]:
@@ -268,7 +271,7 @@ def unpack_model_outputs(outputs: Tuple) -> Tuple[
     Optional[torch.Tensor],
     torch.Tensor,
     torch.Tensor,
-    Optional[torch.Tensor],
+    Any,
     Optional[torch.Tensor],
 ]:
     if len(outputs) != 7:
@@ -1002,7 +1005,8 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         total_loss = 0
         total_bbox_loss = 0
         total_heatmap_loss = 0
-        total_refine_loss = 0
+        total_text_anchor_loss = 0
+        total_text_pooler_align_loss = 0
         last_heatmap_logits = None
         last_target_bbox = None
         last_heatmap_target = None
@@ -1090,19 +1094,47 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                         heatmap_loss = bbox_loss.new_zeros(())
                         heatmap_target = None
 
-                    if (
-                        Config.USE_REFINE_LOSS
-                        and Config.ENCODER_TYPE == "test"
-                        and isinstance(fused_feats, dict)
-                    ):
-                        refine_loss = refine_bbox_loss_fn(
-                            fused_feats,
-                            target_bbox,
-                            (Config.UNIV_SAT_SIZE["width"], Config.UNIV_SAT_SIZE["height"]),
-                        )
-                        bbox_loss = bbox_loss + Config.REFINE_LOSS_WEIGHT * refine_loss
-                    else:
-                        refine_loss = bbox_loss.new_zeros(())
+                    text_anchor_loss = bbox_loss.new_zeros(())
+                    text_pooler_align_loss = bbox_loss.new_zeros(())
+                    if Config.ENCODER_TYPE == "test" and isinstance(fused_feats, dict):
+                        if Config.USE_TEXT_ANCHOR_LOSS:
+                            text_pred_anchor = fused_feats["text_pred_anchor"]
+                            text_heatmap = fused_feats["text_heatmap"]
+                            text_pred_anchor = text_pred_anchor.view(
+                                B,
+                                9,
+                                5,
+                                text_pred_anchor.shape[2],
+                                text_pred_anchor.shape[3],
+                            )
+                            text_pred_anchor = add_heatmap_to_confidence(
+                                text_pred_anchor,
+                                text_heatmap,
+                            )
+                            text_loss_geo, text_loss_cls = yolo_loss(
+                                text_pred_anchor,
+                                new_gt_bbox,
+                                anchors_full,
+                                best_anchor_gi_gj,
+                                (
+                                    Config.UNIV_SAT_SIZE["width"],
+                                    Config.UNIV_SAT_SIZE["height"],
+                                ),
+                            )
+                            text_anchor_loss = text_loss_geo + text_loss_cls
+                            if Config.USE_HEATMAP_LOSS and text_heatmap is not None:
+                                text_anchor_heatmap_loss = heatmap_loss_fn(
+                                    text_heatmap,
+                                    target_bbox,
+                                )
+                                text_anchor_loss = (
+                                    text_anchor_loss
+                                    + Config.HEATMAP_LOSS_WEIGHT * text_anchor_heatmap_loss
+                                )
+                            bbox_loss = (
+                                bbox_loss
+                                + Config.TEXT_ANCHOR_LOSS_WEIGHT * text_anchor_loss
+                            )
 
                     if heatmap_logits is not None:
                         last_heatmap_logits = heatmap_logits.detach()
@@ -1133,6 +1165,22 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     image_retrieval_loss = info_nce_loss(
                         anchor_feats, candidate_feats, positive_indices
                     )
+                    if (
+                        Config.ENCODER_TYPE == "test"
+                        and text_feats is not None
+                        and Config.TEXT_POOLER_ALIGN_LOSS_WEIGHT > 0
+                    ):
+                        pair_labels = torch.arange(B, device=accelerator.device)
+                        text_pooler_align_loss = info_nce_loss(
+                            text_feats,
+                            anchor_feats.detach(),
+                            pair_labels,
+                        )
+                        image_retrieval_loss = (
+                            image_retrieval_loss
+                            + Config.TEXT_POOLER_ALIGN_LOSS_WEIGHT
+                            * text_pooler_align_loss
+                        )
 
                     # scheduled_bbox_weight, scheduled_retrieval_weight = get_loss_weights(
                     #     epoch, Config.COSINE_EPOCHS, end_num
@@ -1161,13 +1209,15 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
             total_loss += loss.item()
             total_bbox_loss += bbox_loss.item()
             total_heatmap_loss += heatmap_loss.item()
-            total_refine_loss += refine_loss.item()
+            total_text_anchor_loss += text_anchor_loss.item()
+            total_text_pooler_align_loss += text_pooler_align_loss.item()
             global_step = epoch * len(train_dataloader) + i
             progress_bar.set_postfix(
                 {
                     "bbox_loss": f"{bbox_loss.item():.4f}",
                     "heatmap_loss": f"{heatmap_loss.item():.4f}",
-                    "refine_loss": f"{refine_loss.item():.4f}",
+                    "text_anchor": f"{text_anchor_loss.item():.4f}",
+                    "text_pooler": f"{text_pooler_align_loss.item():.4f}",
                     "retrieval_loss": f"{image_retrieval_loss.item():.4f}",
                     "retrieval_weight": f"{retrieval_weight:.4f}",
                     "bbox_weight": f"{bbox_weight:.4f}",
@@ -1180,7 +1230,8 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 writer.add_scalar("Loss/bbox_geo_step", loss_geo.item(), global_step)
                 writer.add_scalar("Loss/bbox_cls_step", loss_cls.item(), global_step)
                 writer.add_scalar("Loss/heatmap_step", heatmap_loss.item(), global_step)
-                writer.add_scalar("Loss/refine_step", refine_loss.item(), global_step)
+                writer.add_scalar("Loss/text_anchor_step", text_anchor_loss.item(), global_step)
+                writer.add_scalar("Loss/text_pooler_align_step", text_pooler_align_loss.item(), global_step)
                 writer.add_scalar("Loss/retrieval_step", image_retrieval_loss.item(), global_step)
                 writer.add_scalar("Weight/retrieval", retrieval_weight, global_step)
                 writer.add_scalar("Weight/bbox", bbox_weight, global_step)
@@ -1201,7 +1252,10 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     "train", "heatmap_loss", heatmap_loss.item(), global_step
                 )
                 clearml_logger.report_scalar(
-                    "train", "refine_loss", refine_loss.item(), global_step
+                    "train", "text_anchor_loss", text_anchor_loss.item(), global_step
+                )
+                clearml_logger.report_scalar(
+                    "train", "text_pooler_align_loss", text_pooler_align_loss.item(), global_step
                 )
                 clearml_logger.report_scalar(
                     "train", "image_retrieval_loss", image_retrieval_loss.item(), global_step
@@ -1228,8 +1282,13 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 epoch,
             )
             writer.add_scalar(
-                "Loss/refine_epoch",
-                total_refine_loss / len(train_dataloader),
+                "Loss/text_anchor_epoch",
+                total_text_anchor_loss / len(train_dataloader),
+                epoch,
+            )
+            writer.add_scalar(
+                "Loss/text_pooler_align_epoch",
+                total_text_pooler_align_loss / len(train_dataloader),
                 epoch,
             )
             writer.add_scalar("lr/learning_rate", optimizer.param_groups[0]["lr"], epoch)

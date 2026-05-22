@@ -330,6 +330,7 @@ class Encoder_heat(nn.Module):
         anchor_feats: torch.Tensor,
         sat_features_2d: torch.Tensor,
         geo: Optional[torch.Tensor],
+        detach_anchor: bool = True,
     ) -> torch.Tensor:
         if anchor_feats.ndim != 3:
             raise ValueError(f"Expected anchor_feats shape (B, N, C), got {tuple(anchor_feats.shape)}.")
@@ -344,12 +345,8 @@ class Encoder_heat(nn.Module):
             )
 
         anchor_h, anchor_w = self._infer_anchor_grid(anchor_feats.shape[1])
-        anchor_grid = (
-            anchor_feats.detach()
-            .transpose(1, 2)
-            .reshape(batch_size, channels, anchor_h, anchor_w)
-            .contiguous()
-        )
+        anchor_source = anchor_feats.detach() if detach_anchor else anchor_feats
+        anchor_grid = anchor_source.transpose(1, 2).reshape(batch_size, channels, anchor_h, anchor_w).contiguous()
         rotated_anchor = self._rotate_anchor_grid(anchor_grid, geo)
         kernel = F.adaptive_avg_pool2d(
             rotated_anchor,
@@ -402,12 +399,55 @@ class Encoder_heat(nn.Module):
         self,
         anchor_feats: torch.Tensor,
         geo: Optional[torch.Tensor],
+        detach_anchor: bool = True,
     ) -> torch.Tensor:
         if geo is not None:
-            anchor_feats = self.angle_film(anchor_feats.detach() if self.usesg else anchor_feats, geo)
-        else:
+            anchor_feats = self.angle_film(
+                anchor_feats.detach() if detach_anchor and self.usesg else anchor_feats,
+                geo,
+            )
+        elif detach_anchor:
             anchor_feats = anchor_feats.detach()
         return self.bbox_adapter(anchor_feats) + anchor_feats
+
+    def _bbox_forward_from_anchor_feats(
+        self,
+        anchor_feats: torch.Tensor,
+        sat_features_2d: torch.Tensor,
+        angle: Optional[torch.Tensor],
+        detach_anchor: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        anchor_context = self._anchor_context(anchor_feats, angle, detach_anchor=detach_anchor)
+        heatmap_logits = self._dynamic_heatmap(
+            anchor_feats,
+            sat_features_2d,
+            angle,
+            detach_anchor=detach_anchor,
+        )
+        heatmap = self._spatial_softmax(heatmap_logits)
+
+        heat_gate = heatmap * heatmap.shape[-2] * heatmap.shape[-1] / 2
+        guided_sat_features = self.heat_fuse(
+            torch.cat([sat_features_2d, heat_gate], dim=1)
+        )
+        guided_sat_features = guided_sat_features + self._build_position_embedding(guided_sat_features)
+
+        fused_features = self.bbox_transformer(
+            x=guided_sat_features,
+            context=anchor_context,
+        )
+        pred_anchor = self.bbox_fcn_out(fused_features)
+
+        heatmap_out = heatmap
+        if heatmap_out.shape[-2:] != pred_anchor.shape[-2:]:
+            heatmap_logits = F.interpolate(
+                heatmap_logits,
+                size=pred_anchor.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            heatmap_out = self._spatial_softmax(heatmap_logits)
+        return pred_anchor, heatmap_out
 
     def forward(
         self,
@@ -448,31 +488,12 @@ class Encoder_heat(nn.Module):
         )
         sat_features_2d = sat_feats.permute(0, 2, 1).reshape(batch_size, self.feature_dim, grid_h, grid_w)
 
-        anchor_context = self._anchor_context(anchor_feats, angle)
-        heatmap_logits = self._dynamic_heatmap(anchor_feats, sat_features_2d, angle)
-        heatmap = self._spatial_softmax(heatmap_logits)
-
-        heat_gate = heatmap * heatmap.shape[-2] * heatmap.shape[-1] / 2
-        guided_sat_features = self.heat_fuse(
-            torch.cat([sat_features_2d, heat_gate], dim=1)
+        pred_anchor, heatmap_out = self._bbox_forward_from_anchor_feats(
+            anchor_feats,
+            sat_features_2d,
+            angle,
+            detach_anchor=True,
         )
-        guided_sat_features = guided_sat_features + self._build_position_embedding(guided_sat_features)
-
-        fused_features = self.bbox_transformer(
-            x=guided_sat_features,
-            context=anchor_context,
-        )
-        pred_anchor = self.bbox_fcn_out(fused_features)
-
-        heatmap_out = heatmap
-        if heatmap_out.shape[-2:] != pred_anchor.shape[-2:]:
-            heatmap_logits = F.interpolate(
-                heatmap_logits,
-                size=pred_anchor.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-            heatmap_out = self._spatial_softmax(heatmap_logits)
 
         return (
             pred_anchor,
@@ -516,8 +537,6 @@ class Encoder_test(Encoder_heat):
                 f"Encoder_test requires text dim {self.text_feature_dim} "
                 f"to match vision dim {self.feature_dim}."
             )
-        self.refine_topk = 9
-        self.text_candidate_weight = 0.25
 
         text_replaced = self._inject_lora(
             module=self.text_model,
@@ -528,177 +547,39 @@ class Encoder_test(Encoder_heat):
         if text_replaced <= 0:
             raise ValueError("No text Linear layers were replaced by LoRA.")
 
-        self.refine_mlp = nn.Sequential(
-            nn.LayerNorm(self.feature_dim * 3 + 10),
-            nn.Linear(self.feature_dim * 3 + 10, self.feature_dim),
-            nn.GELU(),
-            nn.Linear(self.feature_dim, self.feature_dim // 2),
-            nn.GELU(),
-            nn.Linear(self.feature_dim // 2, 5),
-        )
-        nn.init.zeros_(self.refine_mlp[-1].weight)
-        nn.init.zeros_(self.refine_mlp[-1].bias)
-
-    def _encode_text_features(
+    def _encode_text_anchor(
         self,
         input_ids: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if input_ids is None:
-            raise ValueError("Encoder_test requires input_ids for text-guided refinement.")
+            raise ValueError("Encoder_test requires input_ids.")
+        if input_ids.ndim != 2:
+            raise ValueError(f"Expected input_ids shape (B, L), got {tuple(input_ids.shape)}.")
         text_outputs = self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
-        return F.normalize(text_outputs.pooler_output, p=2, dim=1)
-
-    def _text_dynamic_heatmap(
-        self,
-        text_feats: Optional[torch.Tensor],
-        sat_features_2d: torch.Tensor,
-    ) -> torch.Tensor:
-        if text_feats is None:
-            raise ValueError("Encoder_test text heatmap requires text_feats.")
-
-        batch_size, channels, height, width = sat_features_2d.shape
-        if text_feats.shape != (batch_size, channels):
-            raise ValueError(f"Expected text_feats shape {(batch_size, channels)}, got {tuple(text_feats.shape)}.")
-
-        text_kernel = F.normalize(
-            text_feats.to(device=sat_features_2d.device, dtype=sat_features_2d.dtype),
-            p=2,
-            dim=1,
-        )
-        sat_features = F.normalize(sat_features_2d.contiguous(), p=2, dim=1)
-        conv_input = sat_features.reshape(1, batch_size * channels, height, width)
-        conv_kernel = text_kernel.reshape(batch_size, channels, 1, 1)
-        return F.conv2d(conv_input, conv_kernel, groups=batch_size).view(batch_size, 1, height, width)
-
-    def _height_size_prior(
-        self,
-        geo: torch.Tensor,
-        image_wh: Tuple[int, int],
-    ) -> torch.Tensor:
-        if geo.ndim != 2 or geo.shape[1] != 3:
-            raise ValueError(f"Expected geo shape (B, 3), got {tuple(geo.shape)}.")
-
-        image_w, image_h = image_wh
-        heights = geo[:, 2].to(dtype=torch.float32).clamp_min(0.0) * 300.0
-        table_h = torch.tensor([150.0, 200.0, 250.0, 300.0], device=geo.device)
-        table_s = torch.tensor([165.0, 207.0, 263.5, 339.0], device=geo.device)
-        bucket = torch.bucketize(heights, table_h).clamp(1, table_h.numel() - 1)
-        h0 = table_h[bucket - 1]
-        h1 = table_h[bucket]
-        s0 = table_s[bucket - 1]
-        s1 = table_s[bucket]
-        ratio = ((heights - h0) / (h1 - h0).clamp_min(1e-6)).clamp(0.0, 1.0)
-        size_orig = s0 + ratio * (s1 - s0)
-        scale = min(float(image_w) / 3840.0, float(image_h) / 2160.0)
-        size = size_orig * scale
-        return size.to(device=geo.device, dtype=geo.dtype).unsqueeze(1).repeat(1, 2)
-
-    def _sample_candidate_features(
-        self,
-        feature_map: torch.Tensor,
-        xs: torch.Tensor,
-        ys: torch.Tensor,
-    ) -> torch.Tensor:
-        batch_size, _, height, width = feature_map.shape
-        grid_x = ((xs.to(dtype=feature_map.dtype) + 0.5) / float(width)) * 2.0 - 1.0
-        grid_y = ((ys.to(dtype=feature_map.dtype) + 0.5) / float(height)) * 2.0 - 1.0
-        grid = torch.stack([grid_x, grid_y], dim=-1).view(batch_size, -1, 1, 2)
-        sampled = F.grid_sample(
-            feature_map,
-            grid,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=False,
-        )
-        return sampled.squeeze(-1).transpose(1, 2).contiguous()
-
-    def _refine_bbox_from_heatmap(
-        self,
-        text_heatmap: torch.Tensor,
-        visual_heatmap: torch.Tensor,
-        text_feats: torch.Tensor,
-        anchor_pooler: torch.Tensor,
-        sat_features_2d: torch.Tensor,
-        geo: torch.Tensor,
-        image_wh: Tuple[int, int],
-    ) -> dict:
-        if text_heatmap.shape != visual_heatmap.shape:
+        text_hidden = text_outputs.last_hidden_state
+        if text_hidden.ndim != 3:
+            raise ValueError(f"Expected text hidden shape (B, L, C), got {tuple(text_hidden.shape)}.")
+        if text_hidden.shape[0] != input_ids.shape[0] or text_hidden.shape[2] != self.feature_dim:
             raise ValueError(
-                f"Expected text and visual heatmaps to share shape, got "
-                f"{tuple(text_heatmap.shape)} and {tuple(visual_heatmap.shape)}."
+                f"Unexpected text hidden shape {tuple(text_hidden.shape)} for input_ids {tuple(input_ids.shape)}."
             )
-        if text_heatmap.ndim != 4 or text_heatmap.shape[1] != 1:
-            raise ValueError(f"Expected heatmap shape (B, 1, H, W), got {tuple(text_heatmap.shape)}.")
+        if attention_mask is not None:
+            if attention_mask.shape != input_ids.shape:
+                raise ValueError(
+                    f"Expected attention_mask shape {tuple(input_ids.shape)}, got {tuple(attention_mask.shape)}."
+                )
+            text_mask = attention_mask.to(device=text_hidden.device, dtype=text_hidden.dtype).unsqueeze(-1)
+            text_hidden = text_hidden * text_mask
 
-        batch_size, _, grid_h, grid_w = visual_heatmap.shape
-        image_w, image_h = image_wh
-        topk = min(int(self.refine_topk), grid_h * grid_w)
-
-        visual_prob = visual_heatmap.flatten(1)
-        text_prob = text_heatmap.flatten(1)
-        combined_prob = visual_prob + float(self.text_candidate_weight) * text_prob
-        topk_scores, topk_indices = combined_prob.topk(topk, dim=1)
-        ys = torch.div(topk_indices, grid_w, rounding_mode="floor")
-        xs = topk_indices % grid_w
-
-        local_feats = self._sample_candidate_features(sat_features_2d, xs, ys)
-        anchor_ctx = anchor_pooler.unsqueeze(1).expand(-1, topk, -1).to(dtype=local_feats.dtype)
-        text_ctx = text_feats.unsqueeze(1).expand(-1, topk, -1).to(dtype=local_feats.dtype)
-
-        base_wh = self._height_size_prior(geo, image_wh).to(device=local_feats.device, dtype=local_feats.dtype)
-        base_wh = base_wh.unsqueeze(1).expand(-1, topk, -1)
-        center_x = (xs.to(dtype=local_feats.dtype) + 0.5) / float(grid_w) * float(image_w)
-        center_y = (ys.to(dtype=local_feats.dtype) + 0.5) / float(grid_h) * float(image_h)
-        centers = torch.stack([center_x, center_y], dim=-1)
-
-        xy_norm = torch.stack([center_x / float(image_w), center_y / float(image_h)], dim=-1)
-        wh_norm = torch.stack([base_wh[..., 0] / float(image_w), base_wh[..., 1] / float(image_h)], dim=-1)
-        gathered_visual = visual_prob.gather(1, topk_indices).unsqueeze(-1).to(dtype=local_feats.dtype)
-        gathered_text = text_prob.gather(1, topk_indices).unsqueeze(-1).to(dtype=local_feats.dtype)
-        geo_ctx = geo.to(device=local_feats.device, dtype=local_feats.dtype).unsqueeze(1).expand(-1, topk, -1)
-
-        refine_input = torch.cat(
-            [
-                local_feats,
-                anchor_ctx,
-                text_ctx,
-                geo_ctx,
-                xy_norm,
-                wh_norm,
-                gathered_visual,
-                gathered_text,
-                topk_scores.unsqueeze(-1).to(dtype=local_feats.dtype),
-            ],
-            dim=-1,
-        )
-        raw = self.refine_mlp(refine_input)
-        offset = torch.tanh(raw[..., :2]) * base_wh * 0.35
-        refined_wh = base_wh * torch.exp(torch.tanh(raw[..., 2:4]) * 0.6)
-        refined_centers = centers + offset
-
-        x1y1 = refined_centers - refined_wh / 2.0
-        x2y2 = refined_centers + refined_wh / 2.0
-        x1 = x1y1[..., 0].clamp(min=0.0, max=max(float(image_w) - 1.0, 0.0))
-        y1 = x1y1[..., 1].clamp(min=0.0, max=max(float(image_h) - 1.0, 0.0))
-        x2 = x2y2[..., 0].clamp(min=1.0, max=float(image_w))
-        y2 = x2y2[..., 1].clamp(min=1.0, max=float(image_h))
-        x2 = torch.maximum(x2, x1 + 1.0).clamp(max=float(image_w))
-        y2 = torch.maximum(y2, y1 + 1.0).clamp(max=float(image_h))
-        candidates = torch.stack([x1, y1, x2, y2], dim=-1)
-
-        candidate_logits = raw[..., 4] + topk_scores.clamp_min(1e-8).log().to(dtype=raw.dtype)
-        best_idx = candidate_logits.argmax(dim=1)
-        batch_idx = torch.arange(batch_size, device=candidates.device)
-        return {
-            "bbox": candidates[batch_idx, best_idx],
-            "candidates": candidates,
-            "logits": candidate_logits,
-            "topk_indices": topk_indices,
-        }
+        text_pooler = text_outputs.pooler_output
+        if text_pooler.ndim != 2 or text_pooler.shape != (input_ids.shape[0], self.feature_dim):
+            raise ValueError(f"Unexpected text pooler shape: {tuple(text_pooler.shape)}.")
+        text_pooler = F.normalize(text_pooler, p=2, dim=1)
+        return text_hidden, text_pooler
 
     def forward(
         self,
@@ -710,8 +591,6 @@ class Encoder_test(Encoder_heat):
     ):
         batch_size = anchor_pixel_values.shape[0]
         self._validate_geo(angle, batch_size)
-        if angle is None:
-            raise ValueError("Encoder_test requires angle/height geo features for height-aware refinement.")
 
         anchor_output = self._vision_forward(anchor_pixel_values)
         anchor_feats = anchor_output.last_hidden_state
@@ -720,7 +599,7 @@ class Encoder_test(Encoder_heat):
 
         anchor_pooler = self.attnPooling(anchor_feats, 1)[:, 0, :]
         anchor_pooler = F.normalize(anchor_pooler, p=2, dim=1)
-        text_feats = self._encode_text_features(input_ids, attention_mask)
+        text_hidden, text_pooler = self._encode_text_anchor(input_ids, attention_mask)
 
         sat_output = self._vision_forward(
             search_pixel_values,
@@ -738,49 +617,30 @@ class Encoder_test(Encoder_heat):
         )
         sat_features_2d = sat_feats.permute(0, 2, 1).reshape(batch_size, self.feature_dim, grid_h, grid_w)
 
-        anchor_context = self._anchor_context(anchor_feats, angle)
-        heatmap_logits = self._dynamic_heatmap(anchor_feats, sat_features_2d, angle)
-        text_heatmap_logits = self._text_dynamic_heatmap(text_feats, sat_features_2d)
-        heatmap = self._spatial_softmax(heatmap_logits)
-        text_heatmap = self._spatial_softmax(text_heatmap_logits)
-
-        heat_gate = heatmap * heatmap.shape[-2] * heatmap.shape[-1] / 2
-        guided_sat_features = self.heat_fuse(
-            torch.cat([sat_features_2d, heat_gate], dim=1)
+        pred_anchor, heatmap_out = self._bbox_forward_from_anchor_feats(
+            anchor_feats,
+            sat_features_2d,
+            angle,
+            detach_anchor=True,
         )
-        guided_sat_features = guided_sat_features + self._build_position_embedding(guided_sat_features)
-
-        fused_features = self.bbox_transformer(
-            x=guided_sat_features,
-            context=anchor_context,
+        text_pred_anchor, text_heatmap_out = self._bbox_forward_from_anchor_feats(
+            text_hidden,
+            sat_features_2d,
+            angle,
+            detach_anchor=False,
         )
-        pred_anchor = self.bbox_fcn_out(fused_features)
-        refine_outputs = self._refine_bbox_from_heatmap(
-            text_heatmap=text_heatmap,
-            visual_heatmap=heatmap,
-            text_feats=text_feats,
-            anchor_pooler=anchor_pooler,
-            sat_features_2d=guided_sat_features,
-            geo=angle,
-            image_wh=(int(search_pixel_values.shape[-1]), int(search_pixel_values.shape[-2])),
-        )
-
-        heatmap_out = heatmap
-        if heatmap_out.shape[-2:] != pred_anchor.shape[-2:]:
-            heatmap_logits = F.interpolate(
-                heatmap_logits,
-                size=pred_anchor.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-            heatmap_out = self._spatial_softmax(heatmap_logits)
+        aux_outputs = {
+            "text_pred_anchor": text_pred_anchor,
+            "text_heatmap": text_heatmap_out,
+            "text_pooler": text_pooler,
+        }
 
         return (
             pred_anchor,
             None,
-            text_feats,
+            text_pooler,
             anchor_pooler,
             sat_feature_2d_pool,
-            refine_outputs,
+            aux_outputs,
             heatmap_out,
         )
