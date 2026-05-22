@@ -104,6 +104,7 @@ class Config:
     USE_REFINE_LOSS = False
     REFINE_LOSS_WEIGHT = 0.25
     REFINE_SCORE_LOSS_WEIGHT = 0.2
+    USE_TEXT_GROUNDING_PATH = False
     USE_TEXT_ANCHOR_LOSS = False
     TEXT_ANCHOR_LOSS_WEIGHT = 0.5
     TEXT_POOLER_ALIGN_LOSS_WEIGHT = 0.05
@@ -605,6 +606,7 @@ def build_encoder(use_ap: bool, usesg: bool = True) -> nn.Module:
             lora_rank=Config.LORA_RANK,
             lora_alpha=Config.LORA_ALPHA,
             lora_dropout=Config.LORA_DROPOUT,
+            use_text_grounding_path=Config.USE_TEXT_GROUNDING_PATH,
         )
     if Config.ENCODER_TYPE == "test":
         return Encoder_test(
@@ -881,6 +883,8 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
             f"Invalid OPTIMIZE_OBJECTIVE={Config.OPTIMIZE_OBJECTIVE}. "
             f"Choose from {sorted(valid_objectives)}."
         )
+    if Config.USE_TEXT_ANCHOR_LOSS and not Config.USE_TEXT_GROUNDING_PATH:
+        raise ValueError("USE_TEXT_ANCHOR_LOSS requires USE_TEXT_GROUNDING_PATH=True.")
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
@@ -1097,7 +1101,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     text_anchor_loss = bbox_loss.new_zeros(())
                     text_pooler_align_loss = bbox_loss.new_zeros(())
                     if Config.ENCODER_TYPE == "test" and isinstance(fused_feats, dict):
-                        if Config.USE_TEXT_ANCHOR_LOSS:
+                        if Config.USE_TEXT_ANCHOR_LOSS and Config.USE_TEXT_GROUNDING_PATH:
                             text_pred_anchor = fused_feats["text_pred_anchor"]
                             text_heatmap = fused_feats["text_heatmap"]
                             text_pred_anchor = text_pred_anchor.view(

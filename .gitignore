@@ -214,3 +214,4 @@ runs/
 .codex
 configs/
 eval_results/
+node_modules/

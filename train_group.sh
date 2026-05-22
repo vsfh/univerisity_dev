@@ -8,7 +8,7 @@ CONFIGS=(
     # "configs/unified_siglip_supp/single_config/model_heat_no_geo.yaml"
     # Encoder_heat without input_ids.
     # "configs/unified_siglip_supp/single_config/model_heat_no_input_ids.yaml"
-    # Encoder_test with text hidden-state anchor supervision.
+    # Encoder_test with text pooler alignment; text grounding path is disabled by default.
     "configs/unified_siglip_supp/single_config/model_test_geo_input_ids.yaml"
 )
 
@@ -25,3 +25,15 @@ for CONFIG_PATH in "${CONFIGS[@]}"; do
     echo "Finished at: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "============================================================"
 done
+
+echo "============================================================"
+echo "Running test_group.sh after training"
+echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "============================================================"
+
+bash test_group.sh
+
+echo "============================================================"
+echo "Finished test_group.sh"
+echo "Finished at: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "============================================================"

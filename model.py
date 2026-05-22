@@ -519,6 +519,7 @@ class Encoder_test(Encoder_heat):
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.05,
+        use_text_grounding_path: bool = False,
     ):
         super().__init__(
             model_name=model_name,
@@ -546,6 +547,7 @@ class Encoder_test(Encoder_heat):
         )
         if text_replaced <= 0:
             raise ValueError("No text Linear layers were replaced by LoRA.")
+        self.use_text_grounding_path = bool(use_text_grounding_path)
 
     def _encode_text_anchor(
         self,
@@ -623,17 +625,18 @@ class Encoder_test(Encoder_heat):
             angle,
             detach_anchor=True,
         )
-        text_pred_anchor, text_heatmap_out = self._bbox_forward_from_anchor_feats(
-            text_hidden,
-            sat_features_2d,
-            angle,
-            detach_anchor=False,
-        )
         aux_outputs = {
-            "text_pred_anchor": text_pred_anchor,
-            "text_heatmap": text_heatmap_out,
             "text_pooler": text_pooler,
         }
+        if self.use_text_grounding_path:
+            text_pred_anchor, text_heatmap_out = self._bbox_forward_from_anchor_feats(
+                text_hidden,
+                sat_features_2d,
+                angle,
+                detach_anchor=False,
+            )
+            aux_outputs["text_pred_anchor"] = text_pred_anchor
+            aux_outputs["text_heatmap"] = text_heatmap_out
 
         return (
             pred_anchor,
