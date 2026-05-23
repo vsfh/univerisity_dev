@@ -31,6 +31,7 @@ DEFAULT_ENABLE_TIMING_LOG = False
 DEFAULT_TIMING_LOG_INTERVAL = 200
 DEFAULT_MODEL_NAME = "google/siglip-base-patch16-224"
 DEFAULT_CACHE_DIR = "/media/data1/feihong/hf_cache"
+TEXT_DESCRIPTION_FILES = ("distinctive_description.json", "unified_description.json")
 TRAIN_HEIGHT_TO_BOX_SIZE = {
 	150: 330//2,
 	200: 414//2,
@@ -290,7 +291,9 @@ def _augment_satellite_image_with_bbox(
 		3.0 * bbox_w / max(float(orig_w), 1.0),
 		3.0 * bbox_h / max(float(orig_h), 1.0),
 	)
-	ratio = random.uniform(min_ratio_context, min_ratio_context*3/4)
+	min_ratio_context = min(1.0, min_ratio_context)
+	max_ratio_context = min(1.0, max(min_ratio_context, min_ratio_context * 4.0 / 3.0))
+	ratio = random.uniform(min_ratio_context, max_ratio_context)
 
 	crop_w = max(1.0, min(float(orig_w), float(orig_w) * ratio))
 	crop_h = max(1.0, min(float(orig_h), float(orig_h) * ratio))
@@ -653,16 +656,19 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		return None
 
 	def _load_unified_text(self, drone_dir: Path) -> Optional[str]:
-		# text_path = drone_dir / "udes_version1.json"
-		text_path = drone_dir / "distinctive_description.json"
-		if not text_path.exists():
+		text_path = None
+		for file_name in TEXT_DESCRIPTION_FILES:
+			candidate = drone_dir / file_name
+			if candidate.exists():
+				text_path = candidate
+				break
+		if text_path is None:
 			return None
 
 		with open(text_path, "r", encoding="utf-8") as f:
 			payload = json.load(f)
 
 		text = payload.get("unified_description", "")
-		# text = payload.get("chunk_descriptions", "")[0]
 		if not isinstance(text, str):
 			return None
 
