@@ -108,6 +108,9 @@ class Config:
     USE_TEXT_ANCHOR_LOSS = False
     TEXT_ANCHOR_LOSS_WEIGHT = 0.5
     TEXT_POOLER_ALIGN_LOSS_WEIGHT = 0.05
+    TEXT_POOLER_ALIGN_START_EPOCH = 1
+    TEXT_POOLER_ALIGN_WARMUP_EPOCHS = 0
+    TEXT_POOLER_ALIGN_DETACH_IMAGE = True
 
 
 def config_to_dict() -> Dict[str, Any]:
@@ -243,6 +246,24 @@ def build_optimizer(model: nn.Module) -> AdamW:
     if not trainable_params:
         raise ValueError("No trainable parameters found for optimizer.")
     return AdamW(trainable_params, lr=Config.LEARNING_RATE)
+
+
+def text_pooler_align_weight(epoch: int) -> float:
+    target_weight = float(Config.TEXT_POOLER_ALIGN_LOSS_WEIGHT)
+    if target_weight <= 0:
+        return 0.0
+
+    start_epoch = max(1, int(Config.TEXT_POOLER_ALIGN_START_EPOCH))
+    epoch_number = int(epoch) + 1
+    if epoch_number < start_epoch:
+        return 0.0
+
+    warmup_epochs = max(0, int(Config.TEXT_POOLER_ALIGN_WARMUP_EPOCHS))
+    if warmup_epochs <= 0:
+        return target_weight
+
+    progress = min(1.0, float(epoch_number - start_epoch + 1) / float(warmup_epochs))
+    return target_weight * progress
 
 
 def effective_model_name() -> str:
@@ -606,7 +627,6 @@ def build_encoder(use_ap: bool, usesg: bool = True) -> nn.Module:
             lora_rank=Config.LORA_RANK,
             lora_alpha=Config.LORA_ALPHA,
             lora_dropout=Config.LORA_DROPOUT,
-            use_text_grounding_path=Config.USE_TEXT_GROUNDING_PATH,
         )
     if Config.ENCODER_TYPE == "test":
         return Encoder_test(
@@ -617,6 +637,7 @@ def build_encoder(use_ap: bool, usesg: bool = True) -> nn.Module:
             lora_rank=Config.LORA_RANK,
             lora_alpha=Config.LORA_ALPHA,
             lora_dropout=Config.LORA_DROPOUT,
+            use_text_grounding_path=Config.USE_TEXT_GROUNDING_PATH,
         )
     raise ValueError(
         f"Invalid ENCODER_TYPE={Config.ENCODER_TYPE}. Choose 'heat' or 'test'."
@@ -1169,21 +1190,26 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     image_retrieval_loss = info_nce_loss(
                         anchor_feats, candidate_feats, positive_indices
                     )
+                    current_text_pooler_align_weight = text_pooler_align_weight(epoch)
                     if (
                         Config.ENCODER_TYPE == "test"
                         and text_feats is not None
-                        and Config.TEXT_POOLER_ALIGN_LOSS_WEIGHT > 0
+                        and current_text_pooler_align_weight > 0
                     ):
                         pair_labels = torch.arange(B, device=accelerator.device)
+                        align_anchor_feats = (
+                            anchor_feats.detach()
+                            if Config.TEXT_POOLER_ALIGN_DETACH_IMAGE
+                            else anchor_feats
+                        )
                         text_pooler_align_loss = info_nce_loss(
                             text_feats,
-                            anchor_feats.detach(),
+                            align_anchor_feats,
                             pair_labels,
                         )
                         image_retrieval_loss = (
                             image_retrieval_loss
-                            + Config.TEXT_POOLER_ALIGN_LOSS_WEIGHT
-                            * text_pooler_align_loss
+                            + current_text_pooler_align_weight * text_pooler_align_loss
                         )
 
                     # scheduled_bbox_weight, scheduled_retrieval_weight = get_loss_weights(
@@ -1222,6 +1248,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     "heatmap_loss": f"{heatmap_loss.item():.4f}",
                     "text_anchor": f"{text_anchor_loss.item():.4f}",
                     "text_pooler": f"{text_pooler_align_loss.item():.4f}",
+                    "text_pooler_w": f"{current_text_pooler_align_weight:.4f}",
                     "retrieval_loss": f"{image_retrieval_loss.item():.4f}",
                     "retrieval_weight": f"{retrieval_weight:.4f}",
                     "bbox_weight": f"{bbox_weight:.4f}",
@@ -1236,6 +1263,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 writer.add_scalar("Loss/heatmap_step", heatmap_loss.item(), global_step)
                 writer.add_scalar("Loss/text_anchor_step", text_anchor_loss.item(), global_step)
                 writer.add_scalar("Loss/text_pooler_align_step", text_pooler_align_loss.item(), global_step)
+                writer.add_scalar("Weight/text_pooler_align", current_text_pooler_align_weight, global_step)
                 writer.add_scalar("Loss/retrieval_step", image_retrieval_loss.item(), global_step)
                 writer.add_scalar("Weight/retrieval", retrieval_weight, global_step)
                 writer.add_scalar("Weight/bbox", bbox_weight, global_step)
