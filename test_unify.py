@@ -754,6 +754,7 @@ def score_grid_encoder_query(
     device: torch.device,
     text_feat: Optional[torch.Tensor] = None,
     text_score_weight: float = 0.0,
+    text_rerank_topk: int = 50,
 ) -> torch.Tensor:
     candidate_gallery = gallery_feats[candidate_indices].to(device)
     query_feat = query_feat.to(device)
@@ -763,7 +764,16 @@ def score_grid_encoder_query(
 
     text_feat = text_feat.to(device)
     text_scores = torch.einsum("d,knd->kn", text_feat, candidate_gallery).max(dim=1)[0]
-    return image_scores + float(text_score_weight) * text_scores
+    if text_rerank_topk <= 0 or text_rerank_topk >= image_scores.numel():
+        return image_scores + float(text_score_weight) * text_scores
+
+    reranked_scores = image_scores.clone()
+    topk_indices = image_scores.topk(int(text_rerank_topk), dim=0).indices
+    reranked_scores[topk_indices] = (
+        image_scores[topk_indices]
+        + float(text_score_weight) * text_scores[topk_indices]
+    )
+    return reranked_scores
 
 
 def score_encoder_heat_query(
@@ -773,6 +783,7 @@ def score_encoder_heat_query(
     device: torch.device,
     text_feat: Optional[torch.Tensor] = None,
     text_score_weight: float = 0.0,
+    text_rerank_topk: int = 50,
 ) -> torch.Tensor:
     return score_grid_encoder_query(
         query_feat=query_feat,
@@ -781,6 +792,7 @@ def score_encoder_heat_query(
         device=device,
         text_feat=text_feat,
         text_score_weight=text_score_weight,
+        text_rerank_topk=text_rerank_topk,
     )
 
 
@@ -818,6 +830,7 @@ def score_retrieval_and_uiou(
     unify_score_mode: str,
     sampling_seed: int,
     encoder_heat_text_score_weight: float = 0.0,
+    encoder_heat_text_rerank_topk: int = 50,
 ) -> Dict[str, Any]:
     label_to_gallery_index = {label: idx for idx, label in enumerate(bundle.gallery_labels)}
     norm_gallery_labels = [_normalize_label(label) for label in bundle.gallery_labels]
@@ -863,6 +876,7 @@ def score_retrieval_and_uiou(
                 device,
                 text_feat=text_feat,
                 text_score_weight=encoder_heat_text_score_weight,
+                text_rerank_topk=encoder_heat_text_rerank_topk,
             )
         else:
             score_vec = score_unify_query(
@@ -1081,6 +1095,7 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
         unify_score_mode=args.unify_score_mode,
         sampling_seed=args.seed,
         encoder_heat_text_score_weight=args.encoder_heat_text_score_weight,
+        encoder_heat_text_rerank_topk=args.encoder_heat_text_rerank_topk,
     )
     records = scored.pop("query_records")
     per_subset, per_height, per_angle = group_summaries(records)
@@ -1098,6 +1113,7 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
         "encoder_heat_use_ap": bool(args.encoder_heat_use_ap) if model_type in {"encoder_heat", "encoder_test"} else None,
         "heatmap_confidence_weight": float(args.heatmap_confidence_weight) if model_type in {"encoder_heat", "encoder_test"} else None,
         "encoder_heat_text_score_weight": float(args.encoder_heat_text_score_weight) if model_type in {"encoder_heat", "encoder_test"} else None,
+        "encoder_heat_text_rerank_topk": int(args.encoder_heat_text_rerank_topk) if model_type in {"encoder_heat", "encoder_test"} else None,
         "lora": (
             {
                 "rank": int(args.lora_rank),
@@ -1221,6 +1237,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--heatmap-confidence-weight", type=float, default=0.5)
     parser.add_argument("--encoder-heat-text-score-weight", type=float, default=0.0)
+    parser.add_argument("--encoder-heat-text-rerank-topk", type=int, default=50)
     parser.add_argument(
         "--output-suffix",
         type=str,

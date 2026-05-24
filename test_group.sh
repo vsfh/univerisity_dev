@@ -12,6 +12,8 @@ COMMON_ARGS=(
     --lora-rank 8
     --lora-alpha 16.0
     --lora-dropout 0.05
+    --encoder-heat-text-score-weight "${TEXT_SCORE_WEIGHT:-0.05}"
+    --encoder-heat-text-rerank-topk "${TEXT_RERANK_TOPK:-50}"
 )
 
 # echo "============================================================"
