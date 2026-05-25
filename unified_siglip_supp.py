@@ -107,10 +107,10 @@ class Config:
     USE_TEXT_GROUNDING_PATH = False
     USE_TEXT_ANCHOR_LOSS = False
     TEXT_ANCHOR_LOSS_WEIGHT = 0.5
-    TEXT_POOLER_ALIGN_LOSS_WEIGHT = 0.05
-    TEXT_POOLER_ALIGN_START_EPOCH = 1
-    TEXT_POOLER_ALIGN_WARMUP_EPOCHS = 0
-    TEXT_POOLER_ALIGN_DETACH_IMAGE = True
+    TEXT_POOLER_ALIGN_START_WEIGHT = 0.05
+    TEXT_POOLER_ALIGN_END_WEIGHT = 0.005
+    TEXT_POOLER_ALIGN_DECAY_EPOCHS = 10
+    TEXT_POOLER_ALIGN_UNDETACH_START_EPOCH = 12
 
 
 def config_to_dict() -> Dict[str, Any]:
@@ -249,21 +249,23 @@ def build_optimizer(model: nn.Module) -> AdamW:
 
 
 def text_pooler_align_weight(epoch: int) -> float:
-    target_weight = float(Config.TEXT_POOLER_ALIGN_LOSS_WEIGHT)
-    if target_weight <= 0:
+    start_weight = float(Config.TEXT_POOLER_ALIGN_START_WEIGHT)
+    end_weight = float(Config.TEXT_POOLER_ALIGN_END_WEIGHT)
+    if start_weight <= 0 and end_weight <= 0:
         return 0.0
 
-    start_epoch = max(1, int(Config.TEXT_POOLER_ALIGN_START_EPOCH))
     epoch_number = int(epoch) + 1
-    if epoch_number < start_epoch:
-        return 0.0
+    decay_epochs = max(1, int(Config.TEXT_POOLER_ALIGN_DECAY_EPOCHS))
+    if epoch_number >= decay_epochs:
+        return end_weight
 
-    warmup_epochs = max(0, int(Config.TEXT_POOLER_ALIGN_WARMUP_EPOCHS))
-    if warmup_epochs <= 0:
-        return target_weight
+    progress = float(epoch_number - 1) / float(decay_epochs - 1)
+    return start_weight + (end_weight - start_weight) * progress
 
-    progress = min(1.0, float(epoch_number - start_epoch + 1) / float(warmup_epochs))
-    return target_weight * progress
+
+def text_pooler_align_detach_image(epoch: int) -> bool:
+    undetach_start_epoch = max(1, int(Config.TEXT_POOLER_ALIGN_UNDETACH_START_EPOCH))
+    return int(epoch) + 1 < undetach_start_epoch
 
 
 def effective_model_name() -> str:
@@ -1197,9 +1199,10 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                         and current_text_pooler_align_weight > 0
                     ):
                         pair_labels = torch.arange(B, device=accelerator.device)
+                        detach_image_for_text_align = text_pooler_align_detach_image(epoch)
                         align_anchor_feats = (
                             anchor_feats.detach()
-                            if Config.TEXT_POOLER_ALIGN_DETACH_IMAGE
+                            if detach_image_for_text_align
                             else anchor_feats
                         )
                         text_pooler_align_loss = info_nce_loss(
