@@ -584,6 +584,37 @@ class Encoder_test(Encoder_heat):
         text_pooler = F.normalize(text_pooler, p=2, dim=1)
         return text_hidden, text_pooler
 
+    def _encode_phrase_features(
+        self,
+        phrase_input_ids: Optional[torch.Tensor],
+        phrase_attention_mask: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if phrase_input_ids is None:
+            return None
+        if phrase_input_ids.ndim != 3:
+            raise ValueError(f"Expected phrase_input_ids shape (B, P, L), got {tuple(phrase_input_ids.shape)}.")
+
+        batch_size, phrase_count, token_count = phrase_input_ids.shape
+        flat_input_ids = phrase_input_ids.reshape(batch_size * phrase_count, token_count)
+        flat_attention_mask = None
+        if phrase_attention_mask is not None:
+            if phrase_attention_mask.shape != phrase_input_ids.shape:
+                raise ValueError(
+                    f"Expected phrase_attention_mask shape {tuple(phrase_input_ids.shape)}, "
+                    f"got {tuple(phrase_attention_mask.shape)}."
+                )
+            flat_attention_mask = phrase_attention_mask.reshape(batch_size * phrase_count, token_count)
+
+        text_outputs = self.text_model(
+            input_ids=flat_input_ids,
+            attention_mask=flat_attention_mask,
+        )
+        phrase_pooler = text_outputs.pooler_output
+        if phrase_pooler.ndim != 2 or phrase_pooler.shape[1] != self.feature_dim:
+            raise ValueError(f"Unexpected phrase pooler shape: {tuple(phrase_pooler.shape)}.")
+        phrase_pooler = F.normalize(phrase_pooler, p=2, dim=1)
+        return phrase_pooler.view(batch_size, phrase_count, self.feature_dim)
+
     def forward(
         self,
         anchor_pixel_values: torch.Tensor,
@@ -591,6 +622,8 @@ class Encoder_test(Encoder_heat):
         input_ids: Optional[torch.Tensor] = None,
         angle: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        phrase_input_ids: Optional[torch.Tensor] = None,
+        phrase_attention_mask: Optional[torch.Tensor] = None,
     ):
         batch_size = anchor_pixel_values.shape[0]
         self._validate_geo(angle, batch_size)
@@ -602,7 +635,11 @@ class Encoder_test(Encoder_heat):
 
         anchor_pooler = self.attnPooling(anchor_feats, 1)[:, 0, :]
         anchor_pooler = F.normalize(anchor_pooler, p=2, dim=1)
-        text_hidden, text_pooler = self._encode_text_anchor(input_ids, attention_mask)
+        text_hidden = None
+        text_pooler = None
+        if input_ids is not None:
+            text_hidden, text_pooler = self._encode_text_anchor(input_ids, attention_mask)
+        phrase_feats = self._encode_phrase_features(phrase_input_ids, phrase_attention_mask)
 
         sat_output = self._vision_forward(
             search_pixel_values,
@@ -627,9 +664,12 @@ class Encoder_test(Encoder_heat):
             detach_anchor=True,
         )
         aux_outputs = {
-            "text_pooler": text_pooler,
+            "anchor_patch_feats": anchor_feats,
+            "phrase_feats": phrase_feats,
         }
         if self.use_text_grounding_path:
+            if text_hidden is None:
+                raise ValueError("Text grounding path requires input_ids.")
             text_pred_anchor, text_heatmap_out = self._bbox_forward_from_anchor_feats(
                 text_hidden,
                 sat_features_2d,

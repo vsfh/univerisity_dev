@@ -12,7 +12,7 @@ COMMON_ARGS=(
     --lora-rank 8
     --lora-alpha 16.0
     --lora-dropout 0.05
-    --encoder-heat-text-score-weight "${TEXT_SCORE_WEIGHT:-0.05}"
+    --encoder-heat-text-score-weight "${TEXT_SCORE_WEIGHT:-0.0}"
     --encoder-heat-text-rerank-topk "${TEXT_RERANK_TOPK:-50}"
 )
 
@@ -48,7 +48,7 @@ python test_unify.py \
     --model-types encoder_test \
     --checkpoint "/media/data1/feihong/ckpt/model_test_geo_input_ids/${CHECKPOINT_NAME}" \
     --encoder-heat-use-angle \
-    --encoder-heat-use-text \
+    --no-encoder-heat-use-text \
     "${COMMON_ARGS[@]}" \
     "$@"
 

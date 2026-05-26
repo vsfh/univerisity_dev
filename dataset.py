@@ -23,6 +23,7 @@ TEST_SPLIT_FILE = "/media/data1/feihong/ckpt/test_2.txt"
 VAL_SPLIT_COUNT = 20
 TEST_SPLIT_COUNT = 400
 MAX_TEXT_LENGTH = 64
+MAX_TEXT_PHRASES = 10
 DEFAULT_SAT_TARGET_SIZE = (432, 768)
 DEFAULT_TEST_CROP_RATIO = 1.0
 DEFAULT_SUBSET_HEIGHTS = [150, 200, 250, 300]
@@ -58,6 +59,17 @@ def _safe_int(text: str) -> Optional[int]:
 		return int(text)
 	except ValueError:
 		return None
+
+
+def _split_text_phrases(text: str, max_phrases: int = MAX_TEXT_PHRASES) -> List[str]:
+	phrases: List[str] = []
+	for chunk in str(text).replace("\n", ",").replace(";", ",").split(","):
+		phrase = " ".join(chunk.strip().split())
+		if phrase:
+			phrases.append(phrase)
+		if len(phrases) >= max_phrases:
+			break
+	return phrases
 
 
 def _parse_split_ids_from_text_file(file_path: Path) -> Set[int]:
@@ -487,6 +499,7 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		test_split_file: str = TEST_SPLIT_FILE,
 		val_split_count: int = VAL_SPLIT_COUNT,
 		max_text_length: int = MAX_TEXT_LENGTH,
+		max_text_phrases: int = MAX_TEXT_PHRASES,
 		sat_target_size: Tuple[int, int] = DEFAULT_SAT_TARGET_SIZE,
 		test_crop_ratio: float = DEFAULT_TEST_CROP_RATIO,
 		subset_heights: Optional[Sequence[int]] = None,
@@ -507,6 +520,7 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		self.test_split_file = Path(test_split_file)
 		self.val_split_count = max(0, int(val_split_count))
 		self.max_text_length = max_text_length
+		self.max_text_phrases = max(1, int(max_text_phrases))
 		self.train_split_ids: Optional[Set[int]] = None
 		self.val_split_ids: Optional[Set[int]] = None
 		self.test_split_ids: Optional[Set[int]] = None
@@ -575,6 +589,34 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		if attention_mask.ndim > 1:
 			attention_mask = attention_mask[0]
 		return input_ids.long().clone(), attention_mask.long().clone()
+
+	def _tokenize_phrases(self, text: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+		phrases = _split_text_phrases(text, self.max_text_phrases)
+		if not phrases:
+			phrases = [str(text).strip()]
+		input_rows: List[torch.Tensor] = []
+		mask_rows: List[torch.Tensor] = []
+		for phrase in phrases[: self.max_text_phrases]:
+			input_ids, attention_mask = self._tokenize_text(phrase)
+			input_rows.append(input_ids)
+			mask_rows.append(attention_mask)
+
+		valid_mask = torch.zeros(self.max_text_phrases, dtype=torch.bool)
+		valid_count = len(input_rows)
+		valid_mask[:valid_count] = True
+
+		pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+		if pad_token_id is None:
+			pad_token_id = 0
+		while len(input_rows) < self.max_text_phrases:
+			input_rows.append(torch.full((self.max_text_length,), int(pad_token_id), dtype=torch.long))
+			mask_rows.append(torch.zeros(self.max_text_length, dtype=torch.long))
+
+		return (
+			torch.stack(input_rows, dim=0).long(),
+			torch.stack(mask_rows, dim=0).long(),
+			valid_mask,
+		)
 
 	def _list_satellite_files(self) -> List[Path]:
 		sat_root = self.train_satellite_root if self.split == "train" else self.test_satellite_root
@@ -803,6 +845,7 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		index = row_idx * 3 + col_idx
 
 		input_ids, attention_mask = self._tokenize_text(sample["text"])
+		phrase_input_ids, phrase_attention_mask, phrase_valid_mask = self._tokenize_phrases(sample["text"])
 		query_inputs = self.processor(images=query_image, return_tensors="pt")
 		search_inputs = self.processor_sat(
 			images=augmented_search_image,
@@ -814,6 +857,9 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			"search_pixel_values": search_inputs["pixel_values"][0],
 			"input_ids": input_ids,
 			"attention_mask": attention_mask,
+			"phrase_input_ids": phrase_input_ids,
+			"phrase_attention_mask": phrase_attention_mask,
+			"phrase_valid_mask": phrase_valid_mask,
 			"index": index,
 			"bbox": torch.tensor(resized_bbox, dtype=torch.float32),
 			"height": torch.tensor(sample["height"], dtype=torch.long),

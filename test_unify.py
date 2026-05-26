@@ -1027,8 +1027,6 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
 
     if model_type in {"encoder_heat", "encoder_test"}:
         if model_type == "encoder_test":
-            if not args.encoder_heat_use_text:
-                raise ValueError("encoder_test requires --encoder-heat-use-text.")
             if not args.encoder_heat_use_angle:
                 raise ValueError("encoder_test requires --encoder-heat-use-angle.")
         encoder_cls = Encoder_test if model_type == "encoder_test" else Encoder_heat
