@@ -759,20 +759,20 @@ def info_nce_loss(
     return F.cross_entropy(sim_matrix, positive_indices)
 
 
-def phrase_to_drone_patch_loss(
+def phrase_set_to_drone_loss(
     phrase_feats: torch.Tensor,
-    drone_patch_feats: torch.Tensor,
+    drone_feats: torch.Tensor,
     phrase_valid_mask: torch.Tensor,
     temperature: float = 0.07,
 ) -> torch.Tensor:
     if phrase_feats.ndim != 3:
         raise ValueError(f"Expected phrase_feats shape (B, P, C), got {tuple(phrase_feats.shape)}.")
-    if drone_patch_feats.ndim != 3:
-        raise ValueError(f"Expected drone_patch_feats shape (B, N, C), got {tuple(drone_patch_feats.shape)}.")
-    if phrase_feats.shape[0] != drone_patch_feats.shape[0] or phrase_feats.shape[2] != drone_patch_feats.shape[2]:
+    if drone_feats.ndim != 2:
+        raise ValueError(f"Expected drone_feats shape (B, C), got {tuple(drone_feats.shape)}.")
+    if phrase_feats.shape[0] != drone_feats.shape[0] or phrase_feats.shape[2] != drone_feats.shape[1]:
         raise ValueError(
             f"Phrase/drone mismatch: phrase={tuple(phrase_feats.shape)}, "
-            f"drone={tuple(drone_patch_feats.shape)}."
+            f"drone={tuple(drone_feats.shape)}."
         )
     if phrase_valid_mask.shape != phrase_feats.shape[:2]:
         raise ValueError(
@@ -780,15 +780,17 @@ def phrase_to_drone_patch_loss(
             f"got {tuple(phrase_valid_mask.shape)}."
         )
 
-    phrase_feats = F.normalize(phrase_feats, p=2, dim=-1)
-    drone_patch_feats = F.normalize(drone_patch_feats, p=2, dim=-1)
-    patch_scores = torch.einsum("bpc,jnc->bpjn", phrase_feats, drone_patch_feats).amax(dim=-1)
-    valid = phrase_valid_mask.to(device=patch_scores.device, dtype=patch_scores.dtype)
-    valid_count = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
-    sample_scores = (patch_scores * valid.unsqueeze(-1)).sum(dim=1) / valid_count
-    sample_scores = sample_scores / max(float(temperature), 1e-6)
-    targets = torch.arange(sample_scores.shape[0], device=sample_scores.device)
-    return F.cross_entropy(sample_scores, targets)
+    valid = phrase_valid_mask.to(device=phrase_feats.device, dtype=phrase_feats.dtype)
+    valid_count = valid.sum(dim=1, keepdim=True)
+    if torch.any(valid_count <= 0):
+        raise ValueError("Each sample must have at least one valid phrase.")
+
+    phrase_set_feats = (phrase_feats * valid.unsqueeze(-1)).sum(dim=1) / valid_count
+    phrase_set_feats = F.normalize(phrase_set_feats, p=2, dim=1)
+    drone_feats = F.normalize(drone_feats, p=2, dim=1)
+    logits = torch.matmul(phrase_set_feats, drone_feats.T) / max(float(temperature), 1e-6)
+    targets = torch.arange(logits.shape[0], device=logits.device)
+    return F.cross_entropy(logits, targets)
 
 
 # --- Validation ---
@@ -1303,14 +1305,13 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     if (
                         Config.ENCODER_TYPE == "test"
                         and isinstance(fused_feats, dict)
-                        and fused_feats.get("anchor_patch_feats") is not None
                         and fused_feats.get("phrase_feats") is not None
                         and phrase_valid_mask is not None
                         and current_phrase_drone_align_weight > 0
                     ):
-                        phrase_drone_align_loss = phrase_to_drone_patch_loss(
+                        phrase_drone_align_loss = phrase_set_to_drone_loss(
                             fused_feats["phrase_feats"],
-                            fused_feats["anchor_patch_feats"],
+                            anchor_feats,
                             phrase_valid_mask,
                         )
 

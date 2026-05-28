@@ -664,7 +664,6 @@ class Encoder_test(Encoder_heat):
             detach_anchor=True,
         )
         aux_outputs = {
-            "anchor_patch_feats": anchor_feats,
             "phrase_feats": phrase_feats,
         }
         if self.use_text_grounding_path:
