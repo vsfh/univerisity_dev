@@ -23,7 +23,6 @@ TEST_SPLIT_FILE = "/media/data1/feihong/ckpt/test_2.txt"
 VAL_SPLIT_COUNT = 20
 TEST_SPLIT_COUNT = 400
 MAX_TEXT_LENGTH = 64
-MAX_TEXT_PHRASES = 10
 DEFAULT_SAT_TARGET_SIZE = (432, 768)
 DEFAULT_TEST_CROP_RATIO = 1.0
 DEFAULT_SUBSET_HEIGHTS = [150, 200, 250, 300]
@@ -32,7 +31,7 @@ DEFAULT_ENABLE_TIMING_LOG = False
 DEFAULT_TIMING_LOG_INTERVAL = 200
 DEFAULT_MODEL_NAME = "google/siglip-base-patch16-224"
 DEFAULT_CACHE_DIR = "/media/data1/feihong/hf_cache"
-TEXT_DESCRIPTION_FILES = ("distinctive_description.json", "unified_description.json")
+TEXT_DESCRIPTION_FILE = "gemma_5_28_description.json"
 TRAIN_HEIGHT_TO_BOX_SIZE = {
 	150: 330//2,
 	200: 414//2,
@@ -59,17 +58,6 @@ def _safe_int(text: str) -> Optional[int]:
 		return int(text)
 	except ValueError:
 		return None
-
-
-def _split_text_phrases(text: str, max_phrases: int = MAX_TEXT_PHRASES) -> List[str]:
-	phrases: List[str] = []
-	for chunk in str(text).replace("\n", ",").replace(";", ",").split(","):
-		phrase = " ".join(chunk.strip().split())
-		if phrase:
-			phrases.append(phrase)
-		if len(phrases) >= max_phrases:
-			break
-	return phrases
 
 
 def _parse_split_ids_from_text_file(file_path: Path) -> Set[int]:
@@ -495,12 +483,11 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		bbox_file: str = BBOX_FILE,
 		train_max_satellite_id: int = TRAIN_MAX_SATELLITE_ID,
 		train_split_file: str = TRAIN_SPLIT_FILE,
-		val_split_file: str = VAL_SPLIT_FILE,
-		test_split_file: str = TEST_SPLIT_FILE,
-		val_split_count: int = VAL_SPLIT_COUNT,
-		max_text_length: int = MAX_TEXT_LENGTH,
-		max_text_phrases: int = MAX_TEXT_PHRASES,
-		sat_target_size: Tuple[int, int] = DEFAULT_SAT_TARGET_SIZE,
+			val_split_file: str = VAL_SPLIT_FILE,
+			test_split_file: str = TEST_SPLIT_FILE,
+			val_split_count: int = VAL_SPLIT_COUNT,
+			max_text_length: int = MAX_TEXT_LENGTH,
+			sat_target_size: Tuple[int, int] = DEFAULT_SAT_TARGET_SIZE,
 		test_crop_ratio: float = DEFAULT_TEST_CROP_RATIO,
 		subset_heights: Optional[Sequence[int]] = None,
 		subset_angles: Optional[Sequence[int]] = None,
@@ -520,7 +507,6 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		self.test_split_file = Path(test_split_file)
 		self.val_split_count = max(0, int(val_split_count))
 		self.max_text_length = max_text_length
-		self.max_text_phrases = max(1, int(max_text_phrases))
 		self.train_split_ids: Optional[Set[int]] = None
 		self.val_split_ids: Optional[Set[int]] = None
 		self.test_split_ids: Optional[Set[int]] = None
@@ -590,34 +576,6 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			attention_mask = attention_mask[0]
 		return input_ids.long().clone(), attention_mask.long().clone()
 
-	def _tokenize_phrases(self, text: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-		phrases = _split_text_phrases(text, self.max_text_phrases)
-		if not phrases:
-			phrases = [str(text).strip()]
-		input_rows: List[torch.Tensor] = []
-		mask_rows: List[torch.Tensor] = []
-		for phrase in phrases[: self.max_text_phrases]:
-			input_ids, attention_mask = self._tokenize_text(phrase)
-			input_rows.append(input_ids)
-			mask_rows.append(attention_mask)
-
-		valid_mask = torch.zeros(self.max_text_phrases, dtype=torch.bool)
-		valid_count = len(input_rows)
-		valid_mask[:valid_count] = True
-
-		pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
-		if pad_token_id is None:
-			pad_token_id = 0
-		while len(input_rows) < self.max_text_phrases:
-			input_rows.append(torch.full((self.max_text_length,), int(pad_token_id), dtype=torch.long))
-			mask_rows.append(torch.zeros(self.max_text_length, dtype=torch.long))
-
-		return (
-			torch.stack(input_rows, dim=0).long(),
-			torch.stack(mask_rows, dim=0).long(),
-			valid_mask,
-		)
-
 	def _list_satellite_files(self) -> List[Path]:
 		sat_root = self.train_satellite_root if self.split == "train" else self.test_satellite_root
 		if not sat_root.is_dir():
@@ -664,7 +622,7 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		if not self.train_split_file.exists():
 			raise FileNotFoundError(
 				f"Train split file not found: {self.train_split_file}"
-			)
+		)
 
 		train_ids = _parse_split_ids_from_text_file(self.train_split_file)
 
@@ -697,27 +655,29 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			return candidate_2
 		return None
 
-	def _load_unified_text(self, drone_dir: Path) -> Optional[str]:
-		text_path = None
-		for file_name in TEXT_DESCRIPTION_FILES:
-			candidate = drone_dir / file_name
-			if candidate.exists():
-				text_path = candidate
-				break
-		if text_path is None:
+	def _load_height_descriptions(self, drone_dir: Path) -> Optional[Dict[int, str]]:
+		text_path = drone_dir / TEXT_DESCRIPTION_FILE
+		if not text_path.exists():
 			return None
 
 		with open(text_path, "r", encoding="utf-8") as f:
 			payload = json.load(f)
 
-		text = payload.get("unified_description", "")
-		if not isinstance(text, str):
+		descriptions = payload.get("descriptions")
+		if not isinstance(descriptions, dict):
 			return None
 
-		text = text.strip()
-		if not text:
+		height_descriptions: Dict[int, str] = {}
+		for raw_height, raw_text in descriptions.items():
+			height = _safe_int(str(raw_height))
+			if height is None or not isinstance(raw_text, str):
+				continue
+			text = raw_text.strip()
+			if text:
+				height_descriptions[height] = text
+		if not height_descriptions:
 			return None
-		return text
+		return height_descriptions
 
 	def _build_samples(self) -> List[Dict[str, Any]]:
 		samples: List[Dict[str, Any]] = []
@@ -739,8 +699,8 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			if drone_dir is None:
 				continue
 
-			unified_text = self._load_unified_text(drone_dir)
-			if unified_text is None:
+			height_descriptions = self._load_height_descriptions(drone_dir)
+			if height_descriptions is None:
 				continue
 
 			sat_bbox_dict: Dict[str, List[float]] = {}
@@ -764,6 +724,9 @@ class ShiftedSatelliteDroneDataset(Dataset):
 					continue
 				if int(angle) not in self.subset_angles:
 					continue
+				text = height_descriptions.get(int(height))
+				if text is None:
+					continue
 				# if str(angle).endswith("5"):
 				# 	continue
 
@@ -773,7 +736,7 @@ class ShiftedSatelliteDroneDataset(Dataset):
 					"satellite_id": sat_id_int,
 					"height": height,
 					"angle": angle,
-					"text": unified_text,
+					"text": text,
 				}
 
 				if self.split in {"val", "test"}:
@@ -845,21 +808,17 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		index = row_idx * 3 + col_idx
 
 		input_ids, attention_mask = self._tokenize_text(sample["text"])
-		phrase_input_ids, phrase_attention_mask, phrase_valid_mask = self._tokenize_phrases(sample["text"])
 		query_inputs = self.processor(images=query_image, return_tensors="pt")
 		search_inputs = self.processor_sat(
 			images=augmented_search_image,
 			return_tensors="pt",
-		)
+			)
 
 		return {
 			"target_pixel_values": query_inputs["pixel_values"][0],
 			"search_pixel_values": search_inputs["pixel_values"][0],
 			"input_ids": input_ids,
 			"attention_mask": attention_mask,
-			"phrase_input_ids": phrase_input_ids,
-			"phrase_attention_mask": phrase_attention_mask,
-			"phrase_valid_mask": phrase_valid_mask,
 			"index": index,
 			"bbox": torch.tensor(resized_bbox, dtype=torch.float32),
 			"height": torch.tensor(sample["height"], dtype=torch.long),

@@ -110,13 +110,7 @@ class Config:
     TEXT_POOLER_ALIGN_START_WEIGHT = 0.05
     TEXT_POOLER_ALIGN_END_WEIGHT = 0.005
     TEXT_POOLER_ALIGN_DECAY_EPOCHS = 10
-    TEXT_POOLER_ALIGN_UNDETACH_START_EPOCH = 12
-    USE_PHRASE_DRONE_ALIGN_LOSS = False
-    PHRASE_DRONE_ALIGN_START_WEIGHT = 0.005
-    PHRASE_DRONE_ALIGN_PEAK_WEIGHT = 0.02
-    PHRASE_DRONE_ALIGN_END_WEIGHT = 0.005
-    PHRASE_DRONE_ALIGN_WARMUP_EPOCHS = 3
-    PHRASE_DRONE_ALIGN_DECAY_EPOCHS = 10
+    TEXT_POOLER_ALIGN_STOP_EPOCH = 10
 
 
 def config_to_dict() -> Dict[str, Any]:
@@ -261,7 +255,10 @@ def text_pooler_align_weight(epoch: int) -> float:
         return 0.0
 
     epoch_number = int(epoch) + 1
-    decay_epochs = max(1, int(Config.TEXT_POOLER_ALIGN_DECAY_EPOCHS))
+    stop_epoch = max(1, int(Config.TEXT_POOLER_ALIGN_STOP_EPOCH))
+    if epoch_number > stop_epoch:
+        return 0.0
+    decay_epochs = max(1, min(int(Config.TEXT_POOLER_ALIGN_DECAY_EPOCHS), stop_epoch))
     if epoch_number >= decay_epochs:
         return end_weight
 
@@ -270,32 +267,7 @@ def text_pooler_align_weight(epoch: int) -> float:
 
 
 def text_pooler_align_detach_image(epoch: int) -> bool:
-    undetach_start_epoch = max(1, int(Config.TEXT_POOLER_ALIGN_UNDETACH_START_EPOCH))
-    return int(epoch) + 1 < undetach_start_epoch
-
-
-def phrase_drone_align_weight(epoch: int) -> float:
-    if not Config.USE_PHRASE_DRONE_ALIGN_LOSS:
-        return 0.0
-
-    start_weight = float(Config.PHRASE_DRONE_ALIGN_START_WEIGHT)
-    peak_weight = float(Config.PHRASE_DRONE_ALIGN_PEAK_WEIGHT)
-    end_weight = float(Config.PHRASE_DRONE_ALIGN_END_WEIGHT)
-    epoch_number = int(epoch) + 1
-    warmup_epochs = max(1, int(Config.PHRASE_DRONE_ALIGN_WARMUP_EPOCHS))
-    decay_epochs = max(warmup_epochs, int(Config.PHRASE_DRONE_ALIGN_DECAY_EPOCHS))
-
-    if epoch_number <= warmup_epochs:
-        if warmup_epochs == 1:
-            return peak_weight
-        progress = float(epoch_number - 1) / float(warmup_epochs - 1)
-        return start_weight + (peak_weight - start_weight) * progress
-
-    if epoch_number >= decay_epochs:
-        return end_weight
-
-    progress = float(epoch_number - warmup_epochs) / float(decay_epochs - warmup_epochs)
-    return peak_weight + (end_weight - peak_weight) * progress
+    return False
 
 
 def effective_model_name() -> str:
@@ -759,40 +731,6 @@ def info_nce_loss(
     return F.cross_entropy(sim_matrix, positive_indices)
 
 
-def phrase_set_to_drone_loss(
-    phrase_feats: torch.Tensor,
-    drone_feats: torch.Tensor,
-    phrase_valid_mask: torch.Tensor,
-    temperature: float = 0.07,
-) -> torch.Tensor:
-    if phrase_feats.ndim != 3:
-        raise ValueError(f"Expected phrase_feats shape (B, P, C), got {tuple(phrase_feats.shape)}.")
-    if drone_feats.ndim != 2:
-        raise ValueError(f"Expected drone_feats shape (B, C), got {tuple(drone_feats.shape)}.")
-    if phrase_feats.shape[0] != drone_feats.shape[0] or phrase_feats.shape[2] != drone_feats.shape[1]:
-        raise ValueError(
-            f"Phrase/drone mismatch: phrase={tuple(phrase_feats.shape)}, "
-            f"drone={tuple(drone_feats.shape)}."
-        )
-    if phrase_valid_mask.shape != phrase_feats.shape[:2]:
-        raise ValueError(
-            f"Expected phrase_valid_mask shape {tuple(phrase_feats.shape[:2])}, "
-            f"got {tuple(phrase_valid_mask.shape)}."
-        )
-
-    valid = phrase_valid_mask.to(device=phrase_feats.device, dtype=phrase_feats.dtype)
-    valid_count = valid.sum(dim=1, keepdim=True)
-    if torch.any(valid_count <= 0):
-        raise ValueError("Each sample must have at least one valid phrase.")
-
-    phrase_set_feats = (phrase_feats * valid.unsqueeze(-1)).sum(dim=1) / valid_count
-    phrase_set_feats = F.normalize(phrase_set_feats, p=2, dim=1)
-    drone_feats = F.normalize(drone_feats, p=2, dim=1)
-    logits = torch.matmul(phrase_set_feats, drone_feats.T) / max(float(temperature), 1e-6)
-    targets = torch.arange(logits.shape[0], device=logits.device)
-    return F.cross_entropy(logits, targets)
-
-
 # --- Validation ---
 def validate(
     loader: DataLoader,
@@ -1099,7 +1037,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         total_heatmap_loss = 0
         total_text_anchor_loss = 0
         total_text_pooler_align_loss = 0
-        total_phrase_drone_align_loss = 0
+        total_text_satellite_retrieval_loss = 0
         last_heatmap_logits = None
         last_target_bbox = None
         last_heatmap_target = None
@@ -1117,8 +1055,10 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 search_pixel_values = batch["search_pixel_values"].to(
                     accelerator.device, non_blocking=True
                 )
-                use_global_text = Config.USE_TEXT_INPUT and Config.USE_TEXT_GROUNDING_PATH
-                use_phrase_text = Config.USE_TEXT_INPUT and Config.USE_PHRASE_DRONE_ALIGN_LOSS
+                current_text_pooler_align_weight = text_pooler_align_weight(epoch)
+                use_global_text = Config.USE_TEXT_INPUT and (
+                    Config.USE_TEXT_GROUNDING_PATH or current_text_pooler_align_weight > 0
+                )
                 input_ids = (
                     batch["input_ids"].to(accelerator.device, non_blocking=True)
                     if use_global_text
@@ -1127,21 +1067,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 attention_mask = (
                     batch["attention_mask"].to(accelerator.device, non_blocking=True)
                     if use_global_text and "attention_mask" in batch
-                    else None
-                )
-                phrase_input_ids = (
-                    batch["phrase_input_ids"].to(accelerator.device, non_blocking=True)
-                    if use_phrase_text
-                    else None
-                )
-                phrase_attention_mask = (
-                    batch["phrase_attention_mask"].to(accelerator.device, non_blocking=True)
-                    if use_phrase_text and "phrase_attention_mask" in batch
-                    else None
-                )
-                phrase_valid_mask = (
-                    batch["phrase_valid_mask"].to(accelerator.device, non_blocking=True)
-                    if use_phrase_text
                     else None
                 )
                 local_indices = batch["index"].to(
@@ -1157,8 +1082,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                         input_ids,
                         geo,
                         attention_mask=attention_mask,
-                        phrase_input_ids=phrase_input_ids,
-                        phrase_attention_mask=phrase_attention_mask,
                     )
                     (
                         pred_anchor,
@@ -1208,7 +1131,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 
                     text_anchor_loss = bbox_loss.new_zeros(())
                     text_pooler_align_loss = bbox_loss.new_zeros(())
-                    phrase_drone_align_loss = bbox_loss.new_zeros(())
+                    text_satellite_retrieval_loss = bbox_loss.new_zeros(())
                     if Config.ENCODER_TYPE == "test" and isinstance(fused_feats, dict):
                         if Config.USE_TEXT_ANCHOR_LOSS and Config.USE_TEXT_GROUNDING_PATH:
                             text_pred_anchor = fused_feats["text_pred_anchor"]
@@ -1278,7 +1201,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     image_retrieval_loss = info_nce_loss(
                         anchor_feats, candidate_feats, positive_indices
                     )
-                    current_text_pooler_align_weight = text_pooler_align_weight(epoch)
                     if (
                         Config.ENCODER_TYPE == "test"
                         and text_feats is not None
@@ -1292,27 +1214,19 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                             else anchor_feats
                         )
                         text_pooler_align_loss = info_nce_loss(
-                            text_feats,
+                            text_feats.detach(),
                             align_anchor_feats,
                             pair_labels,
+                        )
+                        text_satellite_retrieval_loss = info_nce_loss(
+                            text_feats.detach(),
+                            candidate_feats,
+                            positive_indices,
                         )
                         image_retrieval_loss = (
                             image_retrieval_loss
                             + current_text_pooler_align_weight * text_pooler_align_loss
-                        )
-
-                    current_phrase_drone_align_weight = phrase_drone_align_weight(epoch)
-                    if (
-                        Config.ENCODER_TYPE == "test"
-                        and isinstance(fused_feats, dict)
-                        and fused_feats.get("phrase_feats") is not None
-                        and phrase_valid_mask is not None
-                        and current_phrase_drone_align_weight > 0
-                    ):
-                        phrase_drone_align_loss = phrase_set_to_drone_loss(
-                            fused_feats["phrase_feats"],
-                            anchor_feats,
-                            phrase_valid_mask,
+                            + current_text_pooler_align_weight * text_satellite_retrieval_loss
                         )
 
                     # scheduled_bbox_weight, scheduled_retrieval_weight = get_loss_weights(
@@ -1330,7 +1244,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                         bbox_weight = 1.0
                         retrieval_weight = 0.0
                         loss = retrieval_weight * image_retrieval_loss + bbox_weight * bbox_loss
-                    loss = loss + current_phrase_drone_align_weight * phrase_drone_align_loss
 
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
@@ -1345,7 +1258,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
             total_heatmap_loss += heatmap_loss.item()
             total_text_anchor_loss += text_anchor_loss.item()
             total_text_pooler_align_loss += text_pooler_align_loss.item()
-            total_phrase_drone_align_loss += phrase_drone_align_loss.item()
+            total_text_satellite_retrieval_loss += text_satellite_retrieval_loss.item()
             global_step = epoch * len(train_dataloader) + i
             progress_bar.set_postfix(
                 {
@@ -1353,9 +1266,8 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     "heatmap_loss": f"{heatmap_loss.item():.4f}",
                     "text_anchor": f"{text_anchor_loss.item():.4f}",
                     "text_pooler": f"{text_pooler_align_loss.item():.4f}",
+                    "text_sat": f"{text_satellite_retrieval_loss.item():.4f}",
                     "text_pooler_w": f"{current_text_pooler_align_weight:.4f}",
-                    "phrase": f"{phrase_drone_align_loss.item():.4f}",
-                    "phrase_w": f"{current_phrase_drone_align_weight:.4f}",
                     "retrieval_loss": f"{image_retrieval_loss.item():.4f}",
                     "retrieval_weight": f"{retrieval_weight:.4f}",
                     "bbox_weight": f"{bbox_weight:.4f}",
@@ -1370,9 +1282,8 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 writer.add_scalar("Loss/heatmap_step", heatmap_loss.item(), global_step)
                 writer.add_scalar("Loss/text_anchor_step", text_anchor_loss.item(), global_step)
                 writer.add_scalar("Loss/text_pooler_align_step", text_pooler_align_loss.item(), global_step)
+                writer.add_scalar("Loss/text_satellite_retrieval_step", text_satellite_retrieval_loss.item(), global_step)
                 writer.add_scalar("Weight/text_pooler_align", current_text_pooler_align_weight, global_step)
-                writer.add_scalar("Loss/phrase_drone_align_step", phrase_drone_align_loss.item(), global_step)
-                writer.add_scalar("Weight/phrase_drone_align", current_phrase_drone_align_weight, global_step)
                 writer.add_scalar("Loss/retrieval_step", image_retrieval_loss.item(), global_step)
                 writer.add_scalar("Weight/retrieval", retrieval_weight, global_step)
                 writer.add_scalar("Weight/bbox", bbox_weight, global_step)
@@ -1399,7 +1310,10 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     "train", "text_pooler_align_loss", text_pooler_align_loss.item(), global_step
                 )
                 clearml_logger.report_scalar(
-                    "train", "phrase_drone_align_loss", phrase_drone_align_loss.item(), global_step
+                    "train",
+                    "text_satellite_retrieval_loss",
+                    text_satellite_retrieval_loss.item(),
+                    global_step,
                 )
                 clearml_logger.report_scalar(
                     "train", "image_retrieval_loss", image_retrieval_loss.item(), global_step
@@ -1436,8 +1350,8 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 epoch,
             )
             writer.add_scalar(
-                "Loss/phrase_drone_align_epoch",
-                total_phrase_drone_align_loss / len(train_dataloader),
+                "Loss/text_satellite_retrieval_epoch",
+                total_text_satellite_retrieval_loss / len(train_dataloader),
                 epoch,
             )
             writer.add_scalar("lr/learning_rate", optimizer.param_groups[0]["lr"], epoch)

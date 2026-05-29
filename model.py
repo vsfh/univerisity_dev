@@ -540,14 +540,8 @@ class Encoder_test(Encoder_heat):
                 f"to match vision dim {self.feature_dim}."
             )
 
-        text_replaced = self._inject_lora(
-            module=self.text_model,
-            rank=int(lora_rank),
-            alpha=float(lora_alpha),
-            dropout=float(lora_dropout),
-        )
-        if text_replaced <= 0:
-            raise ValueError("No text Linear layers were replaced by LoRA.")
+        for param in self.text_model.parameters():
+            param.requires_grad = False
         self.use_text_grounding_path = bool(use_text_grounding_path)
 
     def _encode_text_anchor(
@@ -559,10 +553,11 @@ class Encoder_test(Encoder_heat):
             raise ValueError("Encoder_test requires input_ids.")
         if input_ids.ndim != 2:
             raise ValueError(f"Expected input_ids shape (B, L), got {tuple(input_ids.shape)}.")
-        text_outputs = self.text_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
+        with torch.no_grad():
+            text_outputs = self.text_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
         text_hidden = text_outputs.last_hidden_state
         if text_hidden.ndim != 3:
             raise ValueError(f"Expected text hidden shape (B, L, C), got {tuple(text_hidden.shape)}.")
@@ -584,37 +579,6 @@ class Encoder_test(Encoder_heat):
         text_pooler = F.normalize(text_pooler, p=2, dim=1)
         return text_hidden, text_pooler
 
-    def _encode_phrase_features(
-        self,
-        phrase_input_ids: Optional[torch.Tensor],
-        phrase_attention_mask: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        if phrase_input_ids is None:
-            return None
-        if phrase_input_ids.ndim != 3:
-            raise ValueError(f"Expected phrase_input_ids shape (B, P, L), got {tuple(phrase_input_ids.shape)}.")
-
-        batch_size, phrase_count, token_count = phrase_input_ids.shape
-        flat_input_ids = phrase_input_ids.reshape(batch_size * phrase_count, token_count)
-        flat_attention_mask = None
-        if phrase_attention_mask is not None:
-            if phrase_attention_mask.shape != phrase_input_ids.shape:
-                raise ValueError(
-                    f"Expected phrase_attention_mask shape {tuple(phrase_input_ids.shape)}, "
-                    f"got {tuple(phrase_attention_mask.shape)}."
-                )
-            flat_attention_mask = phrase_attention_mask.reshape(batch_size * phrase_count, token_count)
-
-        text_outputs = self.text_model(
-            input_ids=flat_input_ids,
-            attention_mask=flat_attention_mask,
-        )
-        phrase_pooler = text_outputs.pooler_output
-        if phrase_pooler.ndim != 2 or phrase_pooler.shape[1] != self.feature_dim:
-            raise ValueError(f"Unexpected phrase pooler shape: {tuple(phrase_pooler.shape)}.")
-        phrase_pooler = F.normalize(phrase_pooler, p=2, dim=1)
-        return phrase_pooler.view(batch_size, phrase_count, self.feature_dim)
-
     def forward(
         self,
         anchor_pixel_values: torch.Tensor,
@@ -622,8 +586,6 @@ class Encoder_test(Encoder_heat):
         input_ids: Optional[torch.Tensor] = None,
         angle: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        phrase_input_ids: Optional[torch.Tensor] = None,
-        phrase_attention_mask: Optional[torch.Tensor] = None,
     ):
         batch_size = anchor_pixel_values.shape[0]
         self._validate_geo(angle, batch_size)
@@ -639,7 +601,6 @@ class Encoder_test(Encoder_heat):
         text_pooler = None
         if input_ids is not None:
             text_hidden, text_pooler = self._encode_text_anchor(input_ids, attention_mask)
-        phrase_feats = self._encode_phrase_features(phrase_input_ids, phrase_attention_mask)
 
         sat_output = self._vision_forward(
             search_pixel_values,
@@ -663,9 +624,7 @@ class Encoder_test(Encoder_heat):
             angle,
             detach_anchor=True,
         )
-        aux_outputs = {
-            "phrase_feats": phrase_feats,
-        }
+        aux_outputs = {}
         if self.use_text_grounding_path:
             if text_hidden is None:
                 raise ValueError("Text grounding path requires input_ids.")
