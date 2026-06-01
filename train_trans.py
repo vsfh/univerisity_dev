@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TransGeo-style retrieval + grounding training.
+GeoFormer/TransGeo-style retrieval + grounding training.
 
-The retrieval backbone follows the TransGeo idea of separate query/reference
-distilled ViT branches. A lightweight patch-level decoder is added so the same
-model can predict a satellite heatmap and bounding box for grounding metrics.
+The backbone is rebuilt around the available GeoFormer checkpoint: ResNet101
+visual features are projected through the original visual embedding layout and
+encoded by the pretrained T5 encoder. Task-specific retrieval, heatmap, and
+bbox heads adapt it to the shared drone/satellite dataset.
 """
 
 import argparse
@@ -21,9 +22,11 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models as torchvision_models
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
+from transformers import T5Config, T5EncoderModel
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -48,137 +51,151 @@ from train_uni import (
 
 # --- Configuration ---
 BATCH_SIZE = 16
-NUM_EPOCHS = 8
+NUM_EPOCHS = 40
 LEARNING_RATE = 4.5e-4
+BACKBONE_LEARNING_RATE = 1e-5
 WEIGHT_DECAY = 0.04
 PRINT_FREQ = 50
 PROJECTION_DIM = 768
 DETAIL_DIM = 384
-EMBED_DIM = 384
+EMBED_DIM = 768
 DEPTH = 12
-NUM_HEADS = 6
-PATCH_SIZE = 16
+NUM_HEADS = 12
+PATCH_SIZE = 32
 RETRIEVAL_LOSS_WEIGHT = 1.0
 LOCALIZATION_LOSS_WEIGHT = 1.0
 BBOX_LOSS_WEIGHT = 5.0
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+PRETRAINED_CHECKPOINT = "/media/data1/feihong/ckpt/geoformer.pth"
+VAL_FRACTION = 0.25
+DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 
 
-class PatchEmbed(nn.Module):
-    def __init__(
-        self,
-        image_size: Tuple[int, int],
-        patch_size: int = PATCH_SIZE,
-        embed_dim: int = EMBED_DIM,
-    ):
+class GeoFormerVisualEmbedding(nn.Module):
+    """Visual token embedding layout matching geoformer.pth."""
+
+    def __init__(self, feat_dim: int = 2048, hidden_dim: int = EMBED_DIM, max_order: int = 32200):
         super().__init__()
-        image_w, image_h = int(image_size[0]), int(image_size[1])
-        self.grid_size = (image_h // patch_size, image_w // patch_size)
-        self.proj = nn.Conv2d(
-            3,
-            embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size,
+        self.feat_embedding = nn.Sequential(
+            nn.Linear(feat_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
         )
+        self.absolute_vis_pos_embedding = nn.Sequential(
+            nn.Linear(5, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.obj_order_embedding = nn.Embedding(max_order, hidden_dim)
+        self.img_order_embedding = nn.Embedding(2, hidden_dim)
 
-    def forward(self, x):
-        x = self.proj(x)
-        grid_hw = (int(x.shape[-2]), int(x.shape[-1]))
-        x = x.flatten(2).transpose(1, 2)
-        return x, grid_hw
+    def forward(self, feat_map: torch.Tensor, image_order_id: int) -> Tuple[torch.Tensor, Tuple[int, int]]:
+        batch_size, channels, grid_h, grid_w = feat_map.shape
+        feat_tokens = feat_map.flatten(2).transpose(1, 2)
+
+        y0 = torch.arange(grid_h, device=feat_map.device, dtype=feat_map.dtype) / float(grid_h)
+        x0 = torch.arange(grid_w, device=feat_map.device, dtype=feat_map.dtype) / float(grid_w)
+        y1 = (torch.arange(grid_h, device=feat_map.device, dtype=feat_map.dtype) + 1.0) / float(grid_h)
+        x1 = (torch.arange(grid_w, device=feat_map.device, dtype=feat_map.dtype) + 1.0) / float(grid_w)
+        yy0, xx0 = torch.meshgrid(y0, x0, indexing="ij")
+        yy1, xx1 = torch.meshgrid(y1, x1, indexing="ij")
+        area = (yy1 - yy0) * (xx1 - xx0)
+        pos = torch.stack([xx0, yy0, xx1, yy1, area], dim=-1).view(1, grid_h * grid_w, 5)
+        pos = pos.expand(batch_size, -1, -1)
+
+        order_ids = torch.arange(grid_h * grid_w, device=feat_map.device).clamp_max(
+            self.obj_order_embedding.num_embeddings - 1
+        )
+        order_emb = self.obj_order_embedding(order_ids).unsqueeze(0)
+        image_ids = torch.full(
+            (batch_size, grid_h * grid_w),
+            int(image_order_id),
+            device=feat_map.device,
+            dtype=torch.long,
+        )
+        image_emb = self.img_order_embedding(image_ids)
+        tokens = self.feat_embedding(feat_tokens) + self.absolute_vis_pos_embedding(pos) + order_emb + image_emb
+        return tokens, (grid_h, grid_w)
 
 
-class DistilledViTBranch(nn.Module):
-    """DeiT-small distilled style branch used by TransGeo."""
+class GeoFormerImageEncoder(nn.Module):
+    """ResNet101 + T5 encoder subset that can load geoformer.pth."""
 
-    def __init__(
-        self,
-        image_size: Tuple[int, int],
-        embed_dim: int = EMBED_DIM,
-        depth: int = DEPTH,
-        num_heads: int = NUM_HEADS,
-        proj_dim: int = PROJECTION_DIM,
-        patch_size: int = PATCH_SIZE,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.0,
-    ):
+    def __init__(self, hidden_dim: int = EMBED_DIM, num_layers: int = DEPTH, num_heads: int = NUM_HEADS):
         super().__init__()
-        self.patch_embed = PatchEmbed(
-            image_size=image_size,
-            patch_size=patch_size,
-            embed_dim=embed_dim,
+        if hidden_dim != 768 or num_layers != 12 or num_heads != 12:
+            raise ValueError("geoformer.pth requires hidden_dim=768, num_layers=12, num_heads=12.")
+        resnet = torchvision_models.resnet101(weights=None)
+        self.resnet = nn.Sequential(*list(resnet.children())[:-2])
+        config = T5Config(
+            vocab_size=32200,
+            d_model=hidden_dim,
+            d_kv=hidden_dim // num_heads,
+            d_ff=hidden_dim * 4,
+            num_layers=num_layers,
+            num_decoder_layers=num_layers,
+            num_heads=num_heads,
+            relative_attention_num_buckets=32,
+            dropout_rate=0.0,
+            feed_forward_proj="relu",
+            pad_token_id=0,
+            eos_token_id=1,
+            decoder_start_token_id=0,
         )
-        base_h, base_w = self.patch_embed.grid_size
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.dist_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, base_h * base_w + 2, embed_dim))
-        self.pos_drop = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList(
-            [
-                nn.TransformerEncoderLayer(
-                    d_model=embed_dim,
-                    nhead=num_heads,
-                    dim_feedforward=int(embed_dim * mlp_ratio),
-                    dropout=dropout,
-                    activation="gelu",
-                    batch_first=True,
-                    norm_first=True,
-                )
-                for _ in range(depth)
-            ]
-        )
-        self.norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Linear(embed_dim, proj_dim)
-        self.head_dist = nn.Linear(embed_dim, proj_dim)
-        self._init_weights()
+        t5_encoder = T5EncoderModel(config)
+        self.shared = t5_encoder.shared
+        self.encoder = t5_encoder.encoder
+        self.encoder.visual_embedding = GeoFormerVisualEmbedding(hidden_dim=hidden_dim)
 
-    def _init_weights(self):
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-        nn.init.trunc_normal_(self.dist_token, std=0.02)
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.trunc_normal_(module.weight, std=0.02)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.LayerNorm):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
+    def forward(self, images: torch.Tensor, image_order_id: int) -> Tuple[torch.Tensor, Tuple[int, int], torch.Tensor]:
+        x = self.resnet[0](images)
+        x = self.resnet[1](x)
+        x = self.resnet[2](x)
+        x = self.resnet[3](x)
+        x = self.resnet[4](x)
+        x = self.resnet[5](x)
+        fine_map = self.resnet[6](x)
+        feat_map = self.resnet[7](fine_map)
+        tokens, grid_hw = self.encoder.visual_embedding(feat_map, image_order_id=image_order_id)
+        encoded = self.encoder(inputs_embeds=tokens, return_dict=True).last_hidden_state
+        return encoded, grid_hw, fine_map
 
-    def _pos_embed_for_grid(self, grid_hw: Tuple[int, int]) -> torch.Tensor:
-        grid_h, grid_w = int(grid_hw[0]), int(grid_hw[1])
-        cls_pos = self.pos_embed[:, :2]
-        patch_pos = self.pos_embed[:, 2:]
-        base_h, base_w = self.patch_embed.grid_size
-        if (grid_h, grid_w) == (base_h, base_w):
-            return self.pos_embed
-        patch_pos = patch_pos.reshape(1, base_h, base_w, -1).permute(0, 3, 1, 2)
-        patch_pos = F.interpolate(
-            patch_pos,
-            size=(grid_h, grid_w),
-            mode="bicubic",
-            align_corners=False,
-        )
-        patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, grid_h * grid_w, -1)
-        return torch.cat([cls_pos, patch_pos], dim=1)
 
-    def forward_features(self, x):
-        patch_tokens, grid_hw = self.patch_embed(x)
-        batch_size = int(patch_tokens.shape[0])
-        cls_token = self.cls_token.expand(batch_size, -1, -1)
-        dist_token = self.dist_token.expand(batch_size, -1, -1)
-        tokens = torch.cat([cls_token, dist_token, patch_tokens], dim=1)
-        tokens = self.pos_drop(tokens + self._pos_embed_for_grid(grid_hw))
-        for block in self.blocks:
-            tokens = block(tokens)
-        tokens = self.norm(tokens)
-        return tokens, grid_hw
+def load_geoformer_pretrained(model: nn.Module, checkpoint_path: str) -> Dict[str, int]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"Expected GeoFormer state_dict dict, got {type(checkpoint)}.")
 
-    def forward(self, x):
-        tokens, _ = self.forward_features(x)
-        cls_out = self.head(tokens[:, 0])
-        dist_out = self.head_dist(tokens[:, 1])
-        return F.normalize(0.5 * (cls_out + dist_out), p=2, dim=1)
+    mapped_state: Dict[str, torch.Tensor] = {}
+    skipped_decoder = 0
+    for key, value in checkpoint.items():
+        clean_key = key.removeprefix("module.")
+        if clean_key.startswith("decoder.") or clean_key.startswith("lm_head."):
+            skipped_decoder += 1
+            continue
+        if clean_key.startswith("resnet."):
+            mapped_state[f"geoformer.{clean_key}"] = value
+        elif clean_key.startswith("shared.") or clean_key.startswith("encoder."):
+            mapped_state[f"geoformer.{clean_key}"] = value
+
+    model_state = model.state_dict()
+    compatible_state = {}
+    skipped_shape = 0
+    skipped_missing = 0
+    for key, value in mapped_state.items():
+        if key not in model_state:
+            skipped_missing += 1
+            continue
+        if tuple(model_state[key].shape) != tuple(value.shape):
+            skipped_shape += 1
+            continue
+        compatible_state[key] = value
+    result = model.load_state_dict(compatible_state, strict=False)
+    return {
+        "loaded": len(compatible_state),
+        "skipped_decoder": skipped_decoder,
+        "skipped_missing": skipped_missing,
+        "skipped_shape": skipped_shape,
+        "model_missing": len(result.missing_keys),
+        "unexpected": len(result.unexpected_keys),
+    }
 
 
 class TransGeoGrounding(nn.Module):
@@ -194,78 +211,99 @@ class TransGeoGrounding(nn.Module):
         patch_size: int = PATCH_SIZE,
     ):
         super().__init__()
-        self.query_net = DistilledViTBranch(
-            image_size=drone_size,
-            embed_dim=embed_dim,
-            depth=depth,
+        del sat_size, drone_size, patch_size
+        self.geoformer = GeoFormerImageEncoder(
+            hidden_dim=embed_dim,
+            num_layers=depth,
             num_heads=num_heads,
-            proj_dim=proj_dim,
-            patch_size=patch_size,
         )
-        self.reference_net = DistilledViTBranch(
-            image_size=sat_size,
-            embed_dim=embed_dim,
-            depth=depth,
-            num_heads=num_heads,
-            proj_dim=proj_dim,
-            patch_size=patch_size,
+        self.query_global = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, proj_dim),
+        )
+        self.reference_global = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, proj_dim),
         )
         self.query_detail = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, detail_dim),
+            nn.Conv2d(1024, detail_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(detail_dim),
+            nn.GELU(),
+            nn.Conv2d(detail_dim, detail_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(detail_dim),
+            nn.GELU(),
         )
         self.reference_detail = nn.Sequential(
-            nn.Conv2d(embed_dim, detail_dim, kernel_size=1),
+            nn.Conv2d(1024, detail_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(detail_dim),
+            nn.GELU(),
+            nn.Conv2d(detail_dim, detail_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(detail_dim),
+            nn.GELU(),
+        )
+        self.bbox_head = nn.Sequential(
+            nn.Conv2d(detail_dim * 2 + 1, detail_dim, kernel_size=3, padding=1),
             nn.BatchNorm2d(detail_dim),
             nn.GELU(),
             nn.Conv2d(detail_dim, detail_dim, kernel_size=3, padding=1),
-        )
-        self.bbox_head = nn.Sequential(
-            nn.Conv2d(detail_dim * 2, detail_dim, kernel_size=3, padding=1),
             nn.BatchNorm2d(detail_dim),
             nn.GELU(),
             nn.Conv2d(detail_dim, 4, kernel_size=1),
         )
         self.logit_scale = nn.Parameter(torch.tensor(np.log(1 / 0.07), dtype=torch.float32))
         self.temperature = nn.Parameter(torch.tensor(0.07, dtype=torch.float32))
+        self.heat_kernel_size = 3
 
     def _reference_feature_map(self, tokens, grid_hw: Tuple[int, int]):
-        patch_tokens = tokens[:, 2:]
         grid_h, grid_w = int(grid_hw[0]), int(grid_hw[1])
-        return patch_tokens.transpose(1, 2).reshape(tokens.shape[0], -1, grid_h, grid_w)
+        return tokens.transpose(1, 2).reshape(tokens.shape[0], -1, grid_h, grid_w)
+
+    def _dynamic_heatmap(self, query_detail_map: torch.Tensor, aerial_detail: torch.Tensor) -> torch.Tensor:
+        if query_detail_map.ndim != 4:
+            raise ValueError(f"Expected query_detail_map shape (B, C, H, W), got {tuple(query_detail_map.shape)}.")
+        if aerial_detail.ndim != 4:
+            raise ValueError(f"Expected aerial_detail shape (B, C, H, W), got {tuple(aerial_detail.shape)}.")
+        if query_detail_map.shape[0] != aerial_detail.shape[0] or query_detail_map.shape[1] != aerial_detail.shape[1]:
+            raise ValueError(
+                f"Query/aerial detail mismatch: query={tuple(query_detail_map.shape)}, "
+                f"aerial={tuple(aerial_detail.shape)}."
+            )
+
+        batch_size, channels, height, width = aerial_detail.shape
+        kernel = F.adaptive_avg_pool2d(
+            query_detail_map,
+            (self.heat_kernel_size, self.heat_kernel_size),
+        )
+        kernel = kernel - kernel.mean(dim=(2, 3), keepdim=True)
+        kernel = F.normalize(kernel.flatten(1), p=2, dim=1).view_as(kernel)
+        sat_features = F.normalize(aerial_detail.contiguous(), p=2, dim=1)
+        conv_input = sat_features.reshape(1, batch_size * channels, height, width)
+        conv_kernel = kernel.reshape(batch_size, channels, self.heat_kernel_size, self.heat_kernel_size)
+        heatmap = F.conv2d(
+            conv_input,
+            conv_kernel,
+            padding=self.heat_kernel_size // 2,
+            groups=batch_size,
+        )
+        return heatmap.view(batch_size, 1, height, width)
 
     def forward(self, query_imgs, aerial_imgs):
-        query_tokens, _ = self.query_net.forward_features(query_imgs)
-        aerial_tokens, aerial_grid_hw = self.reference_net.forward_features(aerial_imgs)
+        query_tokens, _, query_fine_map = self.geoformer(query_imgs, image_order_id=0)
+        aerial_tokens, _, aerial_fine_map = self.geoformer(aerial_imgs, image_order_id=1)
 
-        query_global = F.normalize(
-            0.5
-            * (
-                self.query_net.head(query_tokens[:, 0])
-                + self.query_net.head_dist(query_tokens[:, 1])
-            ),
-            p=2,
-            dim=1,
-        )
-        aerial_global = F.normalize(
-            0.5
-            * (
-                self.reference_net.head(aerial_tokens[:, 0])
-                + self.reference_net.head_dist(aerial_tokens[:, 1])
-            ),
-            p=2,
-            dim=1,
-        )
+        query_global = F.normalize(self.query_global(query_tokens.mean(dim=1)), p=2, dim=1)
+        aerial_global = F.normalize(self.reference_global(aerial_tokens.mean(dim=1)), p=2, dim=1)
 
-        query_patch_mean = query_tokens[:, 2:].mean(dim=1)
-        ground_detail = F.normalize(self.query_detail(query_patch_mean), p=2, dim=1)
-        aerial_map = self._reference_feature_map(aerial_tokens, aerial_grid_hw)
-        aerial_detail = F.normalize(self.reference_detail(aerial_map), p=2, dim=1)
+        query_detail_map = F.normalize(self.query_detail(query_fine_map), p=2, dim=1)
+        aerial_detail = F.normalize(self.reference_detail(aerial_fine_map), p=2, dim=1)
+        ground_detail = F.normalize(F.adaptive_avg_pool2d(query_detail_map, 1).flatten(1), p=2, dim=1)
 
         temp = self.temperature.clamp(min=0.01, max=1.0)
-        heatmap_logits = torch.einsum("bd,bdhw->bhw", ground_detail, aerial_detail) / temp
+        heatmap_logits = self._dynamic_heatmap(query_detail_map, aerial_detail) / temp
+        heat_gate = F.softmax(heatmap_logits.flatten(1), dim=1).view_as(heatmap_logits)
+        heat_gate = heat_gate * float(heat_gate.shape[-2] * heat_gate.shape[-1])
         query_map = ground_detail[:, :, None, None].expand_as(aerial_detail)
-        bbox_raw = self.bbox_head(torch.cat([aerial_detail, query_map], dim=1))
+        bbox_raw = self.bbox_head(torch.cat([aerial_detail, query_map, heat_gate], dim=1))
 
         scale = self.logit_scale.exp().clamp(max=100.0)
         retrieval_logits = scale * query_global @ aerial_global.t()
@@ -275,8 +313,9 @@ class TransGeoGrounding(nn.Module):
             "aerial_global": aerial_global,
             "ground_detail": ground_detail,
             "aerial_detail": aerial_detail,
-            "heatmap_logits": heatmap_logits.unsqueeze(1),
+            "heatmap_logits": heatmap_logits,
             "bbox_raw": bbox_raw,
+            "logit_scale": scale,
             "retrieval_logits": retrieval_logits,
         }
 
@@ -438,6 +477,14 @@ def build_dataloaders(args):
         tokenizer=tokenizer,
         split="test",
     )
+    raw_val_count = len(val_dataset)
+    val_fraction = float(args.val_fraction)
+    if val_fraction <= 0.0 or val_fraction > 1.0:
+        raise ValueError(f"Expected --val-fraction in (0, 1], got {val_fraction}.")
+    if val_fraction < 1.0:
+        step = max(int(round(1.0 / val_fraction)), 1)
+        val_indices = list(range(0, raw_val_count, step))
+        val_dataset = Subset(val_dataset, val_indices)
 
     train_loader = DataLoader(
         train_dataset,
@@ -463,14 +510,16 @@ def build_dataloaders(args):
 
 
 def adjust_learning_rate(args, optimizer, epoch):
-    if epoch < args.warmup_epochs:
-        lr = args.lr * float(epoch + 1) / max(float(args.warmup_epochs), 1.0)
-    else:
-        progress = (epoch - args.warmup_epochs) / max(float(args.max_epoch - args.warmup_epochs), 1.0)
-        lr = args.min_lr + 0.5 * (args.lr - args.min_lr) * (1.0 + np.cos(np.pi * progress))
-    print(("lr", lr))
     for param_group in optimizer.param_groups:
+        base_lr = float(param_group.get("base_lr", args.lr))
+        min_lr = float(args.min_lr) * base_lr / max(float(args.lr), 1e-12)
+        if epoch < args.warmup_epochs:
+            lr = base_lr * float(epoch + 1) / max(float(args.warmup_epochs), 1.0)
+        else:
+            progress = (epoch - args.warmup_epochs) / max(float(args.max_epoch - args.warmup_epochs), 1.0)
+            lr = min_lr + 0.5 * (base_lr - min_lr) * (1.0 + np.cos(np.pi * progress))
         param_group["lr"] = lr
+    print(("lr", [param_group["lr"] for param_group in optimizer.param_groups]))
 
 
 def main(args):
@@ -498,8 +547,40 @@ def main(args):
         num_heads=args.num_heads,
         patch_size=args.patch_size,
     ).to(DEVICE)
+    if args.pretrained_checkpoint:
+        if not os.path.exists(args.pretrained_checkpoint):
+            raise FileNotFoundError(f"GeoFormer checkpoint not found: {args.pretrained_checkpoint}")
+        load_info = load_geoformer_pretrained(model, args.pretrained_checkpoint)
+        print(f"Loaded GeoFormer checkpoint: {load_info}")
+    if args.freeze_geoformer:
+        for param in model.geoformer.parameters():
+            param.requires_grad = False
+        print("Frozen GeoFormer backbone; training retrieval/detail/bbox heads only.")
 
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.freeze_geoformer:
+        trainable_params = [param for param in model.parameters() if param.requires_grad]
+        optimizer = AdamW(
+            [{"params": trainable_params, "lr": args.lr, "base_lr": args.lr}],
+            weight_decay=args.weight_decay,
+        )
+    else:
+        backbone_params = [param for param in model.geoformer.parameters() if param.requires_grad]
+        head_params = [
+            param
+            for name, param in model.named_parameters()
+            if param.requires_grad and not name.startswith("geoformer.")
+        ]
+        optimizer = AdamW(
+            [
+                {"params": backbone_params, "lr": args.backbone_lr, "base_lr": args.backbone_lr},
+                {"params": head_params, "lr": args.lr, "base_lr": args.lr},
+            ],
+            weight_decay=args.weight_decay,
+        )
+        print(
+            f"Optimizer param groups: geoformer lr={args.backbone_lr:.2e}, "
+            f"heads lr={args.lr:.2e}"
+        )
     best_iou = -1.0
 
     print(f"Starting training for {args.max_epoch} epochs...")
@@ -538,9 +619,16 @@ if __name__ == "__main__":
     parser.add_argument("--max-epoch", type=int, default=NUM_EPOCHS)
     parser.add_argument("--warmup-epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=LEARNING_RATE)
+    parser.add_argument("--backbone-lr", type=float, default=BACKBONE_LEARNING_RATE)
     parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=VAL_FRACTION,
+        help="fraction of the validation split evaluated each epoch",
+    )
     parser.add_argument(
         "--sat-size",
         type=int,
@@ -564,6 +652,24 @@ if __name__ == "__main__":
     parser.add_argument("--localization-loss-weight", type=float, default=LOCALIZATION_LOSS_WEIGHT)
     parser.add_argument("--bbox-loss-weight", type=float, default=BBOX_LOSS_WEIGHT)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument(
+        "--pretrained-checkpoint",
+        type=str,
+        default=PRETRAINED_CHECKPOINT,
+        help="GeoFormer checkpoint used to initialize ResNet101 + T5 visual encoder",
+    )
+    parser.add_argument(
+        "--no-pretrained-checkpoint",
+        dest="pretrained_checkpoint",
+        action="store_const",
+        const=None,
+        help="Disable GeoFormer checkpoint initialization",
+    )
+    parser.add_argument(
+        "--freeze-geoformer",
+        action="store_true",
+        help="Freeze the loaded GeoFormer backbone and train only task heads",
+    )
     parser.add_argument(
         "--checkpoint",
         type=str,

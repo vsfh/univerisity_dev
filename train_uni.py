@@ -25,9 +25,10 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.nn.functional as F
+import timm
 from PIL import Image
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -44,8 +45,9 @@ from grounding.utils.utils import AverageMeter
 SAT_SIZE = (768, 432)  # (width, height)
 DRONE_SIZE = (256, 256)  # (width, height)
 BATCH_SIZE = 16
-NUM_EPOCHS = 8
+NUM_EPOCHS = 40
 LEARNING_RATE = 4.5e-4
+BACKBONE_LEARNING_RATE = 1e-5
 WEIGHT_DECAY = 0.04
 PRINT_FREQ = 50
 PROJECTION_DIM = 768
@@ -54,12 +56,21 @@ RETRIEVAL_LOSS_WEIGHT = 1.0
 LOCALIZATION_LOSS_WEIGHT = 1.0
 BBOX_LOSS_WEIGHT = 5.0
 RERANK_LOSS_WEIGHT = 1.0
+RETRIEVAL_ONLY_EPOCHS = 0
+GROUNDING_RAMP_EPOCHS = 1
+RERANK_START_EPOCH = 1
+MEMORY_QUEUE_SIZE = 0
+BACKBONE_NAME = "swin_small_patch4_window7_224"
+PRETRAINED_CHECKPOINT = "/media/data1/feihong/ckpt/pretrained/smgeo/swin_s_imagenet1k_v1.pth"
+VAL_FRACTION = 0.25
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
 class TransformProcessorWrapper:
     def __init__(self, image_size: Tuple[int, int]):
         self.size = {"height": int(image_size[1]), "width": int(image_size[0])}
+        self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
     def __call__(self, images, return_tensors="pt"):
         target_h = int(self.size["height"])
@@ -68,6 +79,7 @@ class TransformProcessorWrapper:
             images = images.resize((target_w, target_h), Image.Resampling.BILINEAR)
         image_np = np.array(images, dtype=np.float32) / 255.0
         pixel_values = torch.from_numpy(image_np).permute(2, 0, 1)
+        pixel_values = (pixel_values - self.mean) / self.std
         return {"pixel_values": pixel_values.unsqueeze(0)}
 
 
@@ -210,6 +222,14 @@ class GroundDetailProjector(nn.Module):
             nn.BatchNorm2d(detail_dim),
             nn.GELU(),
         )
+        self.map_refine = nn.Sequential(
+            nn.Conv2d(detail_dim, detail_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(detail_dim),
+            nn.GELU(),
+            nn.Conv2d(detail_dim, detail_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(detail_dim),
+            nn.GELU(),
+        )
         self.column_fc = nn.Sequential(
             nn.Conv1d(detail_dim, detail_dim, kernel_size=1),
             nn.GELU(),
@@ -217,11 +237,13 @@ class GroundDetailProjector(nn.Module):
         )
 
     def forward(self, feat):
-        feat = self.reduce(feat)
+        feat = self.map_refine(self.reduce(feat))
         # Aggregate vertically and then summarize azimuth/column information.
         columns = feat.mean(dim=2)
         columns = self.column_fc(columns)
-        return F.normalize(columns.mean(dim=-1), p=2, dim=1)
+        detail_vector = F.normalize(columns.mean(dim=-1), p=2, dim=1)
+        detail_map = F.normalize(feat, p=2, dim=1)
+        return detail_vector, detail_map
 
 
 class AerialDetailProjector(nn.Module):
@@ -242,19 +264,54 @@ class LocalizationDecoder(nn.Module):
     def __init__(self, detail_dim: int):
         super().__init__()
         self.temperature = nn.Parameter(torch.tensor(0.07))
+        self.heat_kernel_size = 3
         self.bbox_head = nn.Sequential(
-            nn.Conv2d(detail_dim * 2, detail_dim, kernel_size=3, padding=1),
+            nn.Conv2d(detail_dim * 2 + 1, detail_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(detail_dim),
+            nn.GELU(),
+            nn.Conv2d(detail_dim, detail_dim, kernel_size=3, padding=1),
             nn.BatchNorm2d(detail_dim),
             nn.GELU(),
             nn.Conv2d(detail_dim, 4, kernel_size=1),
         )
 
-    def forward(self, ground_detail, aerial_detail):
+    def _dynamic_heatmap(self, ground_detail_map, aerial_detail):
+        if ground_detail_map.ndim != 4:
+            raise ValueError(f"Expected ground_detail_map shape (B, C, H, W), got {tuple(ground_detail_map.shape)}.")
+        if aerial_detail.ndim != 4:
+            raise ValueError(f"Expected aerial_detail shape (B, C, H, W), got {tuple(aerial_detail.shape)}.")
+        if ground_detail_map.shape[0] != aerial_detail.shape[0] or ground_detail_map.shape[1] != aerial_detail.shape[1]:
+            raise ValueError(
+                f"Ground/aerial detail mismatch: ground={tuple(ground_detail_map.shape)}, "
+                f"aerial={tuple(aerial_detail.shape)}."
+            )
+
+        batch_size, channels, height, width = aerial_detail.shape
+        kernel = F.adaptive_avg_pool2d(
+            ground_detail_map,
+            (self.heat_kernel_size, self.heat_kernel_size),
+        )
+        kernel = kernel - kernel.mean(dim=(2, 3), keepdim=True)
+        kernel = F.normalize(kernel.flatten(1), p=2, dim=1).view_as(kernel)
+        aerial_detail = F.normalize(aerial_detail.contiguous(), p=2, dim=1)
+        conv_input = aerial_detail.reshape(1, batch_size * channels, height, width)
+        conv_kernel = kernel.reshape(batch_size, channels, self.heat_kernel_size, self.heat_kernel_size)
+        heatmap = F.conv2d(
+            conv_input,
+            conv_kernel,
+            padding=self.heat_kernel_size // 2,
+            groups=batch_size,
+        )
+        return heatmap.view(batch_size, 1, height, width)
+
+    def forward(self, ground_detail, ground_detail_map, aerial_detail):
         temp = self.temperature.clamp(min=0.01, max=1.0)
-        heatmap_logits = torch.einsum("bd,bdhw->bhw", ground_detail, aerial_detail) / temp
+        heatmap_logits = self._dynamic_heatmap(ground_detail_map, aerial_detail) / temp
+        heat_gate = F.softmax(heatmap_logits.flatten(1), dim=1).view_as(heatmap_logits)
+        heat_gate = heat_gate * float(heat_gate.shape[-2] * heat_gate.shape[-1])
         query_map = ground_detail[:, :, None, None].expand_as(aerial_detail)
-        bbox_raw = self.bbox_head(torch.cat([aerial_detail, query_map], dim=1))
-        return heatmap_logits.unsqueeze(1), bbox_raw
+        bbox_raw = self.bbox_head(torch.cat([aerial_detail, query_map, heat_gate], dim=1))
+        return heatmap_logits, bbox_raw
 
     def batch_rerank_logits(self, ground_detail, aerial_detail, retrieval_logits):
         temp = self.temperature.clamp(min=0.01, max=1.0)
@@ -263,20 +320,202 @@ class LocalizationDecoder(nn.Module):
         return retrieval_logits + detail_scores
 
 
+def _map_torchvision_swin_key(key: str) -> Optional[str]:
+    parts = key.split(".")
+    if parts[:2] == ["features", "0"]:
+        if parts[2] == "0":
+            return "patch_embed.proj." + ".".join(parts[3:])
+        if parts[2] == "2":
+            return "patch_embed.norm." + ".".join(parts[3:])
+    if parts[0] == "features" and parts[1] in {"1", "3", "5", "7"}:
+        layer_map = {"1": "layers_0", "3": "layers_1", "5": "layers_2", "7": "layers_3"}
+        rest = parts[3:]
+        if rest[:2] == ["mlp", "0"]:
+            rest = ["mlp", "fc1"] + rest[2:]
+        elif rest[:2] == ["mlp", "3"]:
+            rest = ["mlp", "fc2"] + rest[2:]
+        return f"{layer_map[parts[1]]}.blocks.{parts[2]}." + ".".join(rest)
+    if parts[0] == "features" and parts[1] in {"2", "4", "6"}:
+        layer_map = {"2": "layers_1", "4": "layers_2", "6": "layers_3"}
+        if parts[2] == "reduction":
+            return f"{layer_map[parts[1]]}.downsample.reduction." + ".".join(parts[3:])
+        if parts[2] == "norm":
+            return f"{layer_map[parts[1]]}.downsample.norm." + ".".join(parts[3:])
+    return None
+
+
+def load_feature_backbone_checkpoint(backbone: nn.Module, checkpoint_path: str, backbone_name: str) -> Dict[str, int]:
+    if not checkpoint_path:
+        return {"loaded": 0, "skipped": 0, "shape_mismatch": 0, "missing_after_load": 0}
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Backbone checkpoint not found: {checkpoint_path}")
+
+    state = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    elif isinstance(state, dict) and "model" in state:
+        state = state["model"]
+    if not isinstance(state, dict):
+        raise TypeError(f"Expected checkpoint dict, got {type(state)}.")
+
+    model_state = backbone.state_dict()
+    candidates: Dict[str, torch.Tensor] = {}
+    skipped = 0
+    shape_mismatch = 0
+    for key, value in state.items():
+        clean_key = str(key).removeprefix("module.").removeprefix("backbone.")
+        mapped_key = clean_key
+        if mapped_key not in model_state and "swin" in backbone_name:
+            mapped_key = _map_torchvision_swin_key(clean_key) or clean_key
+        if mapped_key not in model_state:
+            skipped += 1
+            continue
+        if tuple(model_state[mapped_key].shape) != tuple(value.shape):
+            shape_mismatch += 1
+            continue
+        candidates[mapped_key] = value
+
+    result = backbone.load_state_dict(candidates, strict=False)
+    return {
+        "loaded": len(candidates),
+        "skipped": skipped,
+        "shape_mismatch": shape_mismatch,
+        "missing_after_load": len(result.missing_keys),
+    }
+
+
+class TimmHierarchicalBranch(nn.Module):
+    """ConvNeXt feature pyramid branch for coarse-to-fine cross-view matching."""
+
+    def __init__(
+        self,
+        backbone_name: str = "convnext_tiny",
+        pretrained: bool = False,
+        pretrained_checkpoint: Optional[str] = None,
+        detail_dim: int = 384,
+        image_size: Tuple[int, int] = DRONE_SIZE,
+    ):
+        super().__init__()
+        image_h = int(image_size[1])
+        image_w = int(image_size[0])
+        create_kwargs = {
+            "pretrained": pretrained and not pretrained_checkpoint,
+            "features_only": True,
+            "out_indices": (1, 2, 3),
+        }
+        if "swin" in backbone_name:
+            create_kwargs["img_size"] = (image_h, image_w)
+        self.backbone = timm.create_model(backbone_name, **create_kwargs)
+        if pretrained_checkpoint:
+            load_info = load_feature_backbone_checkpoint(self.backbone, pretrained_checkpoint, backbone_name)
+            print(f"Loaded {backbone_name} backbone checkpoint: {load_info}")
+        channels = self.backbone.feature_info.channels()
+        if len(channels) != 3:
+            raise ValueError(f"Expected three feature levels from {backbone_name}, got {channels}.")
+
+        fine_channels, mid_channels, deep_channels = [int(v) for v in channels]
+        self.feature_channels = (fine_channels, mid_channels, deep_channels)
+        self.out_dim = int(detail_dim)
+        self.fine_proj = nn.Sequential(
+            nn.Conv2d(fine_channels, detail_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(detail_dim),
+            nn.GELU(),
+        )
+        self.mid_proj = nn.Sequential(
+            nn.Conv2d(mid_channels, detail_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(detail_dim),
+            nn.GELU(),
+        )
+        self.deep_proj = nn.Sequential(
+            nn.Conv2d(deep_channels, detail_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(detail_dim),
+            nn.GELU(),
+        )
+        self.fpn = nn.Sequential(
+            nn.Conv2d(detail_dim * 3, detail_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(detail_dim),
+            nn.GELU(),
+            nn.Conv2d(detail_dim, detail_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(detail_dim),
+            nn.GELU(),
+        )
+        self.semantic_refine = nn.Sequential(
+            nn.Conv2d(detail_dim, detail_dim, kernel_size=3, padding=1, groups=detail_dim, bias=False),
+            nn.Conv2d(detail_dim, detail_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(detail_dim),
+            nn.GELU(),
+        )
+
+    def _to_nchw(self, feat: torch.Tensor, expected_channels: int) -> torch.Tensor:
+        if feat.ndim != 4:
+            raise ValueError(f"Expected 4D feature map, got {tuple(feat.shape)}.")
+        if feat.shape[1] == expected_channels:
+            return feat.contiguous()
+        if feat.shape[-1] == expected_channels:
+            return feat.permute(0, 3, 1, 2).contiguous()
+        raise ValueError(
+            f"Cannot infer feature layout for shape {tuple(feat.shape)} "
+            f"with expected channels={expected_channels}."
+        )
+
+    def forward(self, x):
+        fine_raw, mid_raw, deep_raw = self.backbone(x)
+        fine_raw = self._to_nchw(fine_raw, self.feature_channels[0])
+        mid_raw = self._to_nchw(mid_raw, self.feature_channels[1])
+        deep_raw = self._to_nchw(deep_raw, self.feature_channels[2])
+        fine = self.fine_proj(fine_raw)
+        mid = F.interpolate(
+            self.mid_proj(mid_raw),
+            size=fine.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        deep = self.deep_proj(deep_raw)
+        deep_up = F.interpolate(
+            deep,
+            size=fine.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        fused = self.fpn(torch.cat([fine, mid, deep_up], dim=1))
+        semantic = self.semantic_refine(deep)
+        return {
+            "multi_scale": (fine, mid, semantic),
+            "fine": fused,
+            "semantic": semantic,
+        }
+
+
 class UnifyGeoLite(nn.Module):
     def __init__(
         self,
         proj_dim: int = PROJECTION_DIM,
         detail_dim: int = 384,
         dims: Tuple[int, int, int] = (96, 192, 384),
+        backbone_name: str = BACKBONE_NAME,
+        pretrained_backbone: bool = False,
+        pretrained_checkpoint: Optional[str] = PRETRAINED_CHECKPOINT,
     ):
         super().__init__()
-        self.ground_encoder = BranchEncoder(dims=dims)
-        self.aerial_encoder = BranchEncoder(dims=dims)
-        self.ground_aggregator = SelfAttentionAggregator(dims[-1], proj_dim)
-        self.aerial_aggregator = SelfAttentionAggregator(dims[-1], proj_dim)
-        self.ground_detail = GroundDetailProjector(dims[-1], detail_dim)
-        self.aerial_detail = AerialDetailProjector(dims[-1], detail_dim)
+        del dims
+        self.ground_encoder = TimmHierarchicalBranch(
+            backbone_name=backbone_name,
+            pretrained=pretrained_backbone,
+            pretrained_checkpoint=pretrained_checkpoint,
+            detail_dim=detail_dim,
+            image_size=DRONE_SIZE,
+        )
+        self.aerial_encoder = TimmHierarchicalBranch(
+            backbone_name=backbone_name,
+            pretrained=pretrained_backbone,
+            pretrained_checkpoint=pretrained_checkpoint,
+            detail_dim=detail_dim,
+            image_size=SAT_SIZE,
+        )
+        self.ground_aggregator = SelfAttentionAggregator(detail_dim, proj_dim)
+        self.aerial_aggregator = SelfAttentionAggregator(detail_dim, proj_dim)
+        self.ground_detail = GroundDetailProjector(detail_dim, detail_dim)
+        self.aerial_detail = AerialDetailProjector(detail_dim, detail_dim)
         self.decoder = LocalizationDecoder(detail_dim)
         self.logit_scale = nn.Parameter(torch.tensor(np.log(1 / 0.07), dtype=torch.float32))
 
@@ -286,10 +525,10 @@ class UnifyGeoLite(nn.Module):
 
         query_global = self.ground_aggregator(ground["semantic"])
         aerial_global = self.aerial_aggregator(aerial["semantic"])
-        ground_detail = self.ground_detail(ground["fine"])
+        ground_detail, ground_detail_map = self.ground_detail(ground["fine"])
         aerial_detail = self.aerial_detail(aerial["fine"])
 
-        heatmap_logits, bbox_raw = self.decoder(ground_detail, aerial_detail)
+        heatmap_logits, bbox_raw = self.decoder(ground_detail, ground_detail_map, aerial_detail)
         scale = self.logit_scale.exp().clamp(max=100.0)
         retrieval_logits = scale * query_global @ aerial_global.t()
         rerank_logits = self.decoder.batch_rerank_logits(
@@ -305,6 +544,7 @@ class UnifyGeoLite(nn.Module):
             "aerial_detail": aerial_detail,
             "heatmap_logits": heatmap_logits,
             "bbox_raw": bbox_raw,
+            "logit_scale": scale,
             "retrieval_logits": retrieval_logits,
             "rerank_logits": rerank_logits,
         }
@@ -323,6 +563,90 @@ def symmetric_info_nce(logits, label_smoothing: float = 0.1):
     loss_q2r = F.cross_entropy(logits, labels, label_smoothing=label_smoothing)
     loss_r2q = F.cross_entropy(logits.t(), labels, label_smoothing=label_smoothing)
     return 0.5 * (loss_q2r + loss_r2q)
+
+
+class RetrievalMemoryQueue:
+    """Detached cross-batch negatives for the global retrieval objective."""
+
+    def __init__(self, capacity: int):
+        self.capacity = max(0, int(capacity))
+        self.query_feats: Optional[torch.Tensor] = None
+        self.aerial_feats: Optional[torch.Tensor] = None
+
+    def __len__(self) -> int:
+        if self.query_feats is None:
+            return 0
+        return int(self.query_feats.shape[0])
+
+    def enqueue(self, query_feats: torch.Tensor, aerial_feats: torch.Tensor) -> None:
+        if self.capacity <= 0:
+            return
+        query_feats = F.normalize(query_feats.detach(), p=2, dim=1).cpu()
+        aerial_feats = F.normalize(aerial_feats.detach(), p=2, dim=1).cpu()
+        if self.query_feats is None:
+            self.query_feats = query_feats[-self.capacity :]
+            self.aerial_feats = aerial_feats[-self.capacity :]
+            return
+        self.query_feats = torch.cat([self.query_feats, query_feats], dim=0)[-self.capacity :]
+        self.aerial_feats = torch.cat([self.aerial_feats, aerial_feats], dim=0)[-self.capacity :]
+
+    def get(self, device: torch.device) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.query_feats is None or self.aerial_feats is None:
+            return None, None
+        return (
+            self.query_feats.to(device=device, non_blocking=True),
+            self.aerial_feats.to(device=device, non_blocking=True),
+        )
+
+
+def retrieval_loss_with_memory(
+    query_feats: torch.Tensor,
+    aerial_feats: torch.Tensor,
+    logit_scale: torch.Tensor,
+    memory_queue: Optional[RetrievalMemoryQueue],
+    label_smoothing: float,
+) -> torch.Tensor:
+    query_feats = F.normalize(query_feats, p=2, dim=1)
+    aerial_feats = F.normalize(aerial_feats, p=2, dim=1)
+    logits = logit_scale * query_feats @ aerial_feats.t()
+    labels = torch.arange(query_feats.shape[0], device=query_feats.device)
+    if memory_queue is None or len(memory_queue) == 0:
+        return 0.5 * (
+            F.cross_entropy(logits, labels, label_smoothing=label_smoothing)
+            + F.cross_entropy(logits.t(), labels, label_smoothing=label_smoothing)
+        )
+
+    memory_query, memory_aerial = memory_queue.get(query_feats.device)
+    if memory_query is None or memory_aerial is None:
+        return symmetric_info_nce(logits, label_smoothing=label_smoothing)
+
+    query_logits = torch.cat([logits, logit_scale * query_feats @ memory_aerial.t()], dim=1)
+    aerial_logits = torch.cat([logits.t(), logit_scale * aerial_feats @ memory_query.t()], dim=1)
+    return 0.5 * (
+        F.cross_entropy(query_logits, labels, label_smoothing=label_smoothing)
+        + F.cross_entropy(aerial_logits, labels, label_smoothing=label_smoothing)
+    )
+
+
+def scheduled_loss_weights(epoch: int, args) -> Dict[str, float]:
+    retrieval_weight = float(args.retrieval_loss_weight)
+    if epoch < int(args.retrieval_only_epochs):
+        grounding_scale = 0.0
+    else:
+        ramp_epoch = epoch - int(args.retrieval_only_epochs) + 1
+        grounding_scale = min(1.0, ramp_epoch / max(float(args.grounding_ramp_epochs), 1.0))
+
+    rerank_scale = 0.0
+    if epoch >= int(args.rerank_start_epoch):
+        rerank_epoch = epoch - int(args.rerank_start_epoch) + 1
+        rerank_scale = min(1.0, rerank_epoch / max(float(args.grounding_ramp_epochs), 1.0))
+
+    return {
+        "retrieval": retrieval_weight,
+        "localization": float(args.localization_loss_weight) * grounding_scale,
+        "bbox": float(args.bbox_loss_weight) * grounding_scale,
+        "rerank": float(args.rerank_loss_weight) * rerank_scale,
+    }
 
 
 def build_heatmap_target(gt_bbox, feature_hw: Tuple[int, int], image_wh: Tuple[int, int], sigma: float):
@@ -398,10 +722,21 @@ def decode_bbox(heatmap_logits, bbox_raw, image_wh: Tuple[int, int]):
     return torch.stack([x1, y1, x2, y2], dim=1)
 
 
-def compute_losses(outputs: Dict[str, torch.Tensor], gt_bbox, image_wh, args):
+def compute_losses(
+    outputs: Dict[str, torch.Tensor],
+    gt_bbox,
+    image_wh,
+    args,
+    epoch: int,
+    memory_queue: Optional[RetrievalMemoryQueue] = None,
+):
     labels = torch.arange(outputs["retrieval_logits"].shape[0], device=gt_bbox.device)
-    retrieval_loss = symmetric_info_nce(
-        outputs["retrieval_logits"],
+    weights = scheduled_loss_weights(epoch, args)
+    retrieval_loss = retrieval_loss_with_memory(
+        outputs["query_global"],
+        outputs["aerial_global"],
+        outputs["logit_scale"],
+        memory_queue,
         label_smoothing=args.label_smoothing,
     )
     localization_loss = spatial_ce_loss(
@@ -413,20 +748,20 @@ def compute_losses(outputs: Dict[str, torch.Tensor], gt_bbox, image_wh, args):
     bbox_loss = bbox_l1_loss(outputs["bbox_raw"], gt_bbox, image_wh)
     rerank_loss = F.cross_entropy(outputs["rerank_logits"], labels)
     total = (
-        args.retrieval_loss_weight * retrieval_loss
-        + args.localization_loss_weight * localization_loss
-        + args.bbox_loss_weight * bbox_loss
-        + args.rerank_loss_weight * rerank_loss
+        weights["retrieval"] * retrieval_loss
+        + weights["localization"] * localization_loss
+        + weights["bbox"] * bbox_loss
+        + weights["rerank"] * rerank_loss
     )
     return total, {
         "retrieval": retrieval_loss,
         "localization": localization_loss,
         "bbox": bbox_loss,
         "rerank": rerank_loss,
-    }
+    }, weights
 
 
-def train_epoch(loader, model, optimizer, epoch, args):
+def train_epoch(loader, model, optimizer, epoch, args, memory_queue: Optional[RetrievalMemoryQueue] = None):
     model.train()
     meters = {
         "loss": AverageMeter(),
@@ -445,13 +780,22 @@ def train_epoch(loader, model, optimizer, epoch, args):
         image_wh = (aerial_imgs.shape[-1], aerial_imgs.shape[-2])
 
         outputs = model(query_imgs, aerial_imgs)
-        loss, loss_items = compute_losses(outputs, gt_bbox, image_wh, args)
+        loss, loss_items, loss_weights = compute_losses(
+            outputs,
+            gt_bbox,
+            image_wh,
+            args,
+            epoch=epoch,
+            memory_queue=memory_queue,
+        )
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if args.grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
+        if memory_queue is not None:
+            memory_queue.enqueue(outputs["query_global"], outputs["aerial_global"])
 
         bs = query_imgs.shape[0]
         meters["loss"].update(loss.item(), bs)
@@ -468,10 +812,15 @@ def train_epoch(loader, model, optimizer, epoch, args):
                 f"Ret: {meters['retrieval'].val:.4f}\t"
                 f"Loc: {meters['localization'].val:.4f}\t"
                 f"Bbox: {meters['bbox'].val:.4f}\t"
-                f"Rerank: {meters['rerank'].val:.4f}"
+                f"Rerank: {meters['rerank'].val:.4f}\t"
+                f"W(loc/bbox/rerank): {loss_weights['localization']:.3f}/"
+                f"{loss_weights['bbox']:.3f}/{loss_weights['rerank']:.3f}"
             )
 
-    return {name: meter.avg for name, meter in meters.items()}
+    metrics = {name: meter.avg for name, meter in meters.items()}
+    metrics.update({f"weight_{name}": float(value) for name, value in scheduled_loss_weights(epoch, args).items()})
+    metrics["memory_queue_size"] = float(len(memory_queue) if memory_queue is not None else 0)
+    return metrics
 
 
 def validate(loader, model):
@@ -544,6 +893,14 @@ def build_dataloaders(args):
         tokenizer=tokenizer,
         split="test",
     )
+    raw_val_count = len(val_dataset)
+    val_fraction = float(args.val_fraction)
+    if val_fraction <= 0.0 or val_fraction > 1.0:
+        raise ValueError(f"Expected --val-fraction in (0, 1], got {val_fraction}.")
+    if val_fraction < 1.0:
+        step = max(int(round(1.0 / val_fraction)), 1)
+        val_indices = list(range(0, raw_val_count, step))
+        val_dataset = Subset(val_dataset, val_indices)
 
     train_loader = DataLoader(
         train_dataset,
@@ -569,14 +926,16 @@ def build_dataloaders(args):
 
 
 def adjust_learning_rate(args, optimizer, epoch):
-    if epoch < args.warmup_epochs:
-        lr = args.lr * float(epoch + 1) / max(float(args.warmup_epochs), 1.0)
-    else:
-        progress = (epoch - args.warmup_epochs) / max(float(args.max_epoch - args.warmup_epochs), 1.0)
-        lr = args.min_lr + 0.5 * (args.lr - args.min_lr) * (1.0 + np.cos(np.pi * progress))
-    print(("lr", lr))
     for param_group in optimizer.param_groups:
+        base_lr = float(param_group.get("base_lr", args.lr))
+        min_lr = float(args.min_lr) * base_lr / max(float(args.lr), 1e-12)
+        if epoch < args.warmup_epochs:
+            lr = base_lr * float(epoch + 1) / max(float(args.warmup_epochs), 1.0)
+        else:
+            progress = (epoch - args.warmup_epochs) / max(float(args.max_epoch - args.warmup_epochs), 1.0)
+            lr = min_lr + 0.5 * (base_lr - min_lr) * (1.0 + np.cos(np.pi * progress))
         param_group["lr"] = lr
+    print(("lr", [param_group["lr"] for param_group in optimizer.param_groups]))
 
 
 def main(args):
@@ -598,15 +957,42 @@ def main(args):
         proj_dim=args.proj_dim,
         detail_dim=args.detail_dim,
         dims=(args.base_dim, args.base_dim * 2, args.base_dim * 4),
+        backbone_name=args.backbone_name,
+        pretrained_backbone=args.timm_pretrained,
+        pretrained_checkpoint=args.pretrained_checkpoint,
     ).to(DEVICE)
 
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    backbone_params = []
+    head_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith("ground_encoder.backbone.") or name.startswith("aerial_encoder.backbone."):
+            backbone_params.append(param)
+        else:
+            head_params.append(param)
+    optimizer = AdamW(
+        [
+            {"params": backbone_params, "lr": args.backbone_lr, "base_lr": args.backbone_lr},
+            {"params": head_params, "lr": args.lr, "base_lr": args.lr},
+        ],
+        weight_decay=args.weight_decay,
+    )
+    print(
+        f"Optimizer param groups: backbone lr={args.backbone_lr:.2e}, "
+        f"heads lr={args.lr:.2e}"
+    )
+    memory_queue = (
+        RetrievalMemoryQueue(args.memory_queue_size)
+        if int(args.memory_queue_size) > 0
+        else None
+    )
     best_iou = -1.0
 
     print(f"Starting training for {args.max_epoch} epochs...")
     for epoch in range(args.max_epoch):
         adjust_learning_rate(args, optimizer, epoch)
-        train_metrics = train_epoch(train_loader, model, optimizer, epoch, args)
+        train_metrics = train_epoch(train_loader, model, optimizer, epoch, args, memory_queue=memory_queue)
         val_metrics = validate(val_loader, model)
 
         for name, value in train_metrics.items():
@@ -621,6 +1007,9 @@ def main(args):
             f"Loc: {train_metrics['localization']:.4f}\t"
             f"Bbox: {train_metrics['bbox']:.4f}\t"
             f"Rerank: {train_metrics['rerank']:.4f}\t"
+            f"W(loc/bbox/rerank): {train_metrics['weight_localization']:.3f}/"
+            f"{train_metrics['weight_bbox']:.3f}/{train_metrics['weight_rerank']:.3f}\t"
+            f"Queue: {int(train_metrics['memory_queue_size'])}\t"
             f"Val mIoU: {val_metrics['mean_iou']:.4f}\t"
             f"Val R@1: {val_metrics['retrieval_top1']:.4f}"
         )
@@ -640,9 +1029,16 @@ if __name__ == "__main__":
     parser.add_argument("--max-epoch", type=int, default=NUM_EPOCHS, help="number of epochs")
     parser.add_argument("--warmup-epochs", type=int, default=1, help="warmup epochs")
     parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="learning rate")
+    parser.add_argument("--backbone-lr", type=float, default=BACKBONE_LEARNING_RATE, help="backbone learning rate")
     parser.add_argument("--min-lr", type=float, default=1e-6, help="minimum cosine LR")
     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="AdamW weight decay")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="batch size")
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=VAL_FRACTION,
+        help="fraction of the validation split evaluated each epoch",
+    )
     parser.add_argument(
         "--sat-size",
         type=int,
@@ -654,7 +1050,26 @@ if __name__ == "__main__":
     parser.add_argument("--savename", type=str, default="unify_geo", help="TensorBoard run name")
     parser.add_argument("--seed", type=int, default=2024, help="random seed")
     parser.add_argument("--print-freq", type=int, default=PRINT_FREQ, help="print frequency")
-    parser.add_argument("--base-dim", type=int, default=96, help="base ConvNeXt channel dimension")
+    parser.add_argument("--base-dim", type=int, default=96, help="deprecated; kept for test_unify CLI compatibility")
+    parser.add_argument("--backbone-name", type=str, default=BACKBONE_NAME, help="timm feature backbone for UnifyGeo")
+    parser.add_argument(
+        "--pretrained-checkpoint",
+        type=str,
+        default=PRETRAINED_CHECKPOINT,
+        help="local backbone checkpoint; defaults to the cached Swin-S ImageNet weights",
+    )
+    parser.add_argument(
+        "--no-pretrained-checkpoint",
+        dest="pretrained_checkpoint",
+        action="store_const",
+        const=None,
+        help="disable local backbone checkpoint loading",
+    )
+    parser.add_argument(
+        "--timm-pretrained",
+        action="store_true",
+        help="let timm load/download pretrained weights when no local checkpoint is used",
+    )
     parser.add_argument("--proj-dim", type=int, default=PROJECTION_DIM, help="retrieval descriptor dimension")
     parser.add_argument("--detail-dim", type=int, default=384, help="detailed matching feature dimension")
     parser.add_argument("--label-smoothing", type=float, default=0.1, help="InfoNCE label smoothing")
@@ -663,6 +1078,30 @@ if __name__ == "__main__":
     parser.add_argument("--localization-loss-weight", type=float, default=LOCALIZATION_LOSS_WEIGHT)
     parser.add_argument("--bbox-loss-weight", type=float, default=BBOX_LOSS_WEIGHT)
     parser.add_argument("--rerank-loss-weight", type=float, default=RERANK_LOSS_WEIGHT)
+    parser.add_argument(
+        "--retrieval-only-epochs",
+        type=int,
+        default=RETRIEVAL_ONLY_EPOCHS,
+        help="epochs that optimize only the global retrieval loss",
+    )
+    parser.add_argument(
+        "--grounding-ramp-epochs",
+        type=int,
+        default=GROUNDING_RAMP_EPOCHS,
+        help="epochs used to ramp localization and bbox losses to their configured weights",
+    )
+    parser.add_argument(
+        "--rerank-start-epoch",
+        type=int,
+        default=RERANK_START_EPOCH,
+        help="epoch index where detailed rerank supervision starts",
+    )
+    parser.add_argument(
+        "--memory-queue-size",
+        type=int,
+        default=MEMORY_QUEUE_SIZE,
+        help="detached cross-batch retrieval negatives; <=0 disables the queue",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0, help="gradient clipping norm, <=0 disables")
     parser.add_argument(
         "--checkpoint",

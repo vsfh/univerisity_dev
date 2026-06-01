@@ -18,6 +18,7 @@ from bbox.yolo_utils import bbox_iou, build_target, eval_iou_acc
 from dataset import DEFAULT_SUBSET_ANGLES, DEFAULT_SUBSET_HEIGHTS, ShiftedSatelliteDroneDataset
 from model import Encoder_heat, Encoder_test
 from train_uni import (
+    BACKBONE_NAME as UNIFY_BACKBONE_NAME,
     DRONE_SIZE,
     PROJECTION_DIM,
     DummyTokenizer,
@@ -542,11 +543,15 @@ def extract_unify_features(
     base_dim: int,
     proj_dim: int,
     detail_dim: int,
+    backbone_name: str,
 ) -> FeatureBundle:
     model = UnifyGeoLite(
         proj_dim=proj_dim,
         detail_dim=detail_dim,
         dims=(base_dim, base_dim * 2, base_dim * 4),
+        backbone_name=backbone_name,
+        pretrained_backbone=False,
+        pretrained_checkpoint=None,
     ).to(device)
     load_checkpoint(model, checkpoint_path)
     model.eval()
@@ -1062,6 +1067,7 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
             base_dim=args.base_dim,
             proj_dim=args.proj_dim,
             detail_dim=args.detail_dim,
+            backbone_name=args.unify_backbone_name,
         )
     elif model_type == "trans_geo":
         bundle = extract_trans_features(
@@ -1244,6 +1250,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--unify-score-mode", choices=["rerank", "global"], default="rerank")
     parser.add_argument("--base-dim", type=int, default=96)
+    parser.add_argument("--unify-backbone-name", type=str, default=UNIFY_BACKBONE_NAME)
     parser.add_argument("--proj-dim", type=int, default=PROJECTION_DIM)
     parser.add_argument("--detail-dim", type=int, default=384)
     parser.add_argument("--trans-proj-dim", type=int, default=PROJECTION_DIM)

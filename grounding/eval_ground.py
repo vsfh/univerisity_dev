@@ -1,3 +1,4 @@
+import argparse
 import importlib.util
 import json
 import os
@@ -20,7 +21,7 @@ if str(GROUNDING_ROOT) not in sys.path:
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-from ground_cvos import DetGeoLite, LPNGeoLite, SampleGeoLite, TROGeoLite
+from ground_cvos import DetGeoLite, LPNGeoLite, SampleGeoGrounding, TROGeoLite
 from ground_siglip import Encoder as SigLIPModel
 from train_ocg import OCGNetLite
 from train_sm import SMGeoLite
@@ -35,6 +36,14 @@ DEFAULT_DRONE_SIZE = (256, 256)  # (H, W)
 DEFAULT_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 BATCH_SIZE = 8
+DEFAULT_GROUNDING_RUNS = {
+    "det": "/media/data1/feihong/ckpt/ground_det/last.pth",
+    "lpn": "/media/data1/feihong/ckpt/ground_lpn/last.pth",
+    "sample4geo": "/media/data1/feihong/ckpt/ground_sample/last.pth",
+    "smgeo": "/media/data1/feihong/ckpt/ground_sm/last.pth",
+    "ocg": "/media/data1/feihong/ckpt/ground_ocg/last.pth",
+    "trogeolite": "/media/data1/feihong/ckpt/ground_cvos/last.pth",
+}
 
 EVAL_CONFIG = {
     "device": DEFAULT_DEVICE,
@@ -66,7 +75,7 @@ EVAL_CONFIG = {
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _load_encoder_classes():
+def _load_encoder_classes() -> Tuple[type, type]:
     """Load root model.py explicitly to avoid import ambiguity."""
     repo_root_str = str(REPO_ROOT)
     if repo_root_str not in sys.path:
@@ -77,10 +86,16 @@ def _load_encoder_classes():
         raise ImportError(f"Unable to load model module from: {model_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    missing = [
+        name
+        for name in ("Encoder_text_angle", "Encoder_heat")
+        if not hasattr(module, name)
+    ]
+    if missing:
+        raise AttributeError(
+            f"{model_path} is missing encoder classes required by eval_ground: {missing}"
+        )
     return module.Encoder_text_angle, module.Encoder_heat
-
-
-EncoderAbla, EncoderHeat = _load_encoder_classes()
 
 
 def _load_shared_dataset_class():
@@ -101,16 +116,21 @@ ShiftedSatelliteDroneDataset = _load_shared_dataset_class()
 class TransformProcessorWrapper:
     """Tensor wrapper matching training behavior for cvos-based models."""
 
-    def __init__(self, image_size: Tuple[int, int]):
+    def __init__(self, image_size: Tuple[int, int], normalize: bool = True):
         self.size = {"height": int(image_size[0]), "width": int(image_size[1])}
+        self.normalize = bool(normalize)
+        self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
     def __call__(self, images, return_tensors="pt"):
         target_h = int(self.size["height"])
         target_w = int(self.size["width"])
         if images.size != (target_w, target_h):
-            images = images.resize((target_w, target_h))
+            images = images.resize((target_w, target_h), Image.Resampling.BILINEAR)
         image_np = np.array(images, dtype=np.float32) / 255.0
         pixel_values = torch.from_numpy(image_np).permute(2, 0, 1)
+        if self.normalize:
+            pixel_values = (pixel_values - self.mean) / self.std
         return {"pixel_values": pixel_values.unsqueeze(0)}
 
 
@@ -154,6 +174,8 @@ def _canonical_model_type(model_type: str) -> str:
         return "sample4geo"
     if name in {"sm", "smgeo", "smgeolite"}:
         return "smgeo"
+    if name in {"wild", "trogeo", "trogeolite"}:
+        return "trogeolite"
     return name
 
 
@@ -243,15 +265,17 @@ def build_model(
     if model_type == "siglip":
         return SigLIPModel(model_name=MODEL_NAME_SIGLIP, proj_dim=768)
     if model_type == "encoder_abla":
+        EncoderAbla, _ = _load_encoder_classes()
         return EncoderAbla(model_name=MODEL_NAME_SIGLIP, proj_dim=768, usesg=True, useap=True)
     if model_type == "encoder_heat":
+        _, EncoderHeat = _load_encoder_classes()
         return EncoderHeat(model_name=MODEL_NAME_SIGLIP, proj_dim=768, usesg=True, useap=True)
     if model_type == "det":
         return DetGeoLite(emb_size=512)
     if model_type == "lpn":
         return LPNGeoLite()
     if model_type == "sample4geo":
-        return SampleGeoLite(pretrained=False)
+        return SampleGeoGrounding(emb_size=1024, pretrained=False)
     if model_type == "smgeo":
         kwargs = _infer_smgeo_kwargs(checkpoint_state)
         if kwargs:
@@ -396,6 +420,39 @@ def _to_xyxy_pixels(pred_bbox: torch.Tensor, image_h: int, image_w: int) -> torc
     return pred
 
 
+def _decode_anchor_free_bbox(
+    heatmap_logits: torch.Tensor,
+    bbox_raw: torch.Tensor,
+    image_wh: Tuple[int, int],
+) -> torch.Tensor:
+    if heatmap_logits.ndim != 4 or heatmap_logits.shape[1] != 1:
+        raise ValueError(f"Expected heatmap logits shape (B, 1, H, W), got {tuple(heatmap_logits.shape)}.")
+    if bbox_raw.ndim != 4 or bbox_raw.shape[1] != 4:
+        raise ValueError(f"Expected bbox raw shape (B, 4, H, W), got {tuple(bbox_raw.shape)}.")
+
+    batch_size, _, feat_h, feat_w = heatmap_logits.shape
+    image_w, image_h = float(image_wh[0]), float(image_wh[1])
+    heat_prob = torch.sigmoid(heatmap_logits[:, 0])
+    flat_idx = heat_prob.flatten(1).argmax(dim=1)
+    gj = torch.div(flat_idx, feat_w, rounding_mode="floor")
+    gi = flat_idx % feat_w
+    batch_idx = torch.arange(batch_size, device=heatmap_logits.device)
+
+    selected_bbox = bbox_raw[batch_idx, :, gj, gi]
+    offset = torch.sigmoid(selected_bbox[:, :2])
+    wh = torch.sigmoid(selected_bbox[:, 2:]).clamp_min(1e-4)
+    cx = (gi.to(dtype=bbox_raw.dtype) + offset[:, 0]) / float(feat_w) * image_w
+    cy = (gj.to(dtype=bbox_raw.dtype) + offset[:, 1]) / float(feat_h) * image_h
+    bw = wh[:, 0] * image_w
+    bh = wh[:, 1] * image_h
+
+    x1 = (cx - 0.5 * bw).clamp(0.0, image_w)
+    y1 = (cy - 0.5 * bh).clamp(0.0, image_h)
+    x2 = (cx + 0.5 * bw).clamp(0.0, image_w)
+    y2 = (cy + 0.5 * bh).clamp(0.0, image_h)
+    return torch.stack([x1, y1, x2, y2], dim=1)
+
+
 def _is_direct_bbox_output(output: Any) -> bool:
     return isinstance(output, torch.Tensor) and output.ndim <= 2 and output.shape[-1] == 4
 
@@ -427,6 +484,11 @@ def _tensor_chw_to_pil(image_tensor: torch.Tensor) -> Image.Image:
     image = image_tensor.detach().float().cpu()
     if image.ndim != 3:
         raise ValueError(f"Expected CHW tensor, got shape: {tuple(image.shape)}")
+
+    if image.shape[0] == 3 and (image.min().item() < -0.1 or image.max().item() > 1.1):
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=image.dtype).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], dtype=image.dtype).view(3, 1, 1)
+        image = image * std + mean
 
     image = image.permute(1, 2, 0).numpy()
     img_min = float(image.min())
@@ -593,7 +655,14 @@ def evaluate(config: EvalConfig) -> Dict[str, Any]:
         image_w = int(search_imgs.shape[-1])
 
         with torch.no_grad():
-            if hasattr(model, "bbox_forward"):
+            if model_type == "sample4geo":
+                sample_outputs = model(query_imgs, search_imgs)
+                output = _decode_anchor_free_bbox(
+                    sample_outputs["heatmap_logits"],
+                    sample_outputs["bbox_raw"],
+                    image_wh=(image_w, image_h),
+                )
+            elif hasattr(model, "bbox_forward"):
                 try:
                     output = model.bbox_forward(query_imgs, search_imgs, geo=geo)
                 except TypeError:
@@ -931,9 +1000,125 @@ def main_with_drone_name_filter(drone_name_filter_path: str):
         evaluate(cfg)
 
 
+def _parse_optional_int_list(values: Optional[List[int]]) -> Optional[List[int]]:
+    if values is None:
+        return None
+    if len(values) == 0:
+        return None
+    return [int(value) for value in values]
+
+
+def _build_eval_config(
+    model_type: str,
+    checkpoint_path: str,
+    args: argparse.Namespace,
+) -> EvalConfig:
+    return EvalConfig(
+        model_type=model_type,
+        checkpoint_path=checkpoint_path,
+        device=str(args.device),
+        batch_size=int(args.batch_size),
+        num_workers=int(args.num_workers),
+        sat_size=(int(args.sat_size[0]), int(args.sat_size[1])),
+        test_crop_ratio=float(args.test_crop_ratio),
+        subset_heights=_parse_optional_int_list(args.subset_heights),
+        subset_angles=_parse_optional_int_list(args.subset_angles),
+        visualize_output_dir=str(args.visualize_output_dir or ""),
+        output_dir=str(args.output_dir),
+        heatmap_confidence_weight=float(args.heatmap_confidence_weight),
+        drone_name_filter_path=args.drone_name_filter,
+    )
+
+
+def _run_cli(args: argparse.Namespace) -> None:
+    selected_models = [_canonical_model_type(model) for model in args.models]
+    if args.all_grounding:
+        selected_models = list(DEFAULT_GROUNDING_RUNS.keys())
+
+    if not selected_models:
+        raise ValueError("No models selected. Use --all-grounding or --models ...")
+    if args.checkpoint is not None and len(selected_models) != 1:
+        raise ValueError("--checkpoint can only be used with exactly one --models entry.")
+
+    for model_type in selected_models:
+        checkpoint = args.checkpoint
+        if checkpoint is None:
+            checkpoint = DEFAULT_GROUNDING_RUNS.get(model_type)
+        if not checkpoint:
+            raise ValueError(f"No default checkpoint is registered for model '{model_type}'.")
+        if not os.path.exists(checkpoint):
+            print(f"Skipping {model_type}: checkpoint not found: {checkpoint}")
+            continue
+
+        cfg = _build_eval_config(
+            model_type=model_type,
+            checkpoint_path=str(checkpoint),
+            args=args,
+        )
+        evaluate(cfg)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate grounding train_* checkpoints.")
+    parser.add_argument(
+        "--all-grounding",
+        action="store_true",
+        help="Evaluate all trained grounding models with default checkpoint paths.",
+    )
+    parser.add_argument(
+        "--models",
+        nargs="*",
+        default=[],
+        choices=["det", "lpn", "sample4geo", "sample", "smgeo", "sm", "ocg", "trogeolite", "wild"],
+        help="Model types to evaluate. Ignored when --all-grounding is set.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Explicit checkpoint path for a single model run.",
+    )
+    parser.add_argument("--device", type=str, default=str(EVAL_CONFIG.get("device", DEFAULT_DEVICE)))
+    parser.add_argument("--batch-size", type=int, default=int(EVAL_CONFIG.get("batch_size", BATCH_SIZE)))
+    parser.add_argument("--num-workers", type=int, default=int(EVAL_CONFIG.get("num_workers", 8)))
+    parser.add_argument(
+        "--sat-size",
+        type=int,
+        nargs=2,
+        metavar=("HEIGHT", "WIDTH"),
+        default=list(EVAL_CONFIG.get("sat_size", list(DEFAULT_SAT_SIZE))),
+        help="Satellite image size as HEIGHT WIDTH.",
+    )
+    parser.add_argument("--test-crop-ratio", type=float, default=float(EVAL_CONFIG.get("test_crop_ratio", 1.0)))
+    parser.add_argument("--subset-heights", type=int, nargs="*", default=EVAL_CONFIG.get("subset_heights"))
+    parser.add_argument("--subset-angles", type=int, nargs="*", default=EVAL_CONFIG.get("subset_angles"))
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=str(EVAL_CONFIG.get("output_dir", "/media/data1/feihong/univerisity_dev/eval_results")),
+    )
+    parser.add_argument("--visualize-output-dir", type=str, default=str(EVAL_CONFIG.get("visualize_output_dir", "")))
+    parser.add_argument(
+        "--heatmap-confidence-weight",
+        type=float,
+        default=float(EVAL_CONFIG.get("heatmap_confidence_weight", 0.5)),
+    )
+    parser.add_argument("--drone-name-filter", type=str, default=None)
+    parser.add_argument(
+        "--use-config",
+        action="store_true",
+        help="Use the legacy EVAL_CONFIG run flags instead of CLI model selection.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
     # eval_encoder_text_angle_checkpoints()
-    main()
+    cli_args = parse_args()
+    if cli_args.use_config or (not cli_args.all_grounding and not cli_args.models and not cli_args.checkpoint):
+        main()
+    else:
+        _run_cli(cli_args)
     # main_with_drone_name_filter(
     #     "/media/data1/feihong/univerisity_dev/eval_results/retrieval_xxx/eval_retrieval_xxx_top1_success_drone_names.txt"
     # )

@@ -47,15 +47,18 @@ BATCH_SIZE = 16
 NUM_EPOCHS = 8
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
+GRAD_CLIP_NORM = 10.0
 PRINT_FREQ = 50
 CLICK_SIGMA = 0.16
-DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
 
 class TransformProcessorWrapper:
     def __init__(self, image_size: Tuple[int, int]):
         self.size = {"height": int(image_size[1]), "width": int(image_size[0])}
+        self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
     def __call__(self, images, return_tensors="pt"):
         target_h = int(self.size["height"])
@@ -64,6 +67,7 @@ class TransformProcessorWrapper:
             images = images.resize((target_w, target_h), Image.Resampling.BILINEAR)
         image_np = np.array(images, dtype=np.float32) / 255.0
         pixel_values = torch.from_numpy(image_np).permute(2, 0, 1)
+        pixel_values = (pixel_values - self.mean) / self.std
         return {"pixel_values": pixel_values.unsqueeze(0)}
 
 
@@ -299,6 +303,8 @@ def train_epoch(
     epoch,
     anchors_full,
     print_freq=PRINT_FREQ,
+    grad_clip_norm=GRAD_CLIP_NORM,
+    beta=1.0,
 ):
     model.train()
 
@@ -337,11 +343,14 @@ def train_epoch(
             anchors_full,
             best_anchor_gi_gj,
             image_wh,
+            confidence_loss_type="balanced_bce",
         )
-        loss = loss_geo + loss_cls
+        loss = loss_geo + beta * loss_cls
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         optimizer.step()
 
         losses.update(loss.item(), query_imgs.shape[0])
@@ -452,6 +461,29 @@ def build_loaders(args):
     return train_loader, len(train_dataset)
 
 
+def build_eval_loader(args):
+    processor = TransformProcessorWrapper(DRONE_SIZE)
+    processor_sat = TransformProcessorWrapper(args.img_size)
+    tokenizer = DummyTokenizer()
+    test_dataset = ShiftedSatelliteDroneDataset(
+        processor=processor,
+        processor_sat=processor_sat,
+        tokenizer=tokenizer,
+        split="test",
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        pin_memory=True,
+        drop_last=False,
+        num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=4 if args.num_workers > 0 else None,
+    )
+    return test_loader, len(test_dataset)
+
+
 def main(args):
     cudnn.benchmark = False
     cudnn.deterministic = True
@@ -473,7 +505,7 @@ def main(args):
         pretrained_backbone=args.pretrained_backbone,
     ).to(DEVICE)
 
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     anchors_full = parse_anchors(DEVICE)
 
     print(f"Starting training for {args.max_epoch} epochs...")
@@ -486,6 +518,8 @@ def main(args):
             epoch,
             anchors_full,
             args.print_freq,
+            args.grad_clip_norm,
+            args.beta,
         )
 
         writer.add_scalar("Loss/train", train_loss, epoch)
@@ -503,11 +537,47 @@ def main(args):
     writer.close()
 
 
+def eval(args):
+    print("Evaluating OCGNet checkpoint on test split...")
+    test_loader, test_count = build_eval_loader(args)
+    print(f"Found {test_count} test samples")
+
+    model = OCGNetLite(
+        channels=512,
+        num_heads=args.num_heads,
+        pretrained_backbone=args.pretrained_backbone,
+    ).to(DEVICE)
+    checkpoint_path = args.checkpoint_path or os.path.join(args.checkpoint, "last.pth")
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=False)
+
+    anchors_full = parse_anchors(DEVICE)
+    mean_iou, accu50, mean_center_distance = validate(test_loader, model, anchors_full)
+    print(
+        f"Eval IoU: {mean_iou:.4f}, Accu50: {accu50:.4f}, "
+        f"CenterDist: {mean_center_distance:.2f}"
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="OCGNet-style training on ShiftedSatelliteDroneDataset")
     parser.add_argument("--num-workers", type=int, default=8, help="num workers for data loading")
     parser.add_argument("--max-epoch", type=int, default=NUM_EPOCHS, help="number of epochs")
     parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="learning rate")
+    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="AdamW weight decay")
+    parser.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=GRAD_CLIP_NORM,
+        help="max gradient norm; <=0 disables clipping",
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=1.0,
+        help="OCGNet-style objectness/confidence loss weight",
+    )
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="batch size")
     parser.add_argument(
         "--img-size",
@@ -521,6 +591,13 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=2024, help="random seed")
     parser.add_argument("--print-freq", type=int, default=PRINT_FREQ, help="print frequency")
     parser.add_argument("--num-heads", type=int, default=8, help="cross-attention heads")
+    parser.add_argument("--eval-only", action="store_true", help="Only run evaluation on test split")
+    parser.add_argument(
+        "--checkpoint-path",
+        type=str,
+        default=None,
+        help="Explicit checkpoint path for evaluation",
+    )
     parser.add_argument(
         "--pretrained-backbone",
         action="store_true",
@@ -535,4 +612,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args.img_size = (int(args.img_size[0]), int(args.img_size[1]))
 
-    main(args)
+    if args.eval_only:
+        eval(args)
+    else:
+        main(args)
