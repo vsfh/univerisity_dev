@@ -243,10 +243,14 @@ def train_epoch(
 
 def validate(loader, model, epoch, use_amp=False):
     """Validate model with InfoNCE loss."""
+    del epoch
     model.eval()
 
     total_loss = 0
     total_samples = 0
+    top1_hits = 0
+    top5_hits = 0
+    top10_hits = 0
 
     for batch in tqdm(loader, desc="Validating"):
         query_imgs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
@@ -273,11 +277,27 @@ def validate(loader, model, epoch, use_amp=False):
         positive_indices[row_indices_flat, global_positive_indices] = 0.95
 
         loss = info_nce_loss(query_feats, candidate_feats, positive_indices)
+        query_norm = nn.functional.normalize(query_feats, p=2, dim=1)
+        candidate_norm = nn.functional.normalize(candidate_feats, p=2, dim=1)
+        sim_matrix = torch.matmul(query_norm, candidate_norm.T)
+        max_k = min(10, sim_matrix.shape[1])
+        topk = sim_matrix.topk(k=max_k, dim=1).indices
+        positive_cols = global_positive_indices.view(-1, 1)
+        top1_hits += int((topk[:, :1] == positive_cols).any(dim=1).sum().item())
+        top5_hits += int((topk[:, : min(5, max_k)] == positive_cols).any(dim=1).sum().item())
+        top10_hits += int((topk[:, : min(10, max_k)] == positive_cols).any(dim=1).sum().item())
 
         total_loss += loss.item() * B
         total_samples += B
 
-    return total_loss / total_samples if total_samples > 0 else 0
+    if total_samples <= 0:
+        return 0.0, 0.0, 0.0, 0.0
+    return (
+        total_loss / total_samples,
+        top1_hits / total_samples,
+        top5_hits / total_samples,
+        top10_hits / total_samples,
+    )
 
 
 def load_distances():
@@ -474,7 +494,7 @@ def main(args):
         processor=processor,
         processor_sat=processor,
         tokenizer=tokenizer,
-        split="test",
+        split="train",
     )
 
     print(f"Found {len(train_dataset)} training pairs, {len(val_dataset)} validation pairs")
@@ -518,16 +538,24 @@ def main(args):
         )
 
         writer.add_scalar("Loss/train", train_loss, epoch)
-        # writer.add_scalar("Metrics/top1_acc", top1, epoch)
-        # writer.add_scalar("Metrics/top5_acc", top5, epoch)
-        # writer.add_scalar("Metrics/top10_acc", top10, epoch)
+        val_loss, top1, top5, top10 = validate(
+            val_loader,
+            model,
+            epoch,
+            use_amp=use_amp,
+        )
+        writer.add_scalar("ValTrain/loss", val_loss, epoch)
+        writer.add_scalar("ValTrain/top1_acc", top1, epoch)
+        writer.add_scalar("ValTrain/top5_acc", top5, epoch)
+        writer.add_scalar("ValTrain/top10_acc", top10, epoch)
 
         print(
             f"Epoch {epoch + 1}/{args.max_epoch}:\t"
             f"Train Loss: {train_loss:.4f}\t"
-            # f"Top1: {top1:.4f}\t"
-            # f"Top5: {top5:.4f}\t"
-            # f"Top10: {top10:.4f}"
+            f"ValTrain Loss: {val_loss:.4f}\t"
+            f"Top1: {top1:.4f}\t"
+            f"Top5: {top5:.4f}\t"
+            f"Top10: {top10:.4f}"
         )
         os.makedirs(args.checkpoint, exist_ok=True)
         torch.save(model.state_dict(), f"{args.checkpoint}/last.pth")

@@ -336,7 +336,7 @@ def main(args):
         processor=processor,
         processor_sat=processor_sat,
         tokenizer=tokenizer,
-        split="test",
+        split="train",
     )
 
     print(f"Found {len(train_dataset)} training samples, {len(val_dataset)} validation samples")
@@ -387,10 +387,20 @@ def main(args):
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/train_geo", train_geo, epoch)
         writer.add_scalar("Loss/train_cls", train_cls, epoch)
+        val_accu50, val_accu25, val_iou = validate(
+            val_loader,
+            model,
+            anchors_full,
+            args.img_size,
+        )
+        writer.add_scalar("ValTrain/mean_iou", val_iou, epoch)
+        writer.add_scalar("ValTrain/accu50", val_accu50, epoch)
+        writer.add_scalar("ValTrain/accu25", val_accu25, epoch)
 
         print(
             f"Epoch {epoch + 1}/{args.max_epoch}:\t"
-            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})"
+            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})\t"
+            f"ValTrain IoU: {val_iou:.4f}, Accu50: {val_accu50:.4f}, Accu25: {val_accu25:.4f}"
         )
         torch.save(model.state_dict(), f"{args.checkpoint}/last.pth")
 

@@ -723,7 +723,17 @@ def build_loaders(args):
         persistent_workers=args.num_workers > 0,
         prefetch_factor=4 if args.num_workers > 0 else None,
     )
-    return train_loader, len(train_dataset)
+    val_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        pin_memory=True,
+        drop_last=False,
+        num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=4 if args.num_workers > 0 else None,
+    )
+    return train_loader, val_loader, len(train_dataset)
 
 
 def main(args):
@@ -737,7 +747,7 @@ def main(args):
     writer = SummaryWriter(f"runs/{args.savename}")
 
     print("Creating datasets from shared data source...")
-    train_loader, train_count = build_loaders(args)
+    train_loader, val_loader, train_count = build_loaders(args)
     print(f"Found {train_count} training samples")
 
     print("Creating SMGeoLite model...")
@@ -770,11 +780,16 @@ def main(args):
         writer.add_scalar("Loss/train_heatmap", train_heat, epoch)
         writer.add_scalar("Loss/train_bbox", train_bbox, epoch)
         writer.add_scalar("MoE/entropy", moe_entropy, epoch)
+        val_iou, val_accu50, val_center = validate(val_loader, model)
+        writer.add_scalar("ValTrain/mean_iou", val_iou, epoch)
+        writer.add_scalar("ValTrain/accu50", val_accu50, epoch)
+        writer.add_scalar("ValTrain/center_distance", val_center, epoch)
 
         print(
             f"Epoch {epoch + 1}/{args.max_epoch}:\t"
             f"Train Loss: {train_loss:.4f} (Heat: {train_heat:.4f}, Bbox: {train_bbox:.4f})\t"
-            f"MoE-H: {moe_entropy:.4f}"
+            f"MoE-H: {moe_entropy:.4f}\t"
+            f"ValTrain IoU: {val_iou:.4f}, Accu50: {val_accu50:.4f}, Center: {val_center:.2f}"
         )
 
         torch.save(model.state_dict(), os.path.join(args.checkpoint, "last.pth"))
