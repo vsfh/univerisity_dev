@@ -44,7 +44,7 @@ from grounding.utils.utils import AverageMeter
 IMG_SIZE = (768, 432)  # (width, height)
 DRONE_SIZE = (256, 256)  # (width, height)
 BATCH_SIZE = 16
-NUM_EPOCHS = 8
+NUM_EPOCHS = 20
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 GRAD_CLIP_NORM = 10.0

@@ -36,7 +36,7 @@ from dataset import ShiftedSatelliteDroneDataset
 
 IMG_SIZE = (768, 432)  # (width, height)
 BATCH_SIZE = 8
-NUM_EPOCHS = 8
+NUM_EPOCHS = 20
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 PRINT_FREQ = 50
