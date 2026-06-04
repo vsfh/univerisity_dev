@@ -17,7 +17,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -37,6 +37,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from bbox.yolo_utils import bbox_iou, build_target, eval_iou_acc, yolo_loss
 from dataset import ShiftedSatelliteDroneDataset
+from grounding.model.darknet import ConvBatchNormReLU, Darknet
 from grounding.utils.utils import AverageMeter
 
 
@@ -52,6 +53,9 @@ PRINT_FREQ = 50
 CLICK_SIGMA = 0.16
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
+DEFAULT_OFFICIAL_PRETRAIN = "/media/data1/feihong/ckpt/OCGNet.pth.tar"
+DEFAULT_DARKNET_CFG = "/media/data1/feihong/ckpt/yolov3_rs.cfg"
+DEFAULT_YOLO_WEIGHTS = "/media/data1/feihong/ckpt/yolov3.weights"
 
 
 class TransformProcessorWrapper:
@@ -163,6 +167,163 @@ class ReferenceEncoder(nn.Module):
         x = self.layer3(x)
         x = self.layer4(x)
         return x
+
+
+class OfficialResNetQuery(nn.Module):
+    """Official OCGNet query tower: ResNet18 deep feature plus layer1 feature."""
+
+    def __init__(self, pretrained: bool = True):
+        super().__init__()
+        self.base_model = _resnet18_backbone(pretrained=pretrained)
+        self.base_model.avgpool = nn.Sequential()
+        self.base_model.fc = nn.Sequential()
+
+    def forward(self, x):
+        x = self.base_model.conv1(x)
+        x = self.base_model.bn1(x)
+        x = self.base_model.relu(x)
+        x = self.base_model.maxpool(x)
+        x = self.base_model.layer1(x)
+        early_features = x
+        x = self.base_model.layer2(x)
+        x = self.base_model.layer3(x)
+        x = self.base_model.layer4(x)
+        return x, early_features
+
+
+class QueryReferenceFusion(nn.Module):
+    def __init__(self, embed_dim=512, num_heads=8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.embed_dim = embed_dim
+        self.head_dim = embed_dim // num_heads
+        if self.head_dim * num_heads != embed_dim:
+            raise ValueError(f"embed_dim={embed_dim} must be divisible by num_heads={num_heads}.")
+        self.query = nn.Linear(embed_dim, embed_dim)
+        self.key = nn.Linear(embed_dim, embed_dim)
+        self.value = nn.Linear(embed_dim, embed_dim)
+        self.out = nn.Linear(embed_dim, embed_dim)
+        self.scale = self.head_dim ** -0.5
+
+    def forward(self, x1, x2):
+        B, D, H, W = x1.shape
+        if x1.shape != x2.shape:
+            x2 = F.interpolate(x2, size=(H, W), mode="bilinear", align_corners=False)
+
+        x1_flat = x1.view(B, D, H * W).permute(0, 2, 1)
+        x2_flat = x2.view(B, D, H * W).permute(0, 2, 1)
+        q = self.query(x1_flat)
+        k = self.key(x2_flat)
+        v = self.value(x2_flat)
+
+        q = q.view(B, H * W, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = k.view(B, H * W, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.view(B, H * W, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn_probs = F.softmax(attn_weights, dim=-1)
+        attn_output = torch.matmul(attn_probs, v)
+        attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(B, H * W, D)
+        output = self.out(attn_output).permute(0, 2, 1).view(B, D, H, W)
+        return output * x1
+
+
+class OfficialCrossViewFusionModule(nn.Module):
+    def forward(self, global_query, value):
+        global_query = F.normalize(global_query, p=2, dim=-1)
+        value = F.normalize(value, p=2, dim=1)
+
+        B, D, H, W = value.shape
+        new_value = value.permute(0, 2, 3, 1).view(B, H * W, D)
+        score = torch.bmm(global_query.view(B, 1, D), new_value.transpose(1, 2))
+        score = score.view(B, H * W)
+
+        min_score = score.min(dim=1, keepdim=True).values
+        max_score = score.max(dim=1, keepdim=True).values
+        attn = (score - min_score) / (max_score - min_score + 1e-8)
+        attn = attn.view(B, 1, H, W)
+        context = attn * value
+        return context, attn
+
+
+class OfficialOCGNet(nn.Module):
+    """Official OCGNet architecture adapted to this repository's bbox head contract."""
+
+    def __init__(
+        self,
+        emb_size: int = 512,
+        num_heads: int = 8,
+        darknet_cfg: str = DEFAULT_DARKNET_CFG,
+        yolo_weights: str = DEFAULT_YOLO_WEIGHTS,
+        load_yolo_weights: bool = True,
+        pretrained_query: bool = False,
+        leaky: bool = True,
+    ):
+        super().__init__()
+        use_instnorm = False
+        self.query_resnet = OfficialResNetQuery(pretrained=pretrained_query)
+        self.reference_darknet = Darknet(config_path=darknet_cfg, img_size=1024)
+        if load_yolo_weights and yolo_weights and os.path.exists(yolo_weights):
+            self.reference_darknet.load_weights(yolo_weights)
+
+        self.combine_clickptns_conv1 = ConvBatchNormReLU(
+            4, 3, 1, 1, 0, 1, leaky=leaky, instance=use_instnorm
+        )
+        self.downsampling_pooling = nn.AvgPool2d(kernel_size=4, stride=4)
+        self.combine_clickptns_conv2 = ConvBatchNormReLU(
+            2, 1, 8, 8, 0, 1, leaky=leaky, instance=use_instnorm
+        )
+        self.queryreferencefusion = QueryReferenceFusion(embed_dim=emb_size, num_heads=num_heads)
+        self.crossview_fusionmodule = OfficialCrossViewFusionModule()
+        self.query_visudim = 512
+        self.reference_visudim = 512
+        self.query_mapping_visu = ConvBatchNormReLU(
+            self.query_visudim, emb_size, 1, 1, 0, 1, leaky=leaky, instance=use_instnorm
+        )
+        self.reference_mapping_visu = ConvBatchNormReLU(
+            self.reference_visudim, emb_size, 1, 1, 0, 1, leaky=leaky, instance=use_instnorm
+        )
+        self.fcn_out = nn.Sequential(
+            ConvBatchNormReLU(emb_size, emb_size // 2, 1, 1, 0, 1, leaky=leaky, instance=use_instnorm),
+            nn.Conv2d(emb_size // 2, 9 * 5, kernel_size=1),
+        )
+
+    def forward(self, query_imgs, reference_imgs, click_maps=None):
+        if click_maps is None:
+            click_maps = build_center_click_maps(query_imgs)
+        if click_maps.ndim == 3:
+            click_maps = click_maps.unsqueeze(1)
+
+        query_imgs = self.combine_clickptns_conv1(torch.cat((query_imgs, click_maps), dim=1))
+        pooled_click_maps = self.downsampling_pooling(click_maps)
+
+        query_fvisu, early_features = self.query_resnet(query_imgs)
+        reference_raw_fvisu = self.reference_darknet(reference_imgs)
+        reference_fvisu = reference_raw_fvisu[1]
+
+        query_fvisu = self.query_mapping_visu(query_fvisu)
+        reference_fvisu = self.reference_mapping_visu(reference_fvisu)
+        early_features = torch.mean(early_features, dim=1, keepdim=True)
+        position_feature = self.combine_clickptns_conv2(
+            torch.cat((early_features, pooled_click_maps), dim=1)
+        )
+
+        B, D, Hquery, Wquery = query_fvisu.shape
+        reference_pooling = F.max_pool2d(reference_fvisu, kernel_size=8)
+        qr_fused_features = self.queryreferencefusion(query_fvisu, reference_pooling)
+        qr_fused_features = qr_fused_features * position_feature
+        query_gvisu = torch.mean(
+            qr_fused_features.view(B, D, Hquery * Wquery),
+            dim=2,
+            keepdims=False,
+        ).view(B, D)
+
+        fused_features, attn_score = self.crossview_fusionmodule(query_gvisu, reference_fvisu)
+        pred_anchor = self.fcn_out(fused_features)
+        return pred_anchor, attn_score.squeeze(1)
+
+    def bbox_forward(self, query_imgs, reference_imgs):
+        return self.forward(query_imgs, reference_imgs)[0]
 
 
 class GaussianKnowledgeTransfer(nn.Module):
@@ -281,6 +442,47 @@ def build_center_click_maps(query_imgs: torch.Tensor, sigma: float = CLICK_SIGMA
     grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing="ij")
     heatmap = torch.exp(-0.5 * (grid_x.square() + grid_y.square()) / max(sigma * sigma, 1e-6))
     return heatmap.view(1, 1, H, W).expand(B, -1, -1, -1).contiguous()
+
+
+def _unwrap_state_dict(checkpoint):
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model", "model_state_dict", "net"):
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                return value
+        return checkpoint
+    raise TypeError(f"Expected checkpoint/state_dict dict, got {type(checkpoint)}.")
+
+
+def load_compatible_checkpoint(model: nn.Module, checkpoint_path: str) -> Dict[str, int]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = _unwrap_state_dict(checkpoint)
+    model_state = model.state_dict()
+    compatible_state = {}
+    skipped_shape = 0
+    skipped_missing = 0
+
+    for key, value in state_dict.items():
+        clean_key = str(key).removeprefix("module.")
+        if clean_key not in model_state:
+            skipped_missing += 1
+            continue
+        if tuple(value.shape) != tuple(model_state[clean_key].shape):
+            skipped_shape += 1
+            continue
+        compatible_state[clean_key] = value
+
+    if not compatible_state:
+        raise ValueError(f"No compatible checkpoint weights found in {checkpoint_path}.")
+
+    result = model.load_state_dict(compatible_state, strict=False)
+    return {
+        "loaded": len(compatible_state),
+        "skipped_missing": skipped_missing,
+        "skipped_shape": skipped_shape,
+        "missing_after_load": len(result.missing_keys),
+        "unexpected_after_load": len(result.unexpected_keys),
+    }
 
 
 def parse_anchors(device: str) -> torch.Tensor:
@@ -508,12 +710,26 @@ def main(args):
     train_loader, val_loader, train_count = build_loaders(args)
     print(f"Found {train_count} training samples")
 
-    print("Creating OCGNetLite model...")
-    model = OCGNetLite(
-        channels=512,
-        num_heads=args.num_heads,
-        pretrained_backbone=args.pretrained_backbone,
-    ).to(DEVICE)
+    print(f"Creating {args.model_variant} OCG model...")
+    if args.model_variant == "official":
+        model = OfficialOCGNet(
+            emb_size=512,
+            num_heads=args.num_heads,
+            darknet_cfg=args.darknet_cfg,
+            yolo_weights=args.yolo_weights,
+            load_yolo_weights=not args.skip_yolo_weights,
+            pretrained_query=args.pretrained_backbone,
+        )
+    else:
+        model = OCGNetLite(
+            channels=512,
+            num_heads=args.num_heads,
+            pretrained_backbone=args.pretrained_backbone,
+        )
+    if args.official_pretrain and not args.no_official_pretrain:
+        load_info = load_compatible_checkpoint(model, args.official_pretrain)
+        print(f"Loaded OCG official pretrain: {load_info}")
+    model = model.to(DEVICE)
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     anchors_full = parse_anchors(DEVICE)
@@ -557,15 +773,27 @@ def eval(args):
     test_loader, test_count = build_eval_loader(args)
     print(f"Found {test_count} test samples")
 
-    model = OCGNetLite(
-        channels=512,
-        num_heads=args.num_heads,
-        pretrained_backbone=args.pretrained_backbone,
-    ).to(DEVICE)
+    if args.model_variant == "official":
+        model = OfficialOCGNet(
+            emb_size=512,
+            num_heads=args.num_heads,
+            darknet_cfg=args.darknet_cfg,
+            yolo_weights=args.yolo_weights,
+            load_yolo_weights=not args.skip_yolo_weights,
+            pretrained_query=args.pretrained_backbone,
+        )
+    else:
+        model = OCGNetLite(
+            channels=512,
+            num_heads=args.num_heads,
+            pretrained_backbone=args.pretrained_backbone,
+        )
     checkpoint_path = args.checkpoint_path or os.path.join(args.checkpoint, "last.pth")
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=False)
+    load_info = load_compatible_checkpoint(model, checkpoint_path)
+    print(f"Loaded eval checkpoint: {load_info}")
+    model = model.to(DEVICE)
 
     anchors_full = parse_anchors(DEVICE)
     mean_iou, accu50, mean_center_distance = validate(test_loader, model, anchors_full)
@@ -606,6 +834,26 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=2024, help="random seed")
     parser.add_argument("--print-freq", type=int, default=PRINT_FREQ, help="print frequency")
     parser.add_argument("--num-heads", type=int, default=8, help="cross-attention heads")
+    parser.add_argument(
+        "--model-variant",
+        choices=["official", "lite"],
+        default="official",
+        help="Use official OCGNet-compatible architecture or the previous lightweight model",
+    )
+    parser.add_argument(
+        "--official-pretrain",
+        type=str,
+        default=DEFAULT_OFFICIAL_PRETRAIN,
+        help="Official OCGNet checkpoint loaded before training",
+    )
+    parser.add_argument(
+        "--no-official-pretrain",
+        action="store_true",
+        help="Do not load --official-pretrain before training",
+    )
+    parser.add_argument("--darknet-cfg", type=str, default=DEFAULT_DARKNET_CFG)
+    parser.add_argument("--yolo-weights", type=str, default=DEFAULT_YOLO_WEIGHTS)
+    parser.add_argument("--skip-yolo-weights", action="store_true")
     parser.add_argument("--eval-only", action="store_true", help="Only run evaluation on test split")
     parser.add_argument(
         "--checkpoint-path",

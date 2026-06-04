@@ -1,8 +1,9 @@
 import os
 from pathlib import Path
+from urllib.parse import quote
 
-os.environ['HF_HOME'] = '/media/data1/feihong/hf_cache'
-custom_cache_path = "/media/data1/feihong/hf_cache"
+os.environ['HF_HOME'] = '/media/4tb/feihong/hf_cache'
+custom_cache_path = "/media/4tb/feihong/hf_cache"
 def clip_siglip(image_folder = "image_512",output_folder = "features", large=False):
     import open_clip
     from transformers import CLIPModel, CLIPProcessor, SiglipModel, SiglipProcessor
@@ -282,8 +283,245 @@ def download_gemma_4_31b_it(
                 os.environ["HF_HUB_DISABLE_XET"] = previous_disable_xet
 
 
+def download_qwen_3_6_35b_a3b_fp8(
+    cache_dir=custom_cache_path,
+    use_china_mirror=True,
+    mirror_endpoint="https://hf-mirror.com",
+    revision=None,
+    verify_load=False,
+    disable_xet=True,
+    max_workers=1,
+    download_timeout=60,
+    direct_fallback=True,
+):
+    """
+    Download Qwen/Qwen3.6-35B-A3B-FP8 into the local Hugging Face cache.
+
+    Args:
+        cache_dir (str): Target HF cache directory.
+        use_china_mirror (bool): Whether to use a China mirror endpoint.
+        mirror_endpoint (str): Mirror endpoint, e.g. https://hf-mirror.com.
+        revision (str|None): Optional model revision.
+        verify_load (bool): If True, try to load the processor and model class.
+        disable_xet (bool): Disable HF Xet transport and use regular resumable HTTP.
+        max_workers (int): Number of snapshot download workers.
+        download_timeout (int): Per-request HF Hub download timeout in seconds.
+        direct_fallback (bool): If snapshot_download fails on mirror metadata,
+            resume files directly from /resolve URLs into a local snapshot.
+
+    Returns:
+        dict: Metadata including local snapshot directory.
+    """
+    model_id = "Qwen/Qwen3.6-35B-A3B-FP8"
+    os.makedirs(cache_dir, exist_ok=True)
+
+    os.environ["HF_HOME"] = cache_dir
+    os.environ["HUGGINGFACE_HUB_CACHE"] = cache_dir
+    os.environ["TRANSFORMERS_CACHE"] = cache_dir
+
+    previous_endpoint = os.environ.get("HF_ENDPOINT")
+    previous_disable_xet = os.environ.get("HF_HUB_DISABLE_XET")
+    previous_download_timeout = os.environ.get("HF_HUB_DOWNLOAD_TIMEOUT")
+
+    os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = str(int(download_timeout))
+    if disable_xet:
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+    if use_china_mirror:
+        os.environ["HF_ENDPOINT"] = mirror_endpoint.rstrip("/")
+
+    from huggingface_hub import snapshot_download
+
+    try:
+        print(f"Downloading {model_id} to cache: {cache_dir}")
+        if use_china_mirror:
+            print(f"Using HF mirror endpoint: {os.environ['HF_ENDPOINT']}")
+        if disable_xet:
+            print("HF Xet transport disabled: HF_HUB_DISABLE_XET=1")
+        print(f"HF Hub download timeout: {os.environ['HF_HUB_DOWNLOAD_TIMEOUT']}s")
+        print(f"Snapshot max_workers: {int(max_workers)}")
+
+        try:
+            snapshot_dir = snapshot_download(
+                repo_id=model_id,
+                cache_dir=cache_dir,
+                revision=revision,
+                resume_download=True,
+                max_workers=int(max_workers),
+            )
+        except Exception as exc:
+            if not direct_fallback:
+                raise
+            print(f"snapshot_download failed: {exc}")
+            print("Trying direct resumable fallback for Qwen files...")
+            snapshot_dir = _download_repo_files_direct(
+                cache_dir=cache_dir,
+                model_id=model_id,
+                endpoint=os.environ.get("HF_ENDPOINT", "https://huggingface.co"),
+                revision=revision or "main",
+                timeout=int(download_timeout),
+            )
+
+        result = {
+            "model_id": model_id,
+            "cache_dir": cache_dir,
+            "snapshot_dir": snapshot_dir,
+            "hf_endpoint": os.environ.get("HF_ENDPOINT", "https://huggingface.co"),
+        }
+
+        if verify_load:
+            from transformers import AutoProcessor
+
+            try:
+                from transformers import AutoModelForImageTextToText
+            except ImportError:
+                AutoModelForImageTextToText = None
+
+            try:
+                from transformers import Qwen3VLForConditionalGeneration
+            except ImportError:
+                Qwen3VLForConditionalGeneration = None
+
+            model_cls = AutoModelForImageTextToText or Qwen3VLForConditionalGeneration
+            if model_cls is None:
+                raise ImportError(
+                    "This Transformers install has neither AutoModelForImageTextToText "
+                    "nor Qwen3VLForConditionalGeneration."
+                )
+
+            _ = AutoProcessor.from_pretrained(model_id, cache_dir=cache_dir)
+            _ = model_cls.from_pretrained(
+                model_id,
+                cache_dir=cache_dir,
+                dtype="auto",
+                device_map="auto",
+            )
+            result["verify_load"] = True
+
+        print(f"Download completed: {snapshot_dir}")
+        return result
+    finally:
+        if use_china_mirror:
+            if previous_endpoint is None:
+                os.environ.pop("HF_ENDPOINT", None)
+            else:
+                os.environ["HF_ENDPOINT"] = previous_endpoint
+        if previous_download_timeout is None:
+            os.environ.pop("HF_HUB_DOWNLOAD_TIMEOUT", None)
+        else:
+            os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = previous_download_timeout
+        if disable_xet:
+            if previous_disable_xet is None:
+                os.environ.pop("HF_HUB_DISABLE_XET", None)
+            else:
+                os.environ["HF_HUB_DISABLE_XET"] = previous_disable_xet
+
+
 def _gemma_cache_root(cache_dir):
     return Path(cache_dir) / "models--google--gemma-4-31B-it"
+
+
+def _hf_cache_root(cache_dir, model_id):
+    return Path(cache_dir) / f"models--{model_id.replace('/', '--')}"
+
+
+def _get_repo_commit_and_files(model_id, endpoint, revision):
+    from huggingface_hub import HfApi
+
+    api = HfApi(endpoint=endpoint)
+    model_info = api.model_info(model_id, revision=revision)
+    commit_hash = model_info.sha
+    if not commit_hash:
+        raise RuntimeError(f"Could not resolve commit hash for {model_id}@{revision}.")
+
+    siblings = getattr(model_info, "siblings", None) or []
+    filenames = [item.rfilename for item in siblings if getattr(item, "rfilename", None)]
+    if not filenames:
+        filenames = api.list_repo_files(model_id, revision=revision)
+    if not filenames:
+        raise RuntimeError(f"No files found for {model_id}@{revision}.")
+    return commit_hash, sorted(filenames)
+
+
+def _download_repo_files_direct(cache_dir, model_id, endpoint, revision, timeout):
+    commit_hash, filenames = _get_repo_commit_and_files(
+        model_id=model_id,
+        endpoint=endpoint,
+        revision=revision,
+    )
+    root = _hf_cache_root(cache_dir, model_id)
+    snapshot_dir = root / "snapshots" / commit_hash
+    refs_dir = root / "refs"
+    refs_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    (refs_dir / revision).write_text(commit_hash, encoding="utf-8")
+
+    print(f"Resolved {model_id}@{revision} to commit: {commit_hash}")
+    print(f"Direct fallback will download {len(filenames)} files into: {snapshot_dir}")
+    for idx, filename in enumerate(filenames, start=1):
+        target = snapshot_dir / filename
+        print(f"[{idx}/{len(filenames)}] {filename}")
+        if target.exists():
+            print(f"Already exists, skipping: {target}")
+            continue
+        _download_repo_file_direct(
+            snapshot_dir=snapshot_dir,
+            model_id=model_id,
+            filename=filename,
+            endpoint=endpoint,
+            revision=commit_hash,
+            timeout=timeout,
+        )
+    return str(snapshot_dir)
+
+
+def _download_repo_file_direct(snapshot_dir, model_id, filename, endpoint, revision, timeout):
+    import requests
+    from tqdm import tqdm
+
+    target = snapshot_dir / filename
+    incomplete_path = target.with_suffix(target.suffix + ".incomplete")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_size = incomplete_path.stat().st_size if incomplete_path.exists() else 0
+    encoded_filename = quote(filename, safe="/")
+    url = f"{endpoint.rstrip('/')}/{model_id}/resolve/{revision}/{encoded_filename}"
+    headers = {"Accept-Encoding": "identity"}
+    if existing_size > 0:
+        headers["Range"] = f"bytes={existing_size}-"
+
+    print(f"Direct download: {url}")
+    print(f"Resume from byte offset: {existing_size}")
+    with requests.get(url, headers=headers, stream=True, timeout=(10, timeout)) as response:
+        if response.status_code not in {200, 206}:
+            raise RuntimeError(
+                f"Direct download failed with status {response.status_code}: "
+                f"{response.text[:500]}"
+            )
+        if response.status_code == 200 and existing_size > 0:
+            print("Server ignored Range header; restarting this file from byte 0.")
+            existing_size = 0
+        mode = "ab" if existing_size > 0 and response.status_code == 206 else "wb"
+        content_length = int(response.headers.get("Content-Length", "0") or 0)
+        total = existing_size + content_length if content_length > 0 else None
+        with open(incomplete_path, mode) as handle:
+            progress = tqdm(
+                total=total,
+                initial=existing_size,
+                unit="B",
+                unit_scale=True,
+                desc=Path(filename).name,
+            )
+            try:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    handle.write(chunk)
+                    progress.update(len(chunk))
+            finally:
+                progress.close()
+
+    incomplete_path.rename(target)
+    print(f"Direct download completed: {target}")
 
 
 def _resolve_gemma_snapshot_dir(cache_dir):
@@ -552,7 +790,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download pretrained models into the local HF cache.")
     parser.add_argument(
         "--model",
-        choices=["c_radio_v4_h", "gemma_4_31b_it"],
+        choices=["c_radio_v4_h", "gemma_4_31b_it", "qwen_3_6_35b_a3b_fp8"],
         default="c_radio_v4_h",
     )
     parser.add_argument("--cache_dir", type=str, default=custom_cache_path)
@@ -576,6 +814,18 @@ if __name__ == "__main__":
         )
     elif args.model == "gemma_4_31b_it":
         download_gemma_4_31b_it(
+            cache_dir=args.cache_dir,
+            use_china_mirror=not args.no_mirror,
+            mirror_endpoint=args.mirror_endpoint,
+            revision=args.revision,
+            verify_load=args.verify_load,
+            disable_xet=not args.enable_xet,
+            max_workers=args.max_workers,
+            download_timeout=args.download_timeout,
+            direct_fallback=not args.no_direct_fallback,
+        )
+    elif args.model == "qwen_3_6_35b_a3b_fp8":
+        download_qwen_3_6_35b_a3b_fp8(
             cache_dir=args.cache_dir,
             use_china_mirror=not args.no_mirror,
             mirror_endpoint=args.mirror_endpoint,

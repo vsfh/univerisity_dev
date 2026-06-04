@@ -52,6 +52,7 @@ UNIV_CROP_SIZE = (640, 640)
 UNIV_DRONE_SIZE = (256, 256)
 UNIV_SAT_SIZE = IMG_SIZE
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+DEFAULT_OFFICIAL_PRETRAIN = "/media/data1/feihong/ckpt/trogeo_droneaerial_model_best.pth.tar"
 
 CVOGL_TRANSFORM = None
 
@@ -98,6 +99,47 @@ def build_geo_features(batch: Dict, device: torch.device) -> torch.Tensor:
         ],
         dim=1,
     )
+
+
+def _unwrap_state_dict(checkpoint):
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model", "model_state_dict", "net"):
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                return value
+        return checkpoint
+    raise TypeError(f"Expected checkpoint/state_dict dict, got {type(checkpoint)}.")
+
+
+def load_compatible_checkpoint(model: nn.Module, checkpoint_path: str) -> Dict[str, int]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = _unwrap_state_dict(checkpoint)
+    model_state = model.state_dict()
+    compatible_state = {}
+    skipped_shape = 0
+    skipped_missing = 0
+
+    for key, value in state_dict.items():
+        clean_key = str(key).removeprefix("module.")
+        if clean_key not in model_state:
+            skipped_missing += 1
+            continue
+        if tuple(value.shape) != tuple(model_state[clean_key].shape):
+            skipped_shape += 1
+            continue
+        compatible_state[clean_key] = value
+
+    if not compatible_state:
+        raise ValueError(f"No compatible checkpoint weights found in {checkpoint_path}.")
+
+    result = model.load_state_dict(compatible_state, strict=False)
+    return {
+        "loaded": len(compatible_state),
+        "skipped_missing": skipped_missing,
+        "skipped_shape": skipped_shape,
+        "missing_after_load": len(result.missing_keys),
+        "unexpected_after_load": len(result.unexpected_keys),
+    }
 
 
 def format_satellite_img_bbox(
@@ -361,7 +403,11 @@ def main(args):
     )
 
     print("Creating model...")
-    model = TROGeoLite(emb_size=768).to(DEVICE)
+    model = TROGeoLite(emb_size=768)
+    if args.official_pretrain and not args.no_official_pretrain:
+        load_info = load_compatible_checkpoint(model, args.official_pretrain)
+        print(f"Loaded TROGeo official pretrain: {load_info}")
+    model = model.to(DEVICE)
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -450,11 +496,13 @@ def eval(args):
         persistent_workers=args.num_workers > 0,
     )
 
-    model = TROGeoLite(emb_size=768).to(DEVICE)
+    model = TROGeoLite(emb_size=768)
     checkpoint_path = args.checkpoint_path or f"{args.checkpoint}/last.pth"
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=False)
+    load_info = load_compatible_checkpoint(model, checkpoint_path)
+    print(f"Loaded eval checkpoint: {load_info}")
+    model = model.to(DEVICE)
 
     anchors_full = np.array([float(x) for x in ANCHORS.split(",")])
     anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
@@ -508,6 +556,17 @@ if __name__ == "__main__":
         type=str,
         default="/media/data1/feihong/ckpt/ground_cvos",
         help="Path to save model checkpoints",
+    )
+    parser.add_argument(
+        "--official-pretrain",
+        type=str,
+        default=DEFAULT_OFFICIAL_PRETRAIN,
+        help="Official TROGeo checkpoint loaded before training",
+    )
+    parser.add_argument(
+        "--no-official-pretrain",
+        action="store_true",
+        help="Do not load --official-pretrain before training",
     )
     parser.add_argument(
         "--eval-only",
