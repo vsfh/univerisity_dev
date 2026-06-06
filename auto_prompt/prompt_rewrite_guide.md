@@ -19,10 +19,10 @@ Good mutation directions:
 - Prefer layout and geometry over object lists.
 - Keep each change small enough that the score can be attributed to the prompt mutation.
 
-After editing, run:
+After editing, run one evaluation:
 
 ```bash
-python auto_prompt/run_iteration.py --iteration N --overwrite-descriptions
+python -m auto_prompt.evaluate_prompt
 ```
 
 If the new row in `auto_prompt/result.csv` has `accepted=True`, continue mutating from that prompt. Otherwise use `auto_prompt/best_prompt.md` as the next base.

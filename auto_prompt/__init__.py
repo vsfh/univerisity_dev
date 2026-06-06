@@ -1,0 +1,1 @@
+"""Auto-prompt research helpers."""

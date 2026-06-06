@@ -41,11 +41,11 @@ DEFAULT_SUBSET_HEIGHTS = [150, 200, 250, 300]
 DEFAULT_SUBSET_ANGLES = [0, 45, 90, 135, 180, 225, 270, 315]
 RESULT_FIELDS = [
     "timestamp",
-    "iteration",
     "accepted",
     "score_metric",
     "score",
     "previous_best_score",
+    "run_id",
     "prompt_sha1",
     "num_cases",
     "num_queries",
@@ -147,7 +147,7 @@ def _read_prompt(path: Path) -> str:
     return prompt
 
 
-def _iter_split_case_ids(split_file: str) -> Iterable[str]:
+def _yield_split_case_ids(split_file: str) -> Iterable[str]:
     path = Path(split_file)
     if not path.exists():
         raise FileNotFoundError(f"Test split file not found: {path}")
@@ -175,7 +175,7 @@ def _select_valid_case_ids(
     drone_root = Path(drone_image_root)
     sat_root = Path(test_satellite_root)
 
-    for sample_id in _iter_split_case_ids(split_file):
+    for sample_id in _yield_split_case_ids(split_file):
         sat_candidates = [
             sat_root / f"{sample_id}.png",
             sat_root / f"{sample_id}.jpg",
@@ -610,6 +610,7 @@ def append_result(
     args: argparse.Namespace,
     prompt: str,
     prompt_sha1: str,
+    run_id: str,
     metrics: Dict[str, Any],
     descriptions_path: Path,
     query_records_path: Path,
@@ -621,11 +622,11 @@ def append_result(
 
     row = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "iteration": int(args.iteration),
         "accepted": bool(accepted),
         "score_metric": args.score_metric,
         "score": score,
         "previous_best_score": "" if previous_best is None else previous_best,
+        "run_id": run_id,
         "prompt_sha1": prompt_sha1,
         "num_cases": int(metrics["num_cases"]),
         "num_queries": int(metrics["num_queries"]),
@@ -660,7 +661,7 @@ def append_result(
 
     archive_dir = AUTO_PROMPT_DIR / "prompt_archive"
     archive_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = archive_dir / f"iter_{int(args.iteration):03d}_{prompt_sha1[:10]}.md"
+    archive_path = archive_dir / f"{run_id}.md"
     archive_path.write_text(prompt + "\n", encoding="utf-8")
 
     if accepted:
@@ -682,9 +683,8 @@ def write_query_records(path: Path, records: Iterable[Dict[str, Any]]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run one auto-prompt retrieval research iteration on the first test cases."
+        description="Evaluate the current auto-prompt once on the first test cases."
     )
-    parser.add_argument("--iteration", type=int, required=True)
     parser.add_argument("--prompt-file", type=Path, default=DEFAULT_PROMPT_FILE)
     parser.add_argument("--best-prompt-file", type=Path, default=DEFAULT_BEST_PROMPT_FILE)
     parser.add_argument("--result-csv", type=Path, default=DEFAULT_RESULT_CSV)
@@ -754,13 +754,17 @@ def main() -> None:
 
     prompt = _read_prompt(Path(args.prompt_file))
     prompt_sha1 = _sha1_text(prompt)
+    run_id = time.strftime("%Y%m%d_%H%M%S") + f"_{prompt_sha1[:10]}"
     case_ids = _select_valid_case_ids(
         split_file=args.test_split_file,
         max_cases=args.max_cases,
         drone_image_root=args.drone_image_root,
         test_satellite_root=args.test_satellite_root,
     )
-    descriptions_path = Path(args.description_dir) / f"iter_{int(args.iteration):03d}_{prompt_sha1[:10]}.json"
+    descriptions_path = (
+        Path(args.description_dir)
+        / f"prompt_{prompt_sha1[:10]}_cases{int(args.max_cases)}.json"
+    )
 
     if args.skip_generate:
         descriptions_by_sample = load_descriptions(descriptions_path)
@@ -773,23 +777,24 @@ def main() -> None:
         )
 
     metrics = evaluate_retrieval(args, descriptions_by_sample)
-    query_records_path = Path(args.query_record_dir) / f"iter_{int(args.iteration):03d}_{prompt_sha1[:10]}.jsonl"
+    query_records_path = Path(args.query_record_dir) / f"{run_id}.jsonl"
     write_query_records(query_records_path, metrics.pop("query_records"))
 
     row = append_result(
         args=args,
         prompt=prompt,
         prompt_sha1=prompt_sha1,
+        run_id=run_id,
         metrics=metrics,
         descriptions_path=descriptions_path,
         query_records_path=query_records_path,
     )
 
     print(
-        "Iteration {iteration} | accepted={accepted} | "
+        "Run {run_id} | accepted={accepted} | "
         "R@1={r1:.4f} R@5={r5:.4f} R@10={r10:.4f} | "
         "result_csv={csv_path}".format(
-            iteration=args.iteration,
+            run_id=run_id,
             accepted=row["accepted"],
             r1=metrics["recall@1"],
             r5=metrics["recall@5"],

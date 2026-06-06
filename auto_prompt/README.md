@@ -2,10 +2,10 @@
 
 This folder runs prompt-only research for the Qwen description generator and the trained `Encoder_test` retrieval network.
 
-Default single iteration:
+Default single evaluation:
 
 ```bash
-python auto_prompt/run_iteration.py --iteration 1 --overwrite-descriptions
+python -m auto_prompt.evaluate_prompt
 ```
 
 What it does:
@@ -22,8 +22,7 @@ What it does:
 Useful options:
 
 ```bash
-python auto_prompt/run_iteration.py \
-  --iteration 2 \
+python -m auto_prompt.evaluate_prompt \
   --checkpoint /data/feihong/ckpt/model_test_geo_input_ids/last.pth \
   --max-cases 50 \
   --candidate-size 50 \
@@ -32,4 +31,4 @@ python auto_prompt/run_iteration.py \
   --overwrite-descriptions
 ```
 
-For Codex loops, ask it to edit only `auto_prompt/current_prompt.md` using `auto_prompt/prompt_rewrite_guide.md`, then run the iteration script again.
+For Codex loops, use `auto_prompt/auto_research.md`. The outer Codex process owns the iteration loop: it edits `auto_prompt/current_prompt.md`, records the rationale in `AUTO_RESEARCH_CHANGELOG.md`, runs `python -m auto_prompt.evaluate_prompt`, reads `result.csv`, and reverts the prompt when the score does not improve.
