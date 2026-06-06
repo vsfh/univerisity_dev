@@ -4,8 +4,8 @@ from pathlib import Path
 from typing import Dict, List
 
 
-DEFAULT_CSV = "/media/data1/feihong/univerisity_dev/eval_results/test_unify/overall_metrics.csv"
-DEFAULT_OUTPUT = "/media/data1/feihong/univerisity_dev/eval_results/test_unify/overall_metrics_lines.png"
+DEFAULT_CSV = "/data/feihong/univerisity_dev/eval_results/test_unify/overall_metrics.csv"
+DEFAULT_OUTPUT = "/data/feihong/univerisity_dev/eval_results/test_unify/overall_metrics_lines.png"
 METRIC_COLUMNS = ("recall@1", "mean_iou", "uIoU")
 
 

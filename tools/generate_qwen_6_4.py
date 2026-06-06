@@ -23,8 +23,13 @@ except ImportError:
 
 # --- Configuration ---
 MODEL_NAME = "Qwen/Qwen3.6-35B-A3B-FP8"
-CACHE_DIR = "/media/data1/feihong/hf_cache"
+CACHE_DIR = "/media/4tb/feihong/hf_cache"
 DEFAULT_GPU_ID = -1
+DEFAULT_GPU_IDS = "1"
+DEFAULT_GPU_MEMORY_UTILIZATION = 0.92
+DEFAULT_GPU_MEMORY_RESERVE_GIB = 2.0
+DEFAULT_FREE_MEMORY_RESERVE_GIB = 3.0
+DEFAULT_CUDA_ALLOC_CONF = "expandable_segments:True"
 DEFAULT_HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "")
 DEFAULT_IMAGE_ROOT = "/media/data1/feihong/drone_img"
 IMAGE_SIZE = (256, 256)
@@ -32,24 +37,59 @@ HEIGHTS = (150, 200, 250, 300)
 CARDINAL_ANGLES = (0, 90, 180, 270)
 DEFAULT_OUTPUT_NAME = "qwen_6_4_description.json"
 DEFAULT_SUMMARY_NAME = "qwen_6_4_description_summary.json"
+DEFAULT_GENERATION_BATCH_SIZE = 4
 REQUIRED_LOCAL_FILES = (
     "config.json",
     "tokenizer_config.json",
 )
 HEIGHT_PROMPT = (
-    "The four drone images show the same target area at one flight height from "
-    "north/east/south/west views.\n\n"
-    "Write exactly one satellite-map retrieval description as exactly 4 "
-    "comma-separated English noun phrases.\n\n"
-    "Phrase 1 is mandatory: it must be 8-12 words and describe the single most "
-    "distinctive building or environmental feature that would distinguish this "
-    "target area on a satellite map.\n"
-    "Phrases 2-4 should be short supporting cues about roof shape, footprint, "
-    "open space, road geometry, water, sports fields, parking, tree belts, or "
-    "relative layout.\n\n"
-    "Use stable overhead-visible evidence only. Avoid angle-specific language, "
-    "uncertain claims, markdown, numbering, headings, and full explanatory "
-    "sentences. Output only the 4 comma-separated phrases."
+    "You are a remote-sensing image description expert. "
+    "The four drone images show the same target area at one flight height. "
+    "Image order is angle 0 north-facing, angle 90 east-facing, angle 180 "
+    "south-facing, and angle 270 west-facing. Use these orientations only as "
+    "clues for inferring the unified overhead layout. The top of the satellite "
+    "map is north.\n\n"
+    "Write for a SigLIP2 text encoder and satellite-map search: the main output "
+    "must read like one compact overhead retrieval prompt, not a report, "
+    "checklist, caption, or per-image comparison. Focus on the target area as a "
+    "single unified place. A detail may come from one clear image if it is "
+    "satellite-visible and useful, but describe it in the unified map coordinate "
+    "system rather than as something seen in that image.\n\n"
+    "The first sentence of the main retrieval text must be the most distinctive "
+    "satellite-visible setting of the target area. After that, add short noun "
+    "phrases and spatial phrases that would help match the target on overhead "
+    "imagery. Favor stable evidence: building footprint, roof color and shape, "
+    "facade or pavement color when visible, road color and geometry, parking "
+    "lots, playgrounds or sports fields, water, green space, plazas, "
+    "intersections, walls or fences, tree belts, shadows, and adjacent land "
+    "cover. Include more concrete color words when visible, such as gray, white, "
+    "red, blue, green, tan, black, light, dark, brick, asphalt, concrete, grass, "
+    "or bare earth. Use directional and relative layout cues naturally: north, "
+    "south, east, west, center, northwest, northeast, southwest, southeast, near, "
+    "between, along, adjacent to, surrounded by, and relative to roads, buildings, "
+    "or green space.\n\n"
+    "Do not mention the source view or camera orientation in the final output. "
+    "Forbidden wording includes north-facing image, east-facing image, "
+    "south-facing image, west-facing image, this view, that view, angle 0, "
+    "angle 90, angle 180, angle 270, photo, and image. Because all inputs are "
+    "drone aerial images, also avoid generic capture-mode phrases such as "
+    "aerial view of, drone view of, overhead view of, satellite view of, or "
+    "top-down view of; these do not help retrieval. Do not write separate "
+    "sentences for separate views.\n\n"
+    "Do not invent place names, school names, city names, coordinates, functions, "
+    "or facts not visible from the images. Do not make temporary details the main "
+    "signal: vehicles, pedestrians, construction material, and lighting changes "
+    "should be ignored unless they are unusually prominent and consistent across "
+    "all four views. If views disagree, silently discard conflicting, weak, or "
+    "unstable cues; keep only shared and stable evidence in the retrieval text.\n\n"
+    "Keep the whole output within about 60 SigLIP2-style text tokens. Balance "
+    "the content roughly 1:1: the first distinctive sentence should carry about "
+    "half of the useful information, and the following short phrases should "
+    "carry the other half.\n\n"
+    "Output exactly one line:\n"
+    "<one distinctive first sentence, then 4 concise "
+    "comma separated English phrases; no markdown; no "
+    "numbering>"
 )
 
 
@@ -64,6 +104,116 @@ def _dtype_from_name(dtype_name: str) -> Any:
     if name in {"fp32", "float32"}:
         return torch.float32
     raise ValueError(f"Unsupported dtype: {dtype_name}")
+
+
+def _parse_gpu_ids(gpu_ids: str) -> Optional[List[int]]:
+    gpu_ids = gpu_ids.strip()
+    if not gpu_ids:
+        return None
+    parsed: List[int] = []
+    for item in gpu_ids.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        parsed.append(int(item))
+    return parsed or None
+
+
+def _configure_visible_gpus(gpu_ids: str) -> Optional[List[int]]:
+    parsed = _parse_gpu_ids(gpu_ids)
+    if parsed is None:
+        return None
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(item) for item in parsed)
+    print(f"Using CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
+    return parsed
+
+
+def _normalize_memory_value(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError("Empty GPU memory value.")
+    suffixes = ("GiB", "MiB", "GB", "MB")
+    if value.endswith(suffixes):
+        return value
+    return f"{value}GiB"
+
+
+def _memory_value_to_gib(value: str) -> float:
+    normalized = _normalize_memory_value(value)
+    for suffix, divisor in (
+        ("GiB", 1.0),
+        ("GB", 1024 ** 3 / 1000 ** 3),
+        ("MiB", 1024.0),
+        ("MB", 1024 ** 3 / 1000 ** 2),
+    ):
+        if normalized.endswith(suffix):
+            return float(normalized[: -len(suffix)].strip()) / divisor
+    raise ValueError(f"Unsupported memory value: {value}")
+
+
+def _free_cuda_memory_gib(device_idx: int) -> float:
+    free_bytes, _ = torch.cuda.mem_get_info(device_idx)
+    return free_bytes / (1024 ** 3)
+
+
+def _build_max_memory(
+    max_memory_per_gpu: Optional[str],
+    gpu_memory_utilization: float,
+    gpu_memory_reserve_gib: float,
+    cpu_max_memory: Optional[str],
+    respect_free_memory: bool,
+    free_memory_reserve_gib: float,
+) -> Optional[Dict[Any, str]]:
+    if not torch.cuda.is_available():
+        return None
+
+    num_devices = torch.cuda.device_count()
+    if num_devices <= 0:
+        return None
+
+    max_memory: Dict[Any, str] = {}
+    reserve_free_gib = max(float(free_memory_reserve_gib), 0.0)
+    if max_memory_per_gpu:
+        values = [
+            _normalize_memory_value(item)
+            for item in max_memory_per_gpu.split(",")
+            if item.strip()
+        ]
+        if len(values) == 1:
+            values = values * num_devices
+        if len(values) != num_devices:
+            raise ValueError(
+                f"--max_memory_per_gpu should provide 1 value or {num_devices} values, "
+                f"got {len(values)}."
+            )
+        for idx, value in enumerate(values):
+            requested_gib = _memory_value_to_gib(value)
+            usable_gib = requested_gib
+            if respect_free_memory:
+                free_gib = _free_cuda_memory_gib(idx)
+                usable_gib = min(requested_gib, max(free_gib - reserve_free_gib, 1.0))
+                if int(usable_gib) < int(requested_gib):
+                    print(
+                        f"Capping visible GPU {idx} max_memory from {value} to "
+                        f"{int(usable_gib)}GiB based on current free memory "
+                        f"({free_gib:.1f}GiB free)."
+                    )
+            max_memory[idx] = f"{int(usable_gib)}GiB"
+    else:
+        utilization = min(max(float(gpu_memory_utilization), 0.1), 1.0)
+        reserve_gib = max(float(gpu_memory_reserve_gib), 0.0)
+        for idx in range(num_devices):
+            props = torch.cuda.get_device_properties(idx)
+            total_gib = props.total_memory / (1024 ** 3)
+            usable_gib = max(total_gib * utilization - reserve_gib, 1.0)
+            if respect_free_memory:
+                free_gib = _free_cuda_memory_gib(idx)
+                usable_gib = min(usable_gib, max(free_gib - reserve_free_gib, 1.0))
+            max_memory[idx] = f"{int(usable_gib)}GiB"
+
+    if cpu_max_memory:
+        max_memory["cpu"] = _normalize_memory_value(cpu_max_memory)
+    return max_memory
 
 
 def _snapshot_download_with_retries(
@@ -174,6 +324,7 @@ def load_qwen36(
     pre_download: bool = True,
     download_retries: int = 5,
     download_max_workers: int = 8,
+    max_memory: Optional[Dict[Any, str]] = None,
 ) -> Tuple[Any, AutoProcessor]:
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["HF_HOME"] = cache_dir
@@ -207,6 +358,9 @@ def load_qwen36(
         "cache_dir": cache_dir,
         "dtype": _dtype_from_name(dtype),
     }
+    if max_memory is not None and gpu_id is None:
+        model_kwargs["max_memory"] = max_memory
+        print(f"Using device_map='auto' max_memory={max_memory}")
     if hf_token:
         model_kwargs["token"] = hf_token
     if use_flash_attention:
@@ -239,6 +393,13 @@ def load_qwen36(
 
 
 def _get_input_device(model: Any) -> torch.device:
+    hf_device_map = getattr(model, "hf_device_map", None)
+    if isinstance(hf_device_map, dict):
+        for device in hf_device_map.values():
+            if isinstance(device, int):
+                return torch.device(f"cuda:{device}")
+            if isinstance(device, str) and device.startswith("cuda"):
+                return torch.device(device)
     device = getattr(model, "device", None)
     if device is not None:
         return torch.device(device)
@@ -332,7 +493,7 @@ def _sample_id_from_dir(image_dir: str) -> str:
 
 def _apply_chat_template(
     processor: AutoProcessor,
-    messages: List[Dict[str, Any]],
+    messages: Any,
     model: Any,
     enable_thinking: bool,
 ) -> Any:
@@ -355,10 +516,10 @@ def _apply_chat_template(
 
 
 @torch.inference_mode()
-def _generate(
+def _generate_batch(
     model: Any,
     processor: AutoProcessor,
-    messages: List[Dict[str, Any]],
+    conversations: Sequence[List[Dict[str, Any]]],
     max_new_tokens: int,
     temperature: float,
     top_p: float,
@@ -367,7 +528,7 @@ def _generate(
 ) -> str:
     inputs = _apply_chat_template(
         processor=processor,
-        messages=messages,
+        messages=list(conversations),
         model=model,
         enable_thinking=enable_thinking,
     )
@@ -383,12 +544,35 @@ def _generate(
 
     outputs = model.generate(**inputs, **generate_kwargs)
     generated_ids_trimmed = outputs[:, input_len:]
-    output_text = processor.batch_decode(
+    output_texts = processor.batch_decode(
         generated_ids_trimmed,
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     )
-    return output_text[0].replace("\n", " ").strip()
+    return [text.replace("\n", " ").strip() for text in output_texts]
+
+
+@torch.inference_mode()
+def _generate(
+    model: Any,
+    processor: AutoProcessor,
+    messages: List[Dict[str, Any]],
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    enable_thinking: bool,
+) -> str:
+    return _generate_batch(
+        model=model,
+        processor=processor,
+        conversations=[messages],
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        enable_thinking=enable_thinking,
+    )[0]
 
 
 def generate_height_description(
@@ -426,21 +610,33 @@ def generate_descriptions_for_one_dir(
 ) -> Dict[str, Any]:
     height_groups = collect_height_groups(resolved_image_dir)
     descriptions: Dict[str, str] = {}
+    generation_batch_size = max(int(args.generation_batch_size), 1)
+    height_items = [(str(height), height_groups[str(height)]) for height in HEIGHTS]
 
-    for height in (str(item) for item in HEIGHTS):
-        descriptions[height] = generate_height_description(
-            image_paths=height_groups[height],
+    for start in range(0, len(height_items), generation_batch_size):
+        batch_items = height_items[start : start + generation_batch_size]
+        conversations: List[List[Dict[str, Any]]] = []
+        for _, image_paths in batch_items:
+            _validate_images(
+                image_paths,
+                expected_size=(args.image_width, args.image_height),
+            )
+            conversations.append(
+                [_build_message(args.prompt, image_paths, image_field=args.image_field)]
+            )
+
+        batch_outputs = _generate_batch(
             model=model,
             processor=processor,
-            prompt=args.prompt,
-            image_size=(args.image_width, args.image_height),
-            image_field=args.image_field,
+            conversations=conversations,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,
             enable_thinking=args.enable_thinking,
         )
+        for (height, _), output_text in zip(batch_items, batch_outputs):
+            descriptions[height] = output_text
 
     return {
         "satellite_id": _sample_id_from_dir(resolved_image_dir),
@@ -466,7 +662,7 @@ def generate_and_save_for_one_dir(
     if not output_path.is_absolute():
         output_path = Path(resolved_image_dir) / output_path
 
-    if output_path.exists() and not args.overwrite:
+    if output_path.exists() and args.skip_existing:
         try:
             with output_path.open("r", encoding="utf-8") as f:
                 existing_result = json.load(f)
@@ -492,6 +688,35 @@ def generate_and_save_for_one_dir(
     return result
 
 
+def _output_path_for_dir(image_dir: str, output_name: str) -> Path:
+    output_path = Path(output_name)
+    if output_path.is_absolute():
+        return output_path
+    return Path(image_dir) / output_path
+
+
+def _load_completed_result(
+    image_dir: str,
+    output_name: str,
+    skip_existing: bool,
+) -> Optional[Dict[str, Any]]:
+    if not skip_existing:
+        return None
+    output_path = _output_path_for_dir(image_dir, output_name)
+    if not output_path.exists():
+        return None
+    try:
+        with output_path.open("r", encoding="utf-8") as f:
+            result = json.load(f)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(result, dict):
+        return None
+    result.setdefault("image_dir", image_dir)
+    result["skipped"] = True
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -511,7 +736,73 @@ def main() -> None:
         "--gpu_id",
         type=int,
         default=DEFAULT_GPU_ID,
-        help="CUDA GPU index. Use -1 for device_map='auto' across available GPUs.",
+        help=(
+            "CUDA GPU index for single-GPU loading. Use -1 for device_map='auto' "
+            "across the GPUs exposed by --gpu_ids."
+        ),
+    )
+    parser.add_argument(
+        "--gpu_ids",
+        type=str,
+        default=DEFAULT_GPU_IDS,
+        help=(
+            "Physical CUDA GPU ids exposed to this process for auto sharding. "
+            "Default uses two cards: 0,1. Set to '' to keep the current environment."
+        ),
+    )
+    parser.add_argument(
+        "--gpu_memory_utilization",
+        type=float,
+        default=DEFAULT_GPU_MEMORY_UTILIZATION,
+        help=(
+            "Fraction of each visible GPU's total memory used for max_memory when "
+            "--max_memory_per_gpu is not set."
+        ),
+    )
+    parser.add_argument(
+        "--gpu_memory_reserve_gib",
+        type=float,
+        default=DEFAULT_GPU_MEMORY_RESERVE_GIB,
+        help="Extra GiB reserved on each visible GPU after applying utilization.",
+    )
+    parser.add_argument(
+        "--max_memory_per_gpu",
+        type=str,
+        default=None,
+        help=(
+            "Override max_memory per visible GPU, e.g. '42GiB' for all visible GPUs "
+            "or '42GiB,44GiB'. Plain numbers are treated as GiB."
+        ),
+    )
+    parser.add_argument(
+        "--cpu_max_memory",
+        type=str,
+        default=None,
+        help="Optional CPU offload memory limit for device_map, e.g. '64GiB'.",
+    )
+    parser.add_argument(
+        "--respect_free_memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Cap max_memory by currently free CUDA memory. This avoids overcommitting "
+            "a visible GPU that already has another process on it."
+        ),
+    )
+    parser.add_argument(
+        "--free_memory_reserve_gib",
+        type=float,
+        default=DEFAULT_FREE_MEMORY_RESERVE_GIB,
+        help="Additional GiB kept free on each visible GPU when capping by free memory.",
+    )
+    parser.add_argument(
+        "--cuda_alloc_conf",
+        type=str,
+        default=DEFAULT_CUDA_ALLOC_CONF,
+        help=(
+            "Default PYTORCH_CUDA_ALLOC_CONF set before CUDA initialization. Use '' "
+            "to leave the environment unchanged."
+        ),
     )
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"])
     parser.add_argument("--flash_attn", action="store_true")
@@ -548,17 +839,129 @@ def main() -> None:
     parser.add_argument("--image_field", choices=["pil", "url", "image"], default="image")
     parser.add_argument("--prompt", type=str, default=HEIGHT_PROMPT)
     parser.add_argument("--max_new_tokens", type=int, default=96)
+    parser.add_argument(
+        "--generation_batch_size",
+        type=int,
+        default=DEFAULT_GENERATION_BATCH_SIZE,
+        help=(
+            "Number of height prompts generated together per sample. Use 1 for "
+            "lowest memory, 2 or 4 for better GPU utilization."
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--top_k", type=int, default=64)
     parser.add_argument("--enable_thinking", action="store_true")
-    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--skip_existing",
+        action="store_true",
+        help="Skip a case when its output JSON already exists. Default regenerates and overwrites.",
+    )
+    parser.add_argument(
+        "--num_shards",
+        type=int,
+        default=1,
+        help="Split sample directories across this many independent processes.",
+    )
+    parser.add_argument(
+        "--shard_id",
+        type=int,
+        default=0,
+        help="Shard index for this process, in [0, num_shards).",
+    )
     args = parser.parse_args()
 
+    _configure_visible_gpus(args.gpu_ids)
+    if args.cuda_alloc_conf:
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", args.cuda_alloc_conf)
+        print(f"Using PYTORCH_CUDA_ALLOC_CONF={os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
     selected_gpu_id: Optional[int] = None if args.gpu_id == -1 else args.gpu_id
+    max_memory = _build_max_memory(
+        max_memory_per_gpu=args.max_memory_per_gpu,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        gpu_memory_reserve_gib=args.gpu_memory_reserve_gib,
+        cpu_max_memory=args.cpu_max_memory,
+        respect_free_memory=args.respect_free_memory,
+        free_memory_reserve_gib=args.free_memory_reserve_gib,
+    )
     has_single_input = any(
         item is not None for item in [args.image_dir, args.one_image]
     ) or (args.image_root is not None and args.sample_id is not None)
+
+    resolved_image_dir: Optional[str] = None
+    all_sample_dirs: List[str] = []
+    shard_sample_dirs: List[str] = []
+    sample_dirs: List[str] = []
+    output_name = Path(args.output).name if Path(args.output).is_absolute() else args.output
+
+    if has_single_input:
+        resolved_image_dir = resolve_image_dir(
+            image_dir=args.image_dir,
+            image_root=args.image_root,
+            sample_id=args.sample_id,
+            one_image=args.one_image,
+        )
+        existing_result = _load_completed_result(
+            image_dir=resolved_image_dir,
+            output_name=args.output,
+            skip_existing=args.skip_existing,
+        )
+        if existing_result is not None:
+            print(f"Skipping completed case: {resolved_image_dir}")
+            if "descriptions" in existing_result:
+                print(json.dumps(existing_result["descriptions"], indent=2, ensure_ascii=False))
+            return
+    else:
+        if args.num_shards < 1:
+            raise ValueError("--num_shards must be >= 1.")
+        if args.shard_id < 0 or args.shard_id >= args.num_shards:
+            raise ValueError("--shard_id must be in [0, num_shards).")
+
+        all_sample_dirs = list_sample_dirs(args.default_image_root)
+        shard_sample_dirs = [
+            sample_dir
+            for idx, sample_dir in enumerate(all_sample_dirs)
+            if idx % args.num_shards == args.shard_id
+        ]
+        sample_dirs = [
+            sample_dir
+            for sample_dir in shard_sample_dirs
+            if _load_completed_result(sample_dir, output_name, args.skip_existing) is None
+        ]
+        num_skipped_existing = len(shard_sample_dirs) - len(sample_dirs)
+        if num_skipped_existing > 0:
+            print(
+                f"Skipping {num_skipped_existing} completed cases with existing "
+                f"{output_name}."
+            )
+        if not sample_dirs:
+            summary_name = DEFAULT_SUMMARY_NAME
+            if args.num_shards > 1:
+                summary_name = (
+                    f"{Path(DEFAULT_SUMMARY_NAME).stem}_shard{args.shard_id}"
+                    f"_of_{args.num_shards}{Path(DEFAULT_SUMMARY_NAME).suffix}"
+                )
+            summary_path = Path(args.default_image_root).resolve() / summary_name
+            summary = {
+                "image_root": str(Path(args.default_image_root).resolve()),
+                "model_name": args.model_name,
+                "output_name": output_name,
+                "heights": list(HEIGHTS),
+                "angles_per_height": list(CARDINAL_ANGLES),
+                "num_total_samples": len(all_sample_dirs),
+                "num_samples": len(shard_sample_dirs),
+                "num_pending": 0,
+                "num_skipped_existing": num_skipped_existing,
+                "num_shards": args.num_shards,
+                "shard_id": args.shard_id,
+                "num_success": 0,
+                "num_failed": 0,
+                "failed_samples": [],
+            }
+            with summary_path.open("w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2, ensure_ascii=False)
+            print(f"Done. No pending cases. summary={summary_path}")
+            return
 
     load_model_name = args.model_name
     pre_download = not args.skip_pre_download
@@ -584,15 +987,11 @@ def main() -> None:
         pre_download=pre_download,
         download_retries=args.download_retries,
         download_max_workers=args.download_max_workers,
+        max_memory=max_memory,
     )
 
     if has_single_input:
-        resolved_image_dir = resolve_image_dir(
-            image_dir=args.image_dir,
-            image_root=args.image_root,
-            sample_id=args.sample_id,
-            one_image=args.one_image,
-        )
+        assert resolved_image_dir is not None
         result = generate_and_save_for_one_dir(
             resolved_image_dir=resolved_image_dir,
             output_name=args.output,
@@ -602,9 +1001,6 @@ def main() -> None:
         )
         print(json.dumps(result["descriptions"], indent=2, ensure_ascii=False))
         return
-
-    sample_dirs = list_sample_dirs(args.default_image_root)
-    output_name = Path(args.output).name if Path(args.output).is_absolute() else args.output
 
     num_success = 0
     failed_samples: List[Dict[str, str]] = []
@@ -630,12 +1026,23 @@ def main() -> None:
         "output_name": output_name,
         "heights": list(HEIGHTS),
         "angles_per_height": list(CARDINAL_ANGLES),
-        "num_samples": len(sample_dirs),
+        "num_total_samples": len(all_sample_dirs),
+        "num_samples": len(shard_sample_dirs),
+        "num_pending": len(sample_dirs),
+        "num_skipped_existing": len(shard_sample_dirs) - len(sample_dirs),
+        "num_shards": args.num_shards,
+        "shard_id": args.shard_id,
         "num_success": num_success,
         "num_failed": len(failed_samples),
         "failed_samples": failed_samples,
     }
-    summary_path = Path(args.default_image_root).resolve() / DEFAULT_SUMMARY_NAME
+    summary_name = DEFAULT_SUMMARY_NAME
+    if args.num_shards > 1:
+        summary_name = (
+            f"{Path(DEFAULT_SUMMARY_NAME).stem}_shard{args.shard_id}"
+            f"_of_{args.num_shards}{Path(DEFAULT_SUMMARY_NAME).suffix}"
+        )
+    summary_path = Path(args.default_image_root).resolve() / summary_name
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 

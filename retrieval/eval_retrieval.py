@@ -110,8 +110,8 @@ EncoderAbla, EncoderDino, EncoderHeat = _load_encoder_classes()
 
 EVAL_CONFIG = {
 	"device": "cuda:1",
-	# "include_file": "/media/data1/feihong/ckpt/include_train.json",
-	"include_file": "/media/data1/feihong/ckpt/include1.json",
+	# "include_file": "/data/feihong/ckpt/include_train.json",
+	"include_file": "/data/feihong/ckpt/include1.json",
 	# "subset_heights": [300],
 	"subset_heights": [150, 200, 250, 300],
 	# "subset_angles": [270],
@@ -130,14 +130,14 @@ EVAL_CONFIG = {
 		"output_dir": "runs/visualizations/retrieval_top1_errors",
 	},
 		"models": {
-			# "siglip": {"run": True, "checkpoint": '/media/data1/feihong/ckpt/retrieval_siglip/last.pth'},
-			# "encoder_abla": {"run": False, "checkpoint": '/media/data1/feihong/ckpt/0.1_wo_angle/last.pth'},
-			# "encoder_dino": {"run": True, "checkpoint": '/media/data1/feihong/ckpt/0.1_full_model/last.pth'},
-			# "encoder_heat": {"run": False, "checkpoint": '/media/data1/feihong/ckpt/0.5_mix_model_heat/last.pth'},
-			"sample_retrieval": {"run": True, "checkpoint": "/media/data1/feihong/ckpt/retrieval_sample4geo/last.pth"},
-			# "clip": {"run": True, "checkpoint": '/media/data1/feihong/ckpt/retrieval_clip/last.pth'},
-		# "openclip": {"run": True, "checkpoint": '/media/data1/feihong/ckpt/retrieval_openclip/last.pth'},
-		# "evaclip": {"run": True, "checkpoint": '/media/data1/feihong/ckpt/retrieval_evaclip/last.pth'},
+			# "siglip": {"run": True, "checkpoint": '/data/feihong/ckpt/retrieval_siglip/last.pth'},
+			# "encoder_abla": {"run": False, "checkpoint": '/data/feihong/ckpt/0.1_wo_angle/last.pth'},
+			# "encoder_dino": {"run": True, "checkpoint": '/data/feihong/ckpt/0.1_full_model/last.pth'},
+			# "encoder_heat": {"run": False, "checkpoint": '/data/feihong/ckpt/0.5_mix_model_heat/last.pth'},
+			"sample_retrieval": {"run": True, "checkpoint": "/data/feihong/ckpt/retrieval_sample4geo/last.pth"},
+			# "clip": {"run": True, "checkpoint": '/data/feihong/ckpt/retrieval_clip/last.pth'},
+		# "openclip": {"run": True, "checkpoint": '/data/feihong/ckpt/retrieval_openclip/last.pth'},
+		# "evaclip": {"run": True, "checkpoint": '/data/feihong/ckpt/retrieval_evaclip/last.pth'},
 	},
 }
 
@@ -201,7 +201,7 @@ def _load_include_map(include_file: Optional[str]) -> Dict[str, Set[str]]:
 def _default_checkpoint_for(model_type: str) -> str:
 	model_type = _canonical_model_type(model_type)
 	if model_type == "sample_retrieval":
-		return "/media/data1/feihong/ckpt/retrieval_sample4geo/last.pth"
+		return "/data/feihong/ckpt/retrieval_sample4geo/last.pth"
 	return str(REPO_ROOT / "ckpt" / f"retrieval_{model_type}" / "best.pth")
 
 
@@ -309,7 +309,7 @@ def _collect_recall1_per_subset_details(
 	subset_heights: Optional[Sequence[int]] = None,
 	subset_angles: Optional[Sequence[int]] = None,
 	candidate_size: Optional[int] = None,
-	include_file: str = "/media/data1/feihong/ckpt/include.json",
+	include_file: str = "/data/feihong/ckpt/include.json",
 	batch_size: int = 16,
 	num_workers: int = 8,
 	device: Optional[str] = None,
@@ -398,7 +398,7 @@ def _collect_recall_metrics_per_subset_details(
 	subset_heights: Optional[Sequence[int]] = None,
 	subset_angles: Optional[Sequence[int]] = None,
 	candidate_size: Optional[int] = None,
-	include_file: str = "/media/data1/feihong/ckpt/include.json",
+	include_file: str = "/data/feihong/ckpt/include.json",
 	batch_size: int = 16,
 	num_workers: int = 8,
 	device: Optional[str] = None,
@@ -1071,12 +1071,12 @@ def eval(
 	subset_heights: Optional[Sequence[int]] = None,
 	subset_angles: Optional[Sequence[int]] = None,
 	candidate_size: Optional[int] = None,
-	include_file: str = "/media/data1/feihong/ckpt/include.json",
+	include_file: str = "/data/feihong/ckpt/include.json",
 	batch_size: int = 16,
 	num_workers: int = 8,
 	device: Optional[str] = None,
 	error_analysis: Optional[Dict[str, object]] = None,
-	output_dir: str = "/media/data1/feihong/univerisity_dev/eval_results",
+	output_dir: str = "/data/feihong/univerisity_dev/eval_results",
 ) -> Dict[str, float]:
 	if device is None:
 		device = "cuda:1" if torch.cuda.is_available() else "cpu"
@@ -1171,7 +1171,7 @@ def eval_recall1_per_subset(
 	subset_heights: Optional[Sequence[int]] = None,
 	subset_angles: Optional[Sequence[int]] = None,
 	candidate_size: Optional[int] = None,
-	include_file: str = "/media/data1/feihong/ckpt/include.json",
+	include_file: str = "/data/feihong/ckpt/include.json",
 	batch_size: int = 16,
 	num_workers: int = 8,
 	device: Optional[str] = None,
@@ -1232,11 +1232,11 @@ def eval_encoder_heat(
 	subset_heights: Optional[Sequence[int]] = None,
 	subset_angles: Optional[Sequence[int]] = None,
 	candidate_size: Optional[int] = None,
-	include_file: str = "/media/data1/feihong/ckpt/include1.json",
+	include_file: str = "/data/feihong/ckpt/include1.json",
 	batch_size: int = 16,
 	num_workers: int = 8,
 	device: Optional[str] = None,
-	output_dir: str = "/media/data1/feihong/univerisity_dev/eval_results",
+	output_dir: str = "/data/feihong/univerisity_dev/eval_results",
 	output_json_path: Optional[str] = None,
 	include_per_subset_recall1: bool = False,
 ) -> List[Dict[str, object]]:
@@ -1246,10 +1246,10 @@ def eval_encoder_heat(
 	configured angle subset for that height.
 	"""
 	checkpoint_paths = [
-		"/media/data1/feihong/ckpt/0.5_mix_model_heat_2/last.pth",
-		# "/media/data1/feihong/ckpt/0.5_mix_model_wo_angle/last.pth",
-		# "/media/data1/feihong/ckpt/0.5_mix_model_wo_text/last.pth",
-		# "/media/data1/feihong/ckpt/0_mix_model_retrieval_only/last.pth",
+		"/data/feihong/ckpt/0.5_mix_model_heat_2/last.pth",
+		# "/data/feihong/ckpt/0.5_mix_model_wo_angle/last.pth",
+		# "/data/feihong/ckpt/0.5_mix_model_wo_text/last.pth",
+		# "/data/feihong/ckpt/0_mix_model_retrieval_only/last.pth",
 		
 	]
 

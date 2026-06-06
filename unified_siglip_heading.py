@@ -41,13 +41,13 @@ class AverageMeter:
 
 
 MODEL_NAME = "google/siglip-base-patch16-224"
-CACHE_DIR = "/media/data1/feihong/hf_cache"
-DRONE_VIEW_FOLDER = "/media/data1/feihong/drone_view"
-IMAGE_FOLDER = "/media/data1/feihong/image_1024"
-HEADING_FOLDER = "/media/data1/feihong/range_250"
-TEXT_FILE = "/media/data1/feihong/drone_text_single_long.json"
-TRAIN_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/train.json"
-TEST_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
+CACHE_DIR = "/data/feihong/hf_cache"
+DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
+IMAGE_FOLDER = "/data/feihong/image_1024"
+HEADING_FOLDER = "/data/feihong/range_250"
+TEXT_FILE = "/data/feihong/drone_text_single_long.json"
+TRAIN_BBOX_FILE = "/data/feihong/univerisity_dev/runs/train.json"
+TEST_BBOX_FILE = "/data/feihong/univerisity_dev/runs/test.json"
 
 SAT_ORIG_SIZE = (3840, 2160)
 UNIV_SAT_SIZE = (640, 640)
@@ -368,14 +368,14 @@ def main(save_path):
 
     print("Reading train/test IDs from files...")
     train_ids = set()
-    with open("/media/data1/feihong/ckpt/train.txt", "r") as f:
+    with open("/data/feihong/ckpt/train.txt", "r") as f:
         for line in f:
             query_path = line.strip()
             name = query_path.split("/")[-2]
             train_ids.add(name)
 
     test_ids = set()
-    with open("/media/data1/feihong/ckpt/test.txt", "r") as f:
+    with open("/data/feihong/ckpt/test.txt", "r") as f:
         for line in f:
             query_path = line.strip()
             name = query_path.split("/")[-2]
@@ -778,7 +778,7 @@ def eval(run=False):
             DEVICE
         )
 
-        model_path = "/media/data1/feihong/ckpt/grounding_siglip/best_info_48.pth"
+        model_path = "/data/feihong/ckpt/grounding_siglip/best_info_48.pth"
         if os.path.exists(model_path):
             model.load_state_dict(torch.load(model_path, map_location="cpu"))
             print(f"Loaded checkpoint: {model_path}")
@@ -788,7 +788,7 @@ def eval(run=False):
         model.eval()
 
         eval_image_pairs = []
-        with open("/media/data1/feihong/ckpt/test.txt", "r") as f:
+        with open("/data/feihong/ckpt/test.txt", "r") as f:
             for line in f:
                 index = line.strip().split("/")[-2]
                 heading_filename = f"{HEADING_FOLDER}/{index}_range250_heading0.png"
@@ -866,7 +866,7 @@ def eval(run=False):
                     res_heading[key] = pred_heading_np[i]
                     res_name[key] = [names[i], heading_val]
 
-        SATELLITE_FOLDER = "/media/data1/feihong/asian_univ"
+        SATELLITE_FOLDER = "/data/feihong/asian_univ"
         satellite_files = sorted(
             [f for f in os.listdir(SATELLITE_FOLDER) if f.endswith(".png")]
         )
@@ -915,7 +915,7 @@ def eval(run=False):
         with open("eval_name_heading.json", "r") as f:
             res_name = json.load(f)
 
-        distances = json.load(open("/media/data1/feihong/ckpt/distances.json", "r"))
+        distances = json.load(open("/data/feihong/ckpt/distances.json", "r"))
         test_num = 100
 
         heading_correct = {0: 0, 90: 0, 180: 0, 270: 0}
@@ -1125,7 +1125,7 @@ def eval_old(run=False):
     if run:
         print("Initializing Evaluation...")
         img_to_text_dict = json.load(
-            open("/media/data1/feihong/drone_text_single_long.json", "r")
+            open("/data/feihong/drone_text_single_long.json", "r")
         )
 
         # Load Processors
@@ -1157,11 +1157,11 @@ def eval_old(run=False):
 
         # Prepare Data List
         eval_list = []
-        with open("/media/data1/feihong/ckpt/test.txt", "r") as f:
+        with open("/data/feihong/ckpt/test.txt", "r") as f:
             for line in f:
                 img_path = line.strip()
                 # index = line.strip().split("/")[-2]
-                # img_path = f"/media/data1/feihong/range_250/{index}_range250_heading0.png"
+                # img_path = f"/data/feihong/range_250/{index}_range250_heading0.png"
                 eval_list.append(img_path)
 
         # Create Dataset & Loader with bbox_dict
@@ -1202,7 +1202,7 @@ def eval_old(run=False):
         cde_meter = AverageMeter()
 
         success_filenames = set()
-        success_file = "/media/data1/feihong/univerisity_dev/eval_success_single.txt"
+        success_file = "/data/feihong/univerisity_dev/eval_success_single.txt"
         if os.path.exists(success_file):
             with open(success_file, "r") as f:
                 for line in f:
@@ -1302,7 +1302,7 @@ def eval_old(run=False):
         print(f"Heading MSE: {heading_meter.avg:.4f}")
         print("=" * 30)
 
-        SATELLITE_FOLDER = "/media/data1/feihong/asian_univ"
+        SATELLITE_FOLDER = "/data/feihong/asian_univ"
         satellite_files = sorted(
             [f for f in os.listdir(SATELLITE_FOLDER) if f.endswith(".png")]
         )
@@ -1345,7 +1345,7 @@ def eval_old(run=False):
         search_res = np.load("eval_search_clip.npz")
         fused_query_res = np.load("eval_fused_query_clip.npz")
 
-        distances = json.load(open("/media/data1/feihong/ckpt/distances.json", "r"))
+        distances = json.load(open("/data/feihong/ckpt/distances.json", "r"))
         num = 0 
         for k1, i1 in distances.items():
             num += 1
@@ -1364,7 +1364,7 @@ def eval_old(run=False):
         #     print("No evaluation data found in npz files.")
         #     return
         # with open(f'runs/{ckpt_name}.txt','w') as f1:
-        #     with open(f"/media/data1/feihong/univerisity_dev/runs/unified_siglip_heading.txt", "r") as f:
+        #     with open(f"/data/feihong/univerisity_dev/runs/unified_siglip_heading.txt", "r") as f:
         #         for line in f:
         #             key = line.strip().split(' ')[0]
         #         # for key in tqdm(test_list):
@@ -1443,7 +1443,7 @@ def eval_heading():
 
     model = Encoder_heading(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM).to(DEVICE)
 
-    model_path = "/media/data1/feihong/ckpt/unified_siglip_heading/best_iou_59.pth"
+    model_path = "/data/feihong/ckpt/unified_siglip_heading/best_iou_59.pth"
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location="cpu"))
         print(f"Loaded checkpoint: {model_path}")
@@ -1464,7 +1464,7 @@ def eval_heading():
     }
 
     eval_pairs = []
-    with open("/media/data1/feihong/ckpt/test.txt", "r") as f:
+    with open("/data/feihong/ckpt/test.txt", "r") as f:
         for line in f:
             img_id = line.strip().split("/")[-2]
             for heading in headings:
@@ -1557,7 +1557,7 @@ def eval_heading():
 if __name__ == "__main__":
     exp_name = "unified_siglip_heading"
     exp_name = "grounding_siglip"
-    save_dir = f"/media/data1/feihong/ckpt/{exp_name}"
+    save_dir = f"/data/feihong/ckpt/{exp_name}"
 
     if os.path.exists(save_dir):
         print(f"Experiment directory '{save_dir}' already exists.")

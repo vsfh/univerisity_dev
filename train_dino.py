@@ -44,14 +44,14 @@ class Config:
     CLEARML_PROJECT = "unified_siglip"
     CLEARML_TASK_NAME = None
     MODEL_NAME = "google/siglip-base-patch16-224"
-    CACHE_DIR = "/media/data1/feihong/hf_cache"
-    DRONE_VIEW_FOLDER = "/media/data1/feihong/drone_view"
-    IMAGE_FOLDER = "/media/data1/feihong/image_1024"
-    HEADING_FOLDER = "/media/data1/feihong/range_250"
-    TEXT_FILE = "/media/data1/feihong/ckpt/drone_text_single_long.json"
-    TRAIN_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/train.json"
-    TEST_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
-    SATELLITE_FOLDER = "/media/data1/feihong/asian_univ"
+    CACHE_DIR = "/data/feihong/hf_cache"
+    DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
+    IMAGE_FOLDER = "/data/feihong/image_1024"
+    HEADING_FOLDER = "/data/feihong/range_250"
+    TEXT_FILE = "/data/feihong/ckpt/drone_text_single_long.json"
+    TRAIN_BBOX_FILE = "/data/feihong/univerisity_dev/runs/train.json"
+    TEST_BBOX_FILE = "/data/feihong/univerisity_dev/runs/test.json"
+    SATELLITE_FOLDER = "/data/feihong/asian_univ"
 
     SAT_ORIG_SIZE = (3840, 2160)
     UNIV_SAT_SIZE = {"height": 432, "width": 768}
@@ -404,7 +404,7 @@ def load_data_splits() -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], se
     train_ids = set()
     test_ids = set()
 
-    with open("/media/data1/feihong/ckpt/train.txt", "r") as f:
+    with open("/data/feihong/ckpt/train.txt", "r") as f:
         for line in f:
             query_path = line.strip()
             name = query_path.split("/")[-2]
@@ -412,7 +412,7 @@ def load_data_splits() -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], se
             train_image_pairs.append((query_path, search_path))
             train_ids.add(name)
 
-    with open("/media/data1/feihong/ckpt/test.txt", "r") as f:
+    with open("/data/feihong/ckpt/test.txt", "r") as f:
         for line in f:
             query_path = line.strip()
             name = query_path.split("/")[-2]
@@ -748,7 +748,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 if __name__ == "__main__":
     end_num = 0.1
     exp_name = f"train_dino_"
-    save_dir = f"/media/data1/feihong/ckpt/{exp_name}"
+    save_dir = f"/data/feihong/ckpt/{exp_name}"
 
     if os.path.exists(save_dir):
         print(f"Experiment directory '{save_dir}' already exists.")

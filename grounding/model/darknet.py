@@ -458,7 +458,7 @@ class Darknet(nn.Module):
     """YOLOv3 object detection model"""
     #sunyuxi
     #def __init__(self, config_path='./model/yolov3.cfg', img_size=416, obj_out=False):
-    def __init__(self, config_path='/media/data1/feihong/ckpt/yolov3_rs.cfg', img_size=1024, obj_out=False):
+    def __init__(self, config_path='/data/feihong/ckpt/yolov3_rs.cfg', img_size=1024, obj_out=False):
         super(Darknet, self).__init__()
         self.config_path = config_path
         self.obj_out = obj_out
@@ -615,7 +615,7 @@ if __name__ == "__main__":
     torch.backends.cudnn.benchmark = False
 
     model = Darknet()
-    model.load_weights('/media/data1/feihong/ckpt/yolov3.weights')
+    model.load_weights('/data/feihong/ckpt/yolov3.weights')
     # model.eval()
 
     image = torch.autograd.Variable(torch.randn(1, 3, 416, 416))

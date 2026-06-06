@@ -42,7 +42,7 @@ from bbox.yolo_utils import bbox_iou
 # --- Configuration ---
 IMG_SIZE = (768, 432)  # (width, height)
 DRONE_SIZE = (256, 256)  # (width, height)
-BATCH_SIZE = 16
+BATCH_SIZE = 12
 NUM_EPOCHS = 20
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
@@ -50,7 +50,7 @@ PRINT_FREQ = 50
 HEATMAP_SIGMA = 1.5
 BBOX_LOSS_WEIGHT = 5.0
 MOE_ENTROPY_WEIGHT = 0.01
-DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
 
 
 class TransformProcessorWrapper:
@@ -826,7 +826,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pretrained-checkpoint",
         type=str,
-        default="/media/data1/feihong/ckpt/SMGeo.pth",
+        default="/data/feihong/ckpt/SMGeo.pth",
         help="Official SMGeo checkpoint used to initialize the Swin-MoE grounding model",
     )
     parser.add_argument(
@@ -839,7 +839,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/media/data1/feihong/ckpt/ground_sm",
+        default="/data/feihong/ckpt/ground_sm",
         help="Path to save model checkpoints",
     )
     args = parser.parse_args()

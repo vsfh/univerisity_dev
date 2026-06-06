@@ -6,14 +6,14 @@ import torch
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-os.environ['HF_HOME'] = '/media/data1/feihong/hf_cache'
+os.environ['HF_HOME'] = '/data/feihong/hf_cache'
 
 # --- Configuration ---
 INPUT_FILE = "runs/schools.txt"
 OUTPUT_FILE = "wild_university_metadata.csv"
 MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CACHE_DIR = "/media/data1/feihong/hf_cache"
+CACHE_DIR = "/data/feihong/hf_cache"
 
 # Phase 2: Strict Prompt Engineering with Köppen Standards
 SYSTEM_PROMPT = """You are an expert geographer and architectural historian. 

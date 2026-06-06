@@ -83,12 +83,12 @@ class AverageMeter:
 
 
 MODEL_NAME = "google/siglip-base-patch16-224"
-CACHE_DIR = "/media/data1/feihong/hf_cache"
-IMAGE_FOLDER = "/media/data1/feihong/image_1024"
-HEADING_FOLDER = "/media/data1/feihong/range_250"
-TRAIN_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/train.json"
-TEST_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
-TEXT_FILE = "/media/data1/feihong/drone_text_single_long.json"
+CACHE_DIR = "/data/feihong/hf_cache"
+IMAGE_FOLDER = "/data/feihong/image_1024"
+HEADING_FOLDER = "/data/feihong/range_250"
+TRAIN_BBOX_FILE = "/data/feihong/univerisity_dev/runs/train.json"
+TEST_BBOX_FILE = "/data/feihong/univerisity_dev/runs/test.json"
+TEXT_FILE = "/data/feihong/drone_text_single_long.json"
 
 UNIV_SAT_SIZE = (640, 640)
 UNIV_DRONE_SIZE = (224, 224)
@@ -593,7 +593,7 @@ def main(save_path):
 
     print("Loading image pairs...")
     train_pairs = []
-    with open("/media/data1/feihong/ckpt/train.txt", "r") as f:
+    with open("/data/feihong/ckpt/train.txt", "r") as f:
         for line in f:
             heading_path = line.strip()
             name = heading_path.split("/")[-2]
@@ -603,7 +603,7 @@ def main(save_path):
                 train_pairs.append((heading_path, search_path))
 
     val_pairs = []
-    with open("/media/data1/feihong/ckpt/test.txt", "r") as f:
+    with open("/data/feihong/ckpt/test.txt", "r") as f:
         for line in f:
             heading_path = line.strip()
             name = heading_path.split("/")[-2]
@@ -709,7 +709,7 @@ def eval_ground():
 
     print("Loading test image pairs...")
     test_pairs = []
-    with open("/media/data1/feihong/ckpt/test.txt", "r") as f:
+    with open("/data/feihong/ckpt/test.txt", "r") as f:
         for line in f:
             heading_path = line.strip()
             name = heading_path.split("/")[-2]
@@ -720,7 +720,7 @@ def eval_ground():
 
     print("Creating model...")
     model = Encoder(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM).to(DEVICE)
-    model_path = f"/media/data1/feihong/ckpt/ground_siglip/last.pth"
+    model_path = f"/data/feihong/ckpt/ground_siglip/last.pth"
 
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location="cpu"))
@@ -821,7 +821,7 @@ if __name__ == "__main__":
         eval_ground()
     else:
         exp_name = "ground_siglip"
-        save_dir = f"/media/data1/feihong/ckpt/{exp_name}"
+        save_dir = f"/data/feihong/ckpt/{exp_name}"
 
         if os.path.exists(save_dir):
             print(f"Experiment directory '{save_dir}' already exists.")

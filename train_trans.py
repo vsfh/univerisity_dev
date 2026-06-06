@@ -65,7 +65,7 @@ PATCH_SIZE = 32
 RETRIEVAL_LOSS_WEIGHT = 1.0
 LOCALIZATION_LOSS_WEIGHT = 1.0
 BBOX_LOSS_WEIGHT = 5.0
-PRETRAINED_CHECKPOINT = "/media/data1/feihong/ckpt/geoformer.pth"
+PRETRAINED_CHECKPOINT = "/data/feihong/ckpt/geoformer.pth"
 VAL_FRACTION = 0.25
 DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 
@@ -673,7 +673,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/media/data1/feihong/ckpt/trans_geo",
+        default="/data/feihong/ckpt/trans_geo",
         help="Path to save model checkpoints",
     )
     args = parser.parse_args()

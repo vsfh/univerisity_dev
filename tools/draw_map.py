@@ -13,7 +13,7 @@ from typing import List, Dict, Tuple
 def get_world_map_two():
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
-    input_folder = "/media/data1/feihong/kml_1024"
+    input_folder = "/data/feihong/kml_1024"
     kml_files = [
         os.path.join(input_folder, f)
         for f in os.listdir(input_folder)
@@ -34,7 +34,7 @@ def get_world_map_two():
     lons_arr = np.array(lons)
     lats_arr = np.array(lats)
 
-    input_folder = "/media/data1/feihong/new_univ_kml"
+    input_folder = "/data/feihong/new_univ_kml"
     kml_files = [
         os.path.join(input_folder, f)
         for f in os.listdir(input_folder)
@@ -494,7 +494,7 @@ def process_kml_file(input_path):
 def get_world_map():
     import geopandas as gpd
 
-    input_folder = "/media/data1/feihong/kml_1024"
+    input_folder = "/data/feihong/kml_1024"
     kml_files = [
         os.path.join(input_folder, f)
         for f in os.listdir(input_folder)
@@ -531,7 +531,7 @@ def get_world_map():
         lons, lats, color="red", s=50, zorder=5, alpha=0.8, label="University-1652"
     )
 
-    input_folder = "/media/data1/feihong/new_univ_kml"
+    input_folder = "/data/feihong/new_univ_kml"
     kml_files = [
         os.path.join(input_folder, f)
         for f in os.listdir(input_folder)
@@ -574,8 +574,8 @@ def match_libraries():
     from geopy.geocoders import Nominatim
     from geopy.exc import GeocoderTimedOut
 
-    library_file = "/media/data1/feihong/univerisity_dev/asian_200_libraries_free.txt"
-    output_file = "/media/data1/feihong/univerisity_dev/matched_university_libraries.txt"
+    library_file = "/data/feihong/univerisity_dev/asian_200_libraries_free.txt"
+    output_file = "/data/feihong/univerisity_dev/matched_university_libraries.txt"
 
     def haversine_distance(lat1, lon1, lat2, lon2):
         R = 6371
@@ -651,7 +651,7 @@ def match_libraries():
 from geopy.distance import distance as geo_distance
 
 def collect_spread_university_targets(
-    input_file: str = "/media/data1/feihong/ckpt/matched_university_libraries.txt",
+    input_file: str = "/data/feihong/ckpt/matched_university_libraries.txt",
     output_file: str = "runs/university_targets.txt",
     per_university: int = 6,
     search_radius_m: int = 2000,
@@ -908,8 +908,8 @@ def rewrite_targets_without_centers(
 
 
 def write_drone_folder_names_to_train_txt(
-    source_dir: str = "/media/data1/feihong/drone_view/drone",
-    output_file: str = "/media/data1/feihong/ckpt/train.txt",
+    source_dir: str = "/data/feihong/drone_view/drone",
+    output_file: str = "/data/feihong/ckpt/train.txt",
     sort_names: bool = True,
 ) -> None:
     """Write one subfolder name per line from source_dir to output_file."""

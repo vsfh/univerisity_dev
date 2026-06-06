@@ -160,10 +160,10 @@ def write_train_test_split_dense_uav():
     from natsort import natsorted
     from glob import glob
 
-    root = "/media/data1/feihong/DenseUAV"
+    root = "/data/feihong/DenseUAV"
     drone_list = natsorted(glob(f"{root}/*/*rone/*5/H80.JPG"))
 
-    output_path = "/media/data1/feihong/ckpt/test_dense.txt"
+    output_path = "/data/feihong/ckpt/test_dense.txt"
     with open(output_path, "w") as f:
         for path in drone_list:
             f.write(path + "\n")

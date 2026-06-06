@@ -42,14 +42,14 @@ class AverageMeter:
 
 # --- Configuration ---
 MODEL_NAME = "google/siglip-base-patch16-224"
-CACHE_DIR = "/media/data1/feihong/hf_cache"
-DRONE_VIEW_FOLDER = "/media/data1/feihong/drone_view"
-IMAGE_FOLDER = "/media/data1/feihong/image_1024"
-BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/bbox_isaac.json"
-TRAIN_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/train.json"
-TEST_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
-TEXT_FILE = "/media/data1/feihong/drone_text_single_long.json"
-HEADING_FOLDER = "/media/data1/feihong/range_250"
+CACHE_DIR = "/data/feihong/hf_cache"
+DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
+IMAGE_FOLDER = "/data/feihong/image_1024"
+BBOX_FILE = "/data/feihong/univerisity_dev/runs/bbox_isaac.json"
+TRAIN_BBOX_FILE = "/data/feihong/univerisity_dev/runs/train.json"
+TEST_BBOX_FILE = "/data/feihong/univerisity_dev/runs/test.json"
+TEXT_FILE = "/data/feihong/drone_text_single_long.json"
+HEADING_FOLDER = "/data/feihong/range_250"
 
 
 SAT_ORIG_SIZE = (3840, 2160)
@@ -534,7 +534,7 @@ def main(save_path):
     )
 
     model = Encoder_attn(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM)
-    # checkpoint_path = "/media/data1/feihong/ckpt/unified_siglip_base/retrieval.pth"
+    # checkpoint_path = "/data/feihong/ckpt/unified_siglip_base/retrieval.pth"
     # new_dict = {
     #     k.replace("_orig_mod.", ""): v
     #     for k, v in torch.load(checkpoint_path, map_location="cpu").items()
@@ -550,7 +550,7 @@ def main(save_path):
 
     print("Setting up dataset and dataloader...")
     train_image_pairs = []
-    with open("/media/data1/feihong/ckpt/train.txt", "r") as f:
+    with open("/data/feihong/ckpt/train.txt", "r") as f:
         for line in f:
             query_path = line.strip()
             name = query_path.split("/")[-2]
@@ -558,7 +558,7 @@ def main(save_path):
             if os.path.exists(search_path):
                 train_image_pairs.append((query_path, search_path))
     test_image_pairs = []
-    with open("/media/data1/feihong/ckpt/test.txt", "r") as f:
+    with open("/data/feihong/ckpt/test.txt", "r") as f:
         for line in f:
             query_path = line.strip()
             name = query_path.split("/")[-2]
@@ -881,7 +881,7 @@ def eval(run=False):
     if run:
         print("Initializing Evaluation...")
         img_to_text_dict = json.load(
-            open("/media/data1/feihong/drone_text_single_long.json", "r")
+            open("/data/feihong/drone_text_single_long.json", "r")
         )
 
         # Load Processors
@@ -908,11 +908,11 @@ def eval(run=False):
 
         # Prepare Data List
         eval_list = []
-        with open("/media/data1/feihong/ckpt/test.txt", "r") as f:
+        with open("/data/feihong/ckpt/test.txt", "r") as f:
             for line in f:
                 img_path = line.strip().replace('01.', '41.')
                 # index = line.strip().split('/')[-2]
-                # img_path = f'/media/data1/feihong/range_250/{index}_range250_heading0.png'
+                # img_path = f'/data/feihong/range_250/{index}_range250_heading0.png'
                 eval_list.append(img_path)
 
         # Create Dataset & Loader
@@ -967,7 +967,7 @@ def eval(run=False):
                     res_search[name] = grid_feats_np[i]
                     res_fused_query[name] = fused_feats_np[i]
 
-        SATELLITE_FOLDER = "/media/data1/feihong/asian_univ"
+        SATELLITE_FOLDER = "/data/feihong/asian_univ"
         satellite_files = sorted(
             [f for f in os.listdir(SATELLITE_FOLDER) if f.endswith(".png")]
         )
@@ -1010,7 +1010,7 @@ def eval(run=False):
         search_res = np.load("eval_search_clip.npz")
         fused_query_res = np.load("eval_fused_query_clip.npz")
 
-        distances = json.load(open("/media/data1/feihong/ckpt/distances.json", "r"))
+        distances = json.load(open("/data/feihong/ckpt/distances.json", "r"))
         test_num = 100
         test_list = [k for k in search_res.keys() if not 'new' in k]
         # test_list = [k for k in search_res.keys()]

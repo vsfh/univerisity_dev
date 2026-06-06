@@ -44,15 +44,15 @@ LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 GRAD_CLIP_NORM = 10.0
 PRINT_FREQ = 50
-UNIV_IMAGE_FOLDER = "/media/data1/feihong/image_1024"
-UNIV_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
-UNIV_TRAIN_FILE = "/media/data1/feihong/ckpt/train.txt"
-UNIV_TEST_FILE = "/media/data1/feihong/ckpt/test.txt"
+UNIV_IMAGE_FOLDER = "/data/feihong/image_1024"
+UNIV_BBOX_FILE = "/data/feihong/univerisity_dev/runs/test.json"
+UNIV_TRAIN_FILE = "/data/feihong/ckpt/train.txt"
+UNIV_TEST_FILE = "/data/feihong/ckpt/test.txt"
 UNIV_CROP_SIZE = (640, 640)
 UNIV_DRONE_SIZE = (256, 256)
 UNIV_SAT_SIZE = IMG_SIZE
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-DEFAULT_OFFICIAL_PRETRAIN = "/media/data1/feihong/ckpt/trogeo_droneaerial_model_best.pth.tar"
+DEFAULT_OFFICIAL_PRETRAIN = "/data/feihong/ckpt/trogeo_droneaerial_model_best.pth.tar"
 
 CVOGL_TRANSFORM = None
 
@@ -545,7 +545,7 @@ if __name__ == "__main__":
         help="image size as WIDTH HEIGHT",
     )
     parser.add_argument(
-        "--savename", type=str, default="ground_smgeo", help="Name head for saved model"
+        "--savename", type=str, default="ground_cvos", help="Name head for saved model"
     )
     parser.add_argument("--seed", type=int, default=2024, help="random seed")
     parser.add_argument(
@@ -554,7 +554,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/media/data1/feihong/ckpt/ground_cvos",
+        default="/data/feihong/ckpt/ground_cvos",
         help="Path to save model checkpoints",
     )
     parser.add_argument(

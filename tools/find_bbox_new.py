@@ -16,9 +16,9 @@ except ImportError:
     raise ImportError("perceptron package required")
 
 HF_PATH = "PerceptronAI/Isaac-0.1"
-CACHE_DIR = "/media/data1/feihong/hf_cache"
-INPUT_DIR = "/media/data1/feihong/image_1024"
-OUTPUT_DIR = "/media/data1/feihong/univerisity_dev/runs/img"
+CACHE_DIR = "/data/feihong/hf_cache"
+INPUT_DIR = "/data/feihong/image_1024"
+OUTPUT_DIR = "/data/feihong/univerisity_dev/runs/img"
 OUTPUT_JSON = "runs/bbox_isaac.json"
 NUM_IMAGES = 1650
 PROMPT = "Locate and provide the bounding box for the single building positioned at the center of this aerial image. Focus on the main central structure only."
@@ -132,9 +132,9 @@ def fine_tune_bbox():
     Save changes to bbox_changed_res.json.
     Press 'q' to quit, 'Enter' to save and proceed to next image.
     """
-    INPUT_JSON = "/media/data1/feihong/univerisity_dev/bbox_results_new.json"
-    OUTPUT_JSON = "/media/data1/feihong/univerisity_dev/bbox_changed_res.json"
-    IMAGE_DIR = "/media/data1/feihong/image_1024"
+    INPUT_JSON = "/data/feihong/univerisity_dev/bbox_results_new.json"
+    OUTPUT_JSON = "/data/feihong/univerisity_dev/bbox_changed_res.json"
+    IMAGE_DIR = "/data/feihong/image_1024"
     DISPLAY_SIZE = 640
     NUM_IMAGES = 50
 
