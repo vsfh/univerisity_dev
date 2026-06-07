@@ -30,6 +30,7 @@ from bbox.yolo_utils import bbox_iou, build_target, eval_iou_acc
 
 # --- Configuration ---
 MODEL_NAME_SIGLIP = "google/siglip-base-patch16-224"
+MODEL_NAME_SIGLIP2 = "google/siglip2-base-patch16-224"
 CACHE_DIR = "/media/data1/feihong/hf_cache"
 DEFAULT_SAT_SIZE = (432, 768)  # (H, W)
 DEFAULT_DRONE_SIZE = (256, 256)  # (H, W)
@@ -43,6 +44,7 @@ DEFAULT_GROUNDING_RUNS = {
     "smgeo": "/media/data1/feihong/ckpt/ground_sm/last.pth",
     "ocg": "/media/data1/feihong/ckpt/ground_ocg/last.pth",
     "trogeolite": "/media/data1/feihong/ckpt/ground_cvos/last.pth",
+    "encoder_test": "/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth",
 }
 
 EVAL_CONFIG = {
@@ -69,6 +71,7 @@ EVAL_CONFIG = {
         "smgeo": {"run": True, "checkpoint": "/media/data1/feihong/ckpt/ground_sm/last.pth"},
         "ocg": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_ocg/last.pth"},
         "trogeolite": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_cvos/last.pth"},
+        "encoder_test": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth"},
     },
 }
 
@@ -76,7 +79,7 @@ EVAL_CONFIG = {
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _load_encoder_classes() -> Tuple[type, type]:
+def _load_encoder_classes() -> Tuple[Optional[type], type, type]:
     """Load root model.py explicitly to avoid import ambiguity."""
     repo_root_str = str(REPO_ROOT)
     if repo_root_str not in sys.path:
@@ -87,16 +90,12 @@ def _load_encoder_classes() -> Tuple[type, type]:
         raise ImportError(f"Unable to load model module from: {model_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    missing = [
-        name
-        for name in ("Encoder_text_angle", "Encoder_heat")
-        if not hasattr(module, name)
-    ]
+    missing = [name for name in ("Encoder_heat", "Encoder_test") if not hasattr(module, name)]
     if missing:
         raise AttributeError(
             f"{model_path} is missing encoder classes required by eval_ground: {missing}"
         )
-    return module.Encoder_text_angle, module.Encoder_heat
+    return getattr(module, "Encoder_text_angle", None), module.Encoder_heat, module.Encoder_test
 
 
 def _load_shared_dataset_class():
@@ -172,6 +171,8 @@ def _canonical_model_type(model_type: str) -> str:
         return "encoder_abla"
     if name in {"heat", "encoder_heat"}:
         return "encoder_heat"
+    if name in {"test", "encoder_test"}:
+        return "encoder_test"
     if name in {"sample", "samplegeo", "sample4geo"}:
         return "sample4geo"
     if name in {"sm", "smgeo", "smgeolite"}:
@@ -267,11 +268,16 @@ def build_model(
     if model_type == "siglip":
         return SigLIPModel(model_name=MODEL_NAME_SIGLIP, proj_dim=768)
     if model_type == "encoder_abla":
-        EncoderAbla, _ = _load_encoder_classes()
+        EncoderAbla, _, _ = _load_encoder_classes()
+        if EncoderAbla is None:
+            raise AttributeError("model.py does not export Encoder_text_angle required by encoder_abla.")
         return EncoderAbla(model_name=MODEL_NAME_SIGLIP, proj_dim=768, usesg=True, useap=True)
     if model_type == "encoder_heat":
-        _, EncoderHeat = _load_encoder_classes()
-        return EncoderHeat(model_name=MODEL_NAME_SIGLIP, proj_dim=768, usesg=True, useap=True)
+        _, EncoderHeat, _ = _load_encoder_classes()
+        return EncoderHeat(model_name=MODEL_NAME_SIGLIP2, proj_dim=768, usesg=True, useap=True)
+    if model_type == "encoder_test":
+        _, _, EncoderTest = _load_encoder_classes()
+        return EncoderTest(model_name=MODEL_NAME_SIGLIP2, proj_dim=768, usesg=True, useap=True)
     if model_type == "det":
         return DetGeoLite(emb_size=512)
     if model_type == "lpn":
@@ -363,14 +369,15 @@ def _filter_dataset_by_drone_names(dataset: Any, allowed_names: Optional[Set[str
 def create_test_loader(config: EvalConfig) -> DataLoader:
     model_type = _canonical_model_type(config.model_type)
     # Use SigLIP processor only for siglip model; others use simple tensor wrapper.
-    if model_type in {"siglip", "encoder_abla", "encoder_heat"}:
-        processor = AutoImageProcessor.from_pretrained(MODEL_NAME_SIGLIP, cache_dir=CACHE_DIR)
+    if model_type in {"siglip", "encoder_abla", "encoder_heat", "encoder_test"}:
+        hf_model_name = MODEL_NAME_SIGLIP2 if model_type in {"encoder_heat", "encoder_test"} else MODEL_NAME_SIGLIP
+        processor = AutoImageProcessor.from_pretrained(hf_model_name, cache_dir=CACHE_DIR)
         processor_sat = AutoImageProcessor.from_pretrained(
-            MODEL_NAME_SIGLIP,
+            hf_model_name,
             cache_dir=CACHE_DIR,
             size={"height": int(config.sat_size[0]), "width": int(config.sat_size[1])},
         )
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME_SIGLIP)
+        tokenizer = AutoTokenizer.from_pretrained(hf_model_name, cache_dir=CACHE_DIR)
     else:
         processor = TransformProcessorWrapper(DEFAULT_DRONE_SIZE)
         processor_sat = TransformProcessorWrapper(config.sat_size)
@@ -803,8 +810,17 @@ def evaluate(config: EvalConfig) -> Dict[str, Any]:
                     output = model.bbox_forward(query_imgs, search_imgs, geo=geo)
                 except TypeError:
                     output = model.bbox_forward(query_imgs, search_imgs)
-            elif model_type in {"encoder_abla", "encoder_heat"}:
-                output = model(query_imgs, search_imgs, input_ids=input_ids, angle=geo)
+            elif model_type in {"encoder_abla", "encoder_heat", "encoder_test"}:
+                attention_mask = None
+                if model_type == "encoder_test" and input_ids is not None and "attention_mask" in batch:
+                    attention_mask = batch["attention_mask"].to(config.device, non_blocking=True)
+                output = model(
+                    query_imgs,
+                    search_imgs,
+                    input_ids=input_ids,
+                    angle=geo,
+                    attention_mask=attention_mask,
+                )
             else:
                 raise AttributeError(
                     f"Model '{model_type}' has no bbox_forward and no fallback path."
@@ -856,7 +872,7 @@ def evaluate(config: EvalConfig) -> Dict[str, Any]:
         else:
             # Anchor-map path: first output is [B, 9*5, Hf, Wf].
             pred_anchor = output if isinstance(output, torch.Tensor) else output[0]
-            heatmap_logits = output[6] if model_type == "encoder_heat" and len(output) > 6 else None
+            heatmap_logits = output[6] if model_type in {"encoder_heat", "encoder_test"} and len(output) > 6 else None
             pred_anchor = pred_anchor.view(
                 pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
             )
@@ -1223,7 +1239,21 @@ def parse_args() -> argparse.Namespace:
         "--models",
         nargs="*",
         default=[],
-        choices=["det", "lpn", "sample4geo", "sample", "smgeo", "sm", "ocg", "trogeolite", "wild"],
+        choices=[
+            "det",
+            "lpn",
+            "sample4geo",
+            "sample",
+            "smgeo",
+            "sm",
+            "ocg",
+            "trogeolite",
+            "wild",
+            "encoder_test",
+            "test",
+            "encoder_heat",
+            "heat",
+        ],
         help="Model types to evaluate. Ignored when --all-grounding is set.",
     )
     parser.add_argument(
