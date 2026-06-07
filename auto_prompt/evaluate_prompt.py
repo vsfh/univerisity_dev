@@ -784,7 +784,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-split-file", type=str, default=DEFAULT_TEST_SPLIT_FILE)
     parser.add_argument("--test-satellite-root", type=str, default=DEFAULT_TEST_SATELLITE_ROOT)
     parser.add_argument("--drone-image-root", type=str, default=DEFAULT_DRONE_IMAGE_ROOT)
-    parser.add_argument("--max-cases", type=int, default=50)
+    parser.add_argument("--max-cases", type=int, default=150)
     parser.add_argument("--use-text", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-angle", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-ap", action=argparse.BooleanOptionalAction, default=True)

@@ -56,7 +56,8 @@ EVAL_CONFIG = {
     # "subset_heights": [250, 300],
     # "subset_angles": [0, 45, 90, 135],
     "output_dir": "/media/data1/feihong/univerisity_dev/eval_results",
-    "visualize_output_dir": "",
+    "visualize_output_dir": "/media/data1/feihong/univerisity_dev/eval_results/visualizations",
+    "visualize_num_cases": 10,
     "heatmap_confidence_weight": 0.5,
     "models": {
         "det": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_det/last.pth",},
@@ -162,6 +163,7 @@ class EvalConfig:
     output_dir: str
     heatmap_confidence_weight: float = 0.0
     drone_name_filter_path: Optional[str] = None
+    visualize_num_cases: int = 10
 
 
 def _canonical_model_type(model_type: str) -> str:
@@ -612,6 +614,137 @@ def visualize_batch_with_prediction(
     return saved_files
 
 
+def _clamp_bbox_list(
+    bbox: Sequence[float],
+    image_w: int,
+    image_h: int,
+) -> List[float]:
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    x1 = max(0.0, min(float(image_w - 1), x1))
+    y1 = max(0.0, min(float(image_h - 1), y1))
+    x2 = max(0.0, min(float(image_w - 1), x2))
+    y2 = max(0.0, min(float(image_h - 1), y2))
+    if x2 <= x1:
+        x2 = min(float(image_w - 1), x1 + 1.0)
+    if y2 <= y1:
+        y2 = min(float(image_h - 1), y1 + 1.0)
+    return [x1, y1, x2, y2]
+
+
+def _resize_to_height_keep_aspect(image: Image.Image, target_h: int) -> Image.Image:
+    if image.height == target_h:
+        return image
+    target_w = max(1, int(round(image.width * target_h / max(1, image.height))))
+    return image.resize((target_w, target_h), Image.Resampling.BILINEAR)
+
+
+def _path_stem(value: Any) -> str:
+    return Path(str(value)).stem
+
+
+def _safe_filename(text: str) -> str:
+    keep = []
+    for char in str(text):
+        if char.isalnum() or char in {"-", "_", "."}:
+            keep.append(char)
+        else:
+            keep.append("_")
+    return "".join(keep).strip("_") or "sample"
+
+
+def save_composite_prediction_visualizations(
+    batch: Dict[str, Any],
+    pred_bbox_batch: torch.Tensor,
+    output_dir: str,
+    model_tag: str,
+    start_index: int,
+    max_cases: int,
+) -> List[str]:
+    """Save per-case panels: drone, satellite with GT/Pred boxes, and GT crop."""
+    if not output_dir or max_cases <= 0 or start_index >= max_cases:
+        return []
+
+    query_batch = batch["target_pixel_values"]
+    satellite_batch = batch["search_pixel_values"]
+    gt_bbox_batch = batch["bbox"]
+
+    num_samples = int(
+        min(query_batch.shape[0], satellite_batch.shape[0], gt_bbox_batch.shape[0], pred_bbox_batch.shape[0])
+    )
+    remaining = max(0, int(max_cases) - int(start_index))
+    num_samples = min(num_samples, remaining)
+    if num_samples <= 0:
+        return []
+
+    out_dir = Path(output_dir) / _safe_filename(model_tag)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_files: List[str] = []
+    panel_h = 360
+    padding = 12
+    label_h = 26
+
+    for idx in range(num_samples):
+        query_img = _tensor_chw_to_pil(query_batch[idx]).convert("RGB")
+        sat_img = _tensor_chw_to_pil(satellite_batch[idx]).convert("RGB")
+
+        gt_xyxy = _clamp_bbox_list(
+            gt_bbox_batch[idx].detach().float().cpu().tolist(),
+            sat_img.width,
+            sat_img.height,
+        )
+        pred_xyxy = _clamp_bbox_list(
+            pred_bbox_batch[idx].detach().float().cpu().tolist(),
+            sat_img.width,
+            sat_img.height,
+        )
+
+        crop_box = tuple(int(round(v)) for v in gt_xyxy)
+        gt_crop = sat_img.crop(crop_box)
+        if gt_crop.width <= 1 or gt_crop.height <= 1:
+            gt_crop = Image.new("RGB", (panel_h, panel_h), color=(20, 20, 20))
+
+        sat_draw = sat_img.copy()
+        draw = ImageDraw.Draw(sat_draw)
+        draw.rectangle(tuple(gt_xyxy), outline=(0, 255, 0), width=4)
+        draw.rectangle(tuple(pred_xyxy), outline=(255, 0, 0), width=4)
+
+        query_panel = _resize_to_height_keep_aspect(query_img, panel_h)
+        sat_panel = _resize_to_height_keep_aspect(sat_draw, panel_h)
+        crop_panel = _resize_to_height_keep_aspect(gt_crop, panel_h)
+
+        panels = [
+            ("drone query", query_panel),
+            ("satellite GT green / Pred red", sat_panel),
+            ("GT bbox crop", crop_panel),
+        ]
+        canvas_w = sum(panel.width for _, panel in panels) + padding * (len(panels) + 1)
+        canvas_h = panel_h + label_h + padding * 2
+        canvas = Image.new("RGB", (canvas_w, canvas_h), color=(18, 18, 18))
+        draw_canvas = ImageDraw.Draw(canvas)
+
+        x = padding
+        for label, panel in panels:
+            draw_canvas.text((x, padding), label, fill=(235, 235, 235))
+            canvas.paste(panel, (x, padding + label_h))
+            x += panel.width + padding
+
+        sample_idx = start_index + idx
+        sat_id = _path_stem(batch["satellite_path"][idx])
+        drone_id = _path_stem(batch["drone_path"][idx])
+        height = int(batch["height"][idx].item()) if hasattr(batch["height"][idx], "item") else int(batch["height"][idx])
+        angle = int(batch["angle"][idx].item()) if hasattr(batch["angle"][idx], "item") else int(batch["angle"][idx])
+        save_name = (
+            f"{sample_idx:03d}_{_safe_filename(model_tag)}_sat{_safe_filename(sat_id)}_"
+            f"drone{_safe_filename(drone_id)}_h{height}_a{angle}.png"
+        )
+        save_path = out_dir / save_name
+        canvas.save(save_path)
+        saved_files.append(str(save_path))
+
+    return saved_files
+
+
 def evaluate(config: EvalConfig) -> Dict[str, Any]:
     model_type = _canonical_model_type(config.model_type)
 
@@ -627,7 +760,10 @@ def evaluate(config: EvalConfig) -> Dict[str, Any]:
     center_distances: List[float] = []
     per_subset_values: Dict[Tuple[int, int], Dict[str, List[float]]] = {}
     per_angle_values: Dict[int, Dict[str, List[float]]] = {}
-    vis_saved = False
+    visualized_count = 0
+    visualize_num_cases = max(0, int(config.visualize_num_cases))
+    checkpoint_name = Path(str(config.checkpoint_path)).resolve().parent.name
+    model_tag = f"{model_type}_{checkpoint_name}"
     checkpoint_for_flags = str(config.checkpoint_path)
     for batch in tqdm(loader, desc=f"Evaluating {model_type}"):
         query_imgs = batch["target_pixel_values"].to(config.device, non_blocking=True)
@@ -680,18 +816,25 @@ def evaluate(config: EvalConfig) -> Dict[str, Any]:
             if pred_bbox_batch.ndim == 1:
                 pred_bbox_batch = pred_bbox_batch.unsqueeze(0)
 
-            if config.visualize_output_dir and not vis_saved:
+            if config.visualize_output_dir and visualized_count < visualize_num_cases:
                 pred_vis = [
                     _to_xyxy_pixels(pred_bbox_batch[b], image_h, image_w).detach().cpu()
                     for b in range(pred_bbox_batch.shape[0])
                 ]
-                saved_files = visualize_batch_with_prediction(
+                saved_files = save_composite_prediction_visualizations(
                     batch,
                     torch.stack(pred_vis, dim=0),
+                    model_tag=model_tag,
                     output_dir=config.visualize_output_dir,
+                    start_index=visualized_count,
+                    max_cases=visualize_num_cases,
                 )
-                print(f"Saved {len(saved_files)} prediction visualizations to: {config.visualize_output_dir}")
-                vis_saved = True
+                visualized_count += len(saved_files)
+                if saved_files:
+                    print(
+                        f"Saved {len(saved_files)} {model_type} prediction visualizations "
+                        f"to: {Path(config.visualize_output_dir) / _safe_filename(model_tag)}"
+                    )
 
             for b in range(pred_bbox_batch.shape[0]):
                 pred_xyxy = _to_xyxy_pixels(pred_bbox_batch[b], image_h, image_w)
@@ -737,14 +880,21 @@ def evaluate(config: EvalConfig) -> Dict[str, Any]:
                 iou_threshold_list=[0.5],
             )
 
-            if config.visualize_output_dir and not vis_saved:
-                saved_files = visualize_batch_with_prediction(
+            if config.visualize_output_dir and visualized_count < visualize_num_cases:
+                saved_files = save_composite_prediction_visualizations(
                     batch,
                     pred_bbox_xyxy.detach().cpu(),
+                    model_tag=model_tag,
                     output_dir=config.visualize_output_dir,
+                    start_index=visualized_count,
+                    max_cases=visualize_num_cases,
                 )
-                print(f"Saved {len(saved_files)} prediction visualizations to: {config.visualize_output_dir}")
-                vis_saved = True
+                visualized_count += len(saved_files)
+                if saved_files:
+                    print(
+                        f"Saved {len(saved_files)} {model_type} prediction visualizations "
+                        f"to: {Path(config.visualize_output_dir) / _safe_filename(model_tag)}"
+                    )
 
             for b in range(pred_bbox_xyxy.shape[0]):
                 pred_xyxy = pred_bbox_xyxy[b].float()
@@ -888,6 +1038,7 @@ def eval_encoder_text_angle_checkpoints(
             visualize_output_dir=str(visualize_output_dir),
             output_dir=str(per_checkpoint_output_dir),
             heatmap_confidence_weight=float(EVAL_CONFIG.get("heatmap_confidence_weight", 0.5)),
+            visualize_num_cases=int(EVAL_CONFIG.get("visualize_num_cases", 10)),
         )
         metrics = evaluate(cfg)
         results.append(
@@ -954,6 +1105,7 @@ def main():
             visualize_output_dir=str(EVAL_CONFIG.get("visualize_output_dir", "")),
             output_dir=str(EVAL_CONFIG.get("output_dir", "/media/data1/feihong/univerisity_dev/eval_results")),
             heatmap_confidence_weight=float(EVAL_CONFIG.get("heatmap_confidence_weight", 0.5)),
+            visualize_num_cases=int(EVAL_CONFIG.get("visualize_num_cases", 10)),
         )
         evaluate(cfg)
 
@@ -996,6 +1148,7 @@ def main_with_drone_name_filter(drone_name_filter_path: str):
             output_dir=str(EVAL_CONFIG.get("output_dir", "/media/data1/feihong/univerisity_dev/eval_results")),
             heatmap_confidence_weight=float(EVAL_CONFIG.get("heatmap_confidence_weight", 0.5)),
             drone_name_filter_path=str(drone_name_filter_path),
+            visualize_num_cases=int(EVAL_CONFIG.get("visualize_num_cases", 10)),
         )
         evaluate(cfg)
 
@@ -1027,6 +1180,7 @@ def _build_eval_config(
         output_dir=str(args.output_dir),
         heatmap_confidence_weight=float(args.heatmap_confidence_weight),
         drone_name_filter_path=args.drone_name_filter,
+        visualize_num_cases=int(args.visualize_num_cases),
     )
 
 
@@ -1098,6 +1252,12 @@ def parse_args() -> argparse.Namespace:
         default=str(EVAL_CONFIG.get("output_dir", "/media/data1/feihong/univerisity_dev/eval_results")),
     )
     parser.add_argument("--visualize-output-dir", type=str, default=str(EVAL_CONFIG.get("visualize_output_dir", "")))
+    parser.add_argument(
+        "--visualize-num-cases",
+        type=int,
+        default=int(EVAL_CONFIG.get("visualize_num_cases", 10)),
+        help="Number of composite prediction visualizations to save per evaluated model.",
+    )
     parser.add_argument(
         "--heatmap-confidence-weight",
         type=float,
