@@ -12,7 +12,7 @@ if [ -z "$CONFIG_PATH" ]; then
 fi
 shift
 
-cd /data/feihong/univerisity_dev
+cd /media/data1/feihong/univerisity_dev
 
 export CUDA_VISIBLE_DEVICES=1,0
 

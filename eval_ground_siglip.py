@@ -40,15 +40,15 @@ TARGET_TO_HEADING = {
     (1.0, 1.0): 270,
 }
 
-HEADING_FOLDER = "/data/feihong/range_250"
-IMAGE_FOLDER = "/data/feihong/image_1024"
+HEADING_FOLDER = "/media/data1/feihong/range_250"
+IMAGE_FOLDER = "/media/data1/feihong/image_1024"
 
 UNIV_SAT_SIZE = (640, 640)
 UNIV_DRONE_SIZE = (256, 256)
 SAT_ORIG_SIZE = (3840, 2160)
 
 MODEL_NAME = "google/siglip-base-patch16-224"
-CACHE_DIR = "/data/feihong/hf_cache"
+CACHE_DIR = "/media/data1/feihong/hf_cache"
 PROJECTION_DIM = 768
 
 
@@ -284,7 +284,7 @@ def visualize_results(
 def get_test_pairs():
     """Get test image pairs from test.txt with heading=0."""
     test_pairs = []
-    with open("/data/feihong/ckpt/test.txt", "r") as f:
+    with open("/media/data1/feihong/ckpt/test.txt", "r") as f:
         for line in f:
             query_path = line.strip()
             name = query_path.split("/")[-2]
@@ -301,7 +301,7 @@ def get_test_pairs():
 def load_success_filenames():
     """Load filenames that are considered successful from the success file."""
     success_set = set()
-    success_file = "/data/feihong/univerisity_dev/eval_success_unified.txt"
+    success_file = "/media/data1/feihong/univerisity_dev/eval_success_unified.txt"
     if os.path.exists(success_file):
         with open(success_file, "r") as f:
             for line in f:
@@ -454,8 +454,8 @@ def preprocess_images_siglip(query_image, search_image, bbox, processor, process
 
 def load_model(checkpoint_path: str, device: str):
     """Load Encoder_heading model from checkpoint."""
-    # checkpoint_path = "/data/feihong/ckpt/unified_siglip_abla_ap/best_iou_41.pth"
-    # checkpoint_path = "/data/feihong/ckpt/unified_siglip_heading/best_iou_44.pth"
+    # checkpoint_path = "/media/data1/feihong/ckpt/unified_siglip_abla_ap/best_iou_41.pth"
+    # checkpoint_path = "/media/data1/feihong/ckpt/unified_siglip_heading/best_iou_44.pth"
     model = Encoder_heading(model_name=MODEL_NAME, proj_dim=PROJECTION_DIM)
     if os.path.exists(checkpoint_path):
         model.load_state_dict(
@@ -484,7 +484,7 @@ def evaluate_model(
         return {}
 
     test_bbox_dict = json.load(
-        open("/data/feihong/univerisity_dev/runs/test.json", "r")
+        open("/media/data1/feihong/univerisity_dev/runs/test.json", "r")
     )
     test_pairs = get_test_pairs()
     print(f"Found {len(test_pairs)} test samples")
@@ -666,13 +666,13 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/data/feihong/ckpt/supp_0.9/last.pth",
+        default="/media/data1/feihong/ckpt/supp_0.9/last.pth",
         help="Path to model checkpoint",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/data/feihong/univerisity_dev/eval_results",
+        default="/media/data1/feihong/univerisity_dev/eval_results",
         help="Output directory for results",
     )
     parser.add_argument(

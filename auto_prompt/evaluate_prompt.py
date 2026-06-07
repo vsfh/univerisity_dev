@@ -29,16 +29,17 @@ DEFAULT_DESCRIPTION_DIR = AUTO_PROMPT_DIR / "generated_descriptions"
 DEFAULT_QUERY_RECORD_DIR = AUTO_PROMPT_DIR / "query_records"
 
 DEFAULT_MODEL_NAME = "google/siglip2-base-patch16-224"
-DEFAULT_CACHE_DIR = "/data/feihong/hf_cache"
-DEFAULT_CHECKPOINT = "/data/feihong/ckpt/model_test_geo_input_ids/last.pth"
-DEFAULT_INCLUDE_FILE = "/data/feihong/ckpt/include2.json"
-DEFAULT_TEST_SPLIT_FILE = "/data/feihong/ckpt/test_2.txt"
-DEFAULT_TEST_SATELLITE_ROOT = "/data/feihong/img_test_2"
-DEFAULT_DRONE_IMAGE_ROOT = "/data/feihong/drone_img"
+DEFAULT_CACHE_DIR = "/media/data1/feihong/hf_cache"
+DEFAULT_CHECKPOINT = "/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth"
+DEFAULT_INCLUDE_FILE = "/media/data1/feihong/ckpt/include2.json"
+DEFAULT_TEST_SPLIT_FILE = "/media/data1/feihong/ckpt/test_2.txt"
+DEFAULT_TEST_SATELLITE_ROOT = "/media/data1/feihong/img_test_2"
+DEFAULT_DRONE_IMAGE_ROOT = "/media/data1/feihong/drone_img"
 DEFAULT_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 DEFAULT_SAT_SIZE = (432, 768)
 DEFAULT_SUBSET_HEIGHTS = [150, 200, 250, 300]
 DEFAULT_SUBSET_ANGLES = [0, 45, 90, 135, 180, 225, 270, 315]
+DEFAULT_QWEN_GENERATE_BATCH_SIZE = 16
 RESULT_FIELDS = [
     "timestamp",
     "accepted",
@@ -147,6 +148,16 @@ def _read_prompt(path: Path) -> str:
     return prompt
 
 
+def _assert_safe_description_path(descriptions_path: Path, drone_image_root: str) -> None:
+    resolved_path = descriptions_path.resolve()
+    resolved_drone_root = Path(drone_image_root).resolve()
+    if resolved_path == resolved_drone_root or resolved_drone_root in resolved_path.parents:
+        raise ValueError(
+            "--description-dir must not be inside --drone-image-root; "
+            "auto-prompt descriptions should not overwrite original per-case JSON files."
+        )
+
+
 def _yield_split_case_ids(split_file: str) -> Iterable[str]:
     path = Path(split_file)
     if not path.exists():
@@ -232,42 +243,82 @@ def generate_descriptions(
     case_ids: Sequence[str],
     descriptions_path: Path,
 ) -> Dict[str, Dict[str, str]]:
+    expected_case_ids = {_normalize_sample_id(sample_id) for sample_id in case_ids}
     if descriptions_path.exists() and not args.overwrite_descriptions:
         with descriptions_path.open("r", encoding="utf-8") as f:
             payload = json.load(f)
-        return {
+        descriptions = {
             _normalize_sample_id(sample_id): descriptions
             for sample_id, descriptions in payload.get("descriptions_by_sample", {}).items()
         }
+        cached_case_ids = set(descriptions)
+        if cached_case_ids != expected_case_ids:
+            raise ValueError(
+                "Cached descriptions do not match the selected evaluation cases. "
+                f"expected={len(expected_case_ids)} cached={len(cached_case_ids)} "
+                "Run again with --overwrite-descriptions."
+            )
+        return descriptions
 
     model, processor = _load_qwen_model(args)
-    qwen_args = SimpleNamespace(
-        prompt=prompt,
-        model_name=args.qwen_model_name,
-        image_width=args.image_width,
-        image_height=args.image_height,
-        image_field=args.image_field,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        enable_thinking=args.enable_thinking,
-    )
-
-    descriptions_by_sample: Dict[str, Dict[str, str]] = {}
-    for idx, sample_id in enumerate(case_ids, start=1):
+    descriptions_by_sample: Dict[str, Dict[str, str]] = {
+        _normalize_sample_id(sample_id): {} for sample_id in case_ids
+    }
+    conversations: List[List[Dict[str, Any]]] = []
+    conversation_keys: List[Tuple[str, str]] = []
+    for sample_idx, sample_id in enumerate(case_ids, start=1):
+        sample_id = _normalize_sample_id(sample_id)
         image_dir = str((Path(args.drone_image_root) / sample_id).resolve())
-        print(f"[Qwen {idx}/{len(case_ids)}] {image_dir}")
-        result = qwen_gen.generate_descriptions_for_one_dir(
-            resolved_image_dir=image_dir,
+        print(f"[Qwen prepare {sample_idx}/{len(case_ids)}] {image_dir}")
+        height_groups = qwen_gen.collect_height_groups(image_dir)
+        for height in (str(item) for item in qwen_gen.HEIGHTS):
+            image_paths = height_groups[height]
+            qwen_gen._validate_images(
+                image_paths,
+                expected_size=(args.image_width, args.image_height),
+            )
+            conversations.append(
+                [qwen_gen._build_message(prompt, image_paths, image_field=args.image_field)]
+            )
+            conversation_keys.append((sample_id, height))
+
+    generate_batch_size = max(int(args.qwen_generate_batch_size), 1)
+    for start in range(0, len(conversations), generate_batch_size):
+        end = min(start + generate_batch_size, len(conversations))
+        print(
+            f"[Qwen generate {start + 1}-{end}/{len(conversations)}] "
+            f"batch_size={end - start}"
+        )
+        batch_outputs = qwen_gen._generate_batch(
             model=model,
             processor=processor,
-            args=qwen_args,
+            conversations=conversations[start:end],
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            enable_thinking=args.enable_thinking,
         )
-        descriptions_by_sample[sample_id] = {
-            str(height): str(text).strip()
-            for height, text in result["descriptions"].items()
-        }
+        for (sample_id, height), text in zip(conversation_keys[start:end], batch_outputs):
+            descriptions_by_sample[sample_id][height] = str(text).strip()
+
+    generated_case_ids = {_normalize_sample_id(sample_id) for sample_id in descriptions_by_sample}
+    if generated_case_ids != expected_case_ids:
+        raise RuntimeError(
+            "Generated descriptions do not match the selected evaluation cases. "
+            f"expected={len(expected_case_ids)} generated={len(generated_case_ids)}"
+        )
+    expected_heights = {str(height) for height in qwen_gen.HEIGHTS}
+    incomplete_cases = [
+        sample_id
+        for sample_id, descriptions in descriptions_by_sample.items()
+        if set(descriptions) != expected_heights
+    ]
+    if incomplete_cases:
+        raise RuntimeError(
+            "Generated descriptions are missing one or more heights for cases: "
+            f"{incomplete_cases[:5]}"
+        )
 
     descriptions_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -277,6 +328,7 @@ def generate_descriptions(
             "prompt": prompt,
             "case_ids": list(case_ids),
             "qwen_model_name": args.qwen_model_name,
+            "qwen_generate_batch_size": int(args.qwen_generate_batch_size),
         },
         "descriptions_by_sample": descriptions_by_sample,
     }
@@ -498,6 +550,9 @@ def evaluate_retrieval(
     descriptions_by_sample: Dict[str, Dict[str, str]],
 ) -> Dict[str, Any]:
     device = torch.device(args.device)
+    query_source = str(args.retrieval_query_source).strip().lower()
+    if query_source in {"text", "image_text"} and not args.use_text:
+        raise ValueError(f"--retrieval-query-source={query_source} requires --use-text.")
     encoder_cls = Encoder_test if args.encoder_type == "test" else Encoder_heat
     model = encoder_cls(
         model_name=args.model_name,
@@ -526,7 +581,6 @@ def evaluate_retrieval(
 
     with torch.inference_mode():
         for batch in tqdm(loader, desc=f"Evaluate Encoder_{args.encoder_type}"):
-            query_imgs = batch["target_pixel_values"].to(device, non_blocking=True)
             search_imgs = batch["search_pixel_values"].to(device, non_blocking=True)
             input_ids = batch["input_ids"].to(device, non_blocking=True) if args.use_text else None
             attention_mask = (
@@ -534,21 +588,36 @@ def evaluate_retrieval(
                 if args.use_text and "attention_mask" in batch
                 else None
             )
-            geo = build_geo_features(batch, device) if args.use_angle else None
-            outputs = model(
-                query_imgs,
-                search_imgs,
-                input_ids=input_ids,
-                angle=geo,
-                attention_mask=attention_mask,
-            )
-            if len(outputs) != 7:
-                raise ValueError(f"Expected 7 model outputs, got {len(outputs)}.")
-            _, _, text_pooler, anchor_pooler, grid_feats, _, _ = outputs
+            if query_source == "text":
+                if not hasattr(model, "_encode_text_anchor"):
+                    raise ValueError("--retrieval-query-source=text requires Encoder_test.")
+                if input_ids is None:
+                    raise ValueError("Text retrieval requires tokenized input_ids.")
+                _, text_pooler = model._encode_text_anchor(input_ids, attention_mask)
+                sat_output = model._vision_forward(
+                    search_imgs,
+                    interpolate_pos_encoding=True,
+                )
+                sat_feats = sat_output.last_hidden_state
+                grid_feats = model.attnPooling(sat_feats, 9)
+                query_feats.append(F.normalize(text_pooler, p=2, dim=1).cpu())
+            else:
+                query_imgs = batch["target_pixel_values"].to(device, non_blocking=True)
+                geo = build_geo_features(batch, device) if args.use_angle else None
+                outputs = model(
+                    query_imgs,
+                    search_imgs,
+                    input_ids=input_ids if query_source == "image_text" else None,
+                    angle=geo,
+                    attention_mask=attention_mask if query_source == "image_text" else None,
+                )
+                if len(outputs) != 7:
+                    raise ValueError(f"Expected 7 model outputs, got {len(outputs)}.")
+                _, _, text_pooler, anchor_pooler, grid_feats, _, _ = outputs
 
-            query_feats.append(F.normalize(anchor_pooler, p=2, dim=1).cpu())
-            if text_pooler is not None:
-                query_text_feats.append(F.normalize(text_pooler, p=2, dim=1).cpu())
+                query_feats.append(F.normalize(anchor_pooler, p=2, dim=1).cpu())
+                if query_source == "image_text" and text_pooler is not None:
+                    query_text_feats.append(F.normalize(text_pooler, p=2, dim=1).cpu())
 
             gallery_grid_batch = F.normalize(grid_feats, p=2, dim=2).cpu()
             batch_labels = [_path_label(path) for path in batch["satellite_path"]]
@@ -567,7 +636,11 @@ def evaluate_retrieval(
         raise RuntimeError("No retrieval features were extracted.")
 
     gallery_labels = sorted(gallery_feat_dict.keys())
-    query_text_tensor = torch.cat(query_text_feats, dim=0) if query_text_feats else None
+    query_text_tensor = (
+        torch.cat(query_text_feats, dim=0)
+        if query_source == "image_text" and query_text_feats
+        else None
+    )
     metrics = score_queries(
         query_feats=torch.cat(query_feats, dim=0),
         query_text_feats=query_text_tensor,
@@ -707,7 +780,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subset-angles", type=int, nargs="*", default=DEFAULT_SUBSET_ANGLES)
     parser.add_argument("--candidate-size", type=int, default=50)
     parser.add_argument("--include-file", type=str, default=DEFAULT_INCLUDE_FILE)
-    parser.add_argument("--bbox-file", type=str, default="/data/feihong/ckpt/bbox_test_2.json")
+    parser.add_argument("--bbox-file", type=str, default="/media/data1/feihong/ckpt/bbox_test_2.json")
     parser.add_argument("--test-split-file", type=str, default=DEFAULT_TEST_SPLIT_FILE)
     parser.add_argument("--test-satellite-root", type=str, default=DEFAULT_TEST_SATELLITE_ROOT)
     parser.add_argument("--drone-image-root", type=str, default=DEFAULT_DRONE_IMAGE_ROOT)
@@ -715,6 +788,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-text", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-angle", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-ap", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--retrieval-query-source",
+        choices=["text", "image", "image_text"],
+        default="text",
+        help=(
+            "Query feature used for retrieval: text uses the SigLIP2 text model "
+            "feature directly; image uses the drone image feature; image_text uses "
+            "image retrieval with text reranking."
+        ),
+    )
     parser.add_argument("--text-score-weight", type=float, default=0.3)
     parser.add_argument("--text-rerank-topk", type=int, default=50)
     parser.add_argument("--lora-rank", type=int, default=8)
@@ -740,6 +823,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-height", type=int, default=qwen_gen.IMAGE_SIZE[1])
     parser.add_argument("--image-field", choices=["pil", "url", "image"], default="image")
     parser.add_argument("--max-new-tokens", type=int, default=96)
+    parser.add_argument(
+        "--generation-batch-size",
+        type=int,
+        default=qwen_gen.DEFAULT_GENERATION_BATCH_SIZE,
+        help="Deprecated; use --qwen-generate-batch-size.",
+    )
+    parser.add_argument(
+        "--qwen-generate-batch-size",
+        type=int,
+        default=DEFAULT_QWEN_GENERATE_BATCH_SIZE,
+        help=(
+            "Number of Qwen conversations generated together across selected "
+            "cases and heights."
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=64)
@@ -765,6 +863,7 @@ def main() -> None:
         Path(args.description_dir)
         / f"prompt_{prompt_sha1[:10]}_cases{int(args.max_cases)}.json"
     )
+    _assert_safe_description_path(descriptions_path, args.drone_image_root)
 
     if args.skip_generate:
         descriptions_by_sample = load_descriptions(descriptions_path)

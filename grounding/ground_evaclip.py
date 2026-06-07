@@ -46,13 +46,13 @@ class AverageMeter:
 
 # --- Configuration ---
 MODEL_NAME = "hf-hub:timm/eva02_base_patch16_clip_224.merged2b_s8b_b131k"
-CACHE_DIR = "/data/feihong/hf_cache"
-DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
-IMAGE_FOLDER = "/data/feihong/image_1024"
-BBOX_FILE = "/data/feihong/univerisity_dev/runs/bbox_isaac.json"
-TRAIN_BBOX_FILE = "/data/feihong/univerisity_dev/runs/train.json"
-TEST_BBOX_FILE = "/data/feihong/univerisity_dev/runs/test.json"
-TEXT_FILE = "/data/feihong/drone_text_single_long.json"
+CACHE_DIR = "/media/data1/feihong/hf_cache"
+DRONE_VIEW_FOLDER = "/media/data1/feihong/drone_view"
+IMAGE_FOLDER = "/media/data1/feihong/image_1024"
+BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/bbox_isaac.json"
+TRAIN_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/train.json"
+TEST_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
+TEXT_FILE = "/media/data1/feihong/drone_text_single_long.json"
 
 SAT_ORIG_SIZE = (3840, 2160)
 UNIV_SAT_SIZE = (640, 640)
@@ -421,7 +421,7 @@ def main(save_path):
 
     print("Setting up dataset and dataloader...")
     train_image_pairs = []
-    with open("/data/feihong/ckpt/train.txt", "r") as f:
+    with open("/media/data1/feihong/ckpt/train.txt", "r") as f:
         for line in f:
             query_path = line.strip()
             name = query_path.split("/")[-2]
@@ -429,7 +429,7 @@ def main(save_path):
             if os.path.exists(search_path):
                 train_image_pairs.append((query_path, search_path))
     test_image_pairs = []
-    with open("/data/feihong/ckpt/test.txt", "r") as f:
+    with open("/media/data1/feihong/ckpt/test.txt", "r") as f:
         for line in f:
             query_path = line.strip()
             name = query_path.split("/")[-2]

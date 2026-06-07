@@ -826,7 +826,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pretrained-checkpoint",
         type=str,
-        default="/data/feihong/ckpt/SMGeo.pth",
+        default="/media/data1/feihong/ckpt/SMGeo.pth",
         help="Official SMGeo checkpoint used to initialize the Swin-MoE grounding model",
     )
     parser.add_argument(
@@ -839,7 +839,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/data/feihong/ckpt/ground_sm",
+        default="/media/data1/feihong/ckpt/ground_sm",
         help="Path to save model checkpoints",
     )
     args = parser.parse_args()

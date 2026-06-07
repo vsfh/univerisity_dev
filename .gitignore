@@ -212,6 +212,5 @@ runs/
 *.npz
 *.pt
 .codex
-configs/
 eval_results/
 node_modules/

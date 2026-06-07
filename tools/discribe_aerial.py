@@ -25,7 +25,7 @@ def qwen3():
     processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
     res = {}
     numbers = ['01','21','31','41','51']
-    for img_path in tqdm(glob(f"/home/SATA4T/gregory/data/drone_view/*/*/image-01.jpeg")):
+    for img_path in tqdm(glob(f"/home/SATA4T/gregory/media/data1/drone_view/*/*/image-01.jpeg")):
         index = img_path.split('/')[-2]
         message = {
                 "role": "user",
@@ -82,7 +82,7 @@ def qwen3_single():
     building_des = json.load(open('../ckpt/drone_text_long.json', 'r'))
     processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
     # numbers = ['01','21','31','41','51']
-    for img_path in tqdm(glob(f"/home/SATA4T/gregory/data/drone_view/*/*/image-01.jpeg")):
+    for img_path in tqdm(glob(f"/home/SATA4T/gregory/media/data1/drone_view/*/*/image-01.jpeg")):
         index = img_path.split('/')[-2]
         if os.path.exists(f'../ckpt/text/{index}.json'):
             continue
@@ -156,7 +156,7 @@ def qwen2():
     # processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct", min_pixels=min_pixels, max_pixels=max_pixels)
     res = {}
     numbers = ['01','21','31','41','51']
-    for img_path in tqdm(glob(f"/home/SATA4T/gregory/data/drone_view/*/*/image-01.jpeg")):
+    for img_path in tqdm(glob(f"/home/SATA4T/gregory/media/data1/drone_view/*/*/image-01.jpeg")):
         index = img_path.split('/')[-2]
         message = {
                 "role": "user",

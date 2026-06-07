@@ -26,9 +26,9 @@ from text import (
 
 
 # --- Configuration ---
-DEFAULT_CHECKPOINT = "/data/feihong/ckpt/text_qwen3vl/last.pth"
-DEFAULT_OUTPUT_DIR = "/data/feihong/univerisity_dev/eval_results/test_unify"
-DEFAULT_INCLUDE_FILE = "/data/feihong/ckpt/include1.json"
+DEFAULT_CHECKPOINT = "/media/data1/feihong/ckpt/text_qwen3vl/last.pth"
+DEFAULT_OUTPUT_DIR = "/media/data1/feihong/univerisity_dev/eval_results/test_unify"
+DEFAULT_INCLUDE_FILE = "/media/data1/feihong/ckpt/include1.json"
 
 
 def _normalize_label(label: str) -> str:

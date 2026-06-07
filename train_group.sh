@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-cd /data/feihong/univerisity_dev
+cd /media/data1/feihong/univerisity_dev
 
 CONFIGS=(
     # Encoder_heat without geo input.

@@ -68,7 +68,7 @@ Place at file top with `--- Configuration ---` separator:
 ```python
 # --- Configuration ---
 MODEL_NAME = "google/siglip-base-patch16-224"
-CACHE_DIR = "/data/feihong/hf_cache"
+CACHE_DIR = "/media/data1/feihong/hf_cache"
 NUM_EPOCHS = 40
 BATCH_SIZE = 20
 LEARNING_RATE = 1e-5

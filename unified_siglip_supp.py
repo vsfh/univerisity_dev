@@ -46,15 +46,15 @@ class Config:
     CLEARML_PROJECT = "unified_siglip"
     CLEARML_TASK_NAME = None
     MODEL_NAME = "google/siglip2-base-patch16-224"
-    CACHE_DIR = "/data/feihong/hf_cache"
-    DRONE_VIEW_FOLDER = "/data/feihong/drone_view"
-    IMAGE_FOLDER = "/data/feihong/image_1024"
-    HEADING_FOLDER = "/data/feihong/range_250"
-    TEXT_FILE = "/data/feihong/ckpt/drone_text_single_long.json"
+    CACHE_DIR = "/media/data1/feihong/hf_cache"
+    DRONE_VIEW_FOLDER = "/media/data1/feihong/drone_view"
+    IMAGE_FOLDER = "/media/data1/feihong/image_1024"
+    HEADING_FOLDER = "/media/data1/feihong/range_250"
+    TEXT_FILE = "/media/data1/feihong/ckpt/drone_text_single_long.json"
     TEXT_JSON_NAME = "udes_siglip2_gemma4.json"
-    TRAIN_BBOX_FILE = "/data/feihong/univerisity_dev/runs/train.json"
-    TEST_BBOX_FILE = "/data/feihong/univerisity_dev/runs/test.json"
-    SATELLITE_FOLDER = "/data/feihong/asian_univ"
+    TRAIN_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/train.json"
+    TEST_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
+    SATELLITE_FOLDER = "/media/data1/feihong/asian_univ"
 
     SAT_ORIG_SIZE = (3840, 2160)
     UNIV_SAT_SIZE = {"height": 432, "width": 768}
@@ -883,7 +883,7 @@ def load_data_splits() -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], se
     train_ids = set()
     test_ids = set()
 
-    with open("/data/feihong/ckpt/train.txt", "r") as f:
+    with open("/media/data1/feihong/ckpt/train.txt", "r") as f:
         for line in f:
             query_path = line.strip()
             name = query_path.split("/")[-2]
@@ -891,7 +891,7 @@ def load_data_splits() -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], se
             train_image_pairs.append((query_path, search_path))
             train_ids.add(name)
 
-    with open("/data/feihong/ckpt/test.txt", "r") as f:
+    with open("/media/data1/feihong/ckpt/test.txt", "r") as f:
         for line in f:
             query_path = line.strip()
             name = query_path.split("/")[-2]
@@ -1037,7 +1037,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         total_heatmap_loss = 0
         total_text_anchor_loss = 0
         total_text_pooler_align_loss = 0
-        total_text_satellite_retrieval_loss = 0
         last_heatmap_logits = None
         last_target_bbox = None
         last_heatmap_target = None
@@ -1131,47 +1130,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 
                     text_anchor_loss = bbox_loss.new_zeros(())
                     text_pooler_align_loss = bbox_loss.new_zeros(())
-                    text_satellite_retrieval_loss = bbox_loss.new_zeros(())
-                    if Config.ENCODER_TYPE == "test" and isinstance(fused_feats, dict):
-                        if Config.USE_TEXT_ANCHOR_LOSS and Config.USE_TEXT_GROUNDING_PATH:
-                            text_pred_anchor = fused_feats["text_pred_anchor"]
-                            text_heatmap = fused_feats["text_heatmap"]
-                            text_pred_anchor = text_pred_anchor.view(
-                                B,
-                                9,
-                                5,
-                                text_pred_anchor.shape[2],
-                                text_pred_anchor.shape[3],
-                            )
-                            text_pred_anchor = add_heatmap_to_confidence(
-                                text_pred_anchor,
-                                text_heatmap,
-                            )
-                            text_loss_geo, text_loss_cls = yolo_loss(
-                                text_pred_anchor,
-                                new_gt_bbox,
-                                anchors_full,
-                                best_anchor_gi_gj,
-                                (
-                                    Config.UNIV_SAT_SIZE["width"],
-                                    Config.UNIV_SAT_SIZE["height"],
-                                ),
-                            )
-                            text_anchor_loss = text_loss_geo + text_loss_cls
-                            if Config.USE_HEATMAP_LOSS and text_heatmap is not None:
-                                text_anchor_heatmap_loss = heatmap_loss_fn(
-                                    text_heatmap,
-                                    target_bbox,
-                                )
-                                text_anchor_loss = (
-                                    text_anchor_loss
-                                    + Config.HEATMAP_LOSS_WEIGHT * text_anchor_heatmap_loss
-                                )
-                            bbox_loss = (
-                                bbox_loss
-                                + Config.TEXT_ANCHOR_LOSS_WEIGHT * text_anchor_loss
-                            )
-
                     if heatmap_logits is not None:
                         last_heatmap_logits = heatmap_logits.detach()
                         last_target_bbox = target_bbox.detach()
@@ -1218,15 +1176,9 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                             align_anchor_feats,
                             pair_labels,
                         )
-                        text_satellite_retrieval_loss = info_nce_loss(
-                            text_feats.detach(),
-                            candidate_feats,
-                            positive_indices,
-                        )
                         image_retrieval_loss = (
                             image_retrieval_loss
                             + current_text_pooler_align_weight * text_pooler_align_loss
-                            + current_text_pooler_align_weight * text_satellite_retrieval_loss
                         )
 
                     # scheduled_bbox_weight, scheduled_retrieval_weight = get_loss_weights(
@@ -1258,7 +1210,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
             total_heatmap_loss += heatmap_loss.item()
             total_text_anchor_loss += text_anchor_loss.item()
             total_text_pooler_align_loss += text_pooler_align_loss.item()
-            total_text_satellite_retrieval_loss += text_satellite_retrieval_loss.item()
             global_step = epoch * len(train_dataloader) + i
             progress_bar.set_postfix(
                 {
@@ -1266,7 +1217,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     "heatmap_loss": f"{heatmap_loss.item():.4f}",
                     "text_anchor": f"{text_anchor_loss.item():.4f}",
                     "text_pooler": f"{text_pooler_align_loss.item():.4f}",
-                    "text_sat": f"{text_satellite_retrieval_loss.item():.4f}",
                     "text_pooler_w": f"{current_text_pooler_align_weight:.4f}",
                     "retrieval_loss": f"{image_retrieval_loss.item():.4f}",
                     "retrieval_weight": f"{retrieval_weight:.4f}",
@@ -1282,7 +1232,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 writer.add_scalar("Loss/heatmap_step", heatmap_loss.item(), global_step)
                 writer.add_scalar("Loss/text_anchor_step", text_anchor_loss.item(), global_step)
                 writer.add_scalar("Loss/text_pooler_align_step", text_pooler_align_loss.item(), global_step)
-                writer.add_scalar("Loss/text_satellite_retrieval_step", text_satellite_retrieval_loss.item(), global_step)
                 writer.add_scalar("Weight/text_pooler_align", current_text_pooler_align_weight, global_step)
                 writer.add_scalar("Loss/retrieval_step", image_retrieval_loss.item(), global_step)
                 writer.add_scalar("Weight/retrieval", retrieval_weight, global_step)
@@ -1308,12 +1257,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 )
                 clearml_logger.report_scalar(
                     "train", "text_pooler_align_loss", text_pooler_align_loss.item(), global_step
-                )
-                clearml_logger.report_scalar(
-                    "train",
-                    "text_satellite_retrieval_loss",
-                    text_satellite_retrieval_loss.item(),
-                    global_step,
                 )
                 clearml_logger.report_scalar(
                     "train", "image_retrieval_loss", image_retrieval_loss.item(), global_step
@@ -1347,11 +1290,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
             writer.add_scalar(
                 "Loss/text_pooler_align_epoch",
                 total_text_pooler_align_loss / len(train_dataloader),
-                epoch,
-            )
-            writer.add_scalar(
-                "Loss/text_satellite_retrieval_epoch",
-                total_text_satellite_retrieval_loss / len(train_dataloader),
                 epoch,
             )
             writer.add_scalar("lr/learning_rate", optimizer.param_groups[0]["lr"], epoch)
@@ -1444,7 +1382,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-root",
         type=str,
-        default="/data/feihong/ckpt",
+        default="/media/data1/feihong/ckpt",
         help="Root directory for checkpoints when --save-dir is not set.",
     )
     parser.add_argument(

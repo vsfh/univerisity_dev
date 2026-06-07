@@ -525,7 +525,7 @@ def _generate_batch(
     top_p: float,
     top_k: int,
     enable_thinking: bool,
-) -> str:
+) -> List[str]:
     inputs = _apply_chat_template(
         processor=processor,
         messages=list(conversations),

@@ -1,0 +1,232 @@
+timestamp,accepted,score_metric,score,previous_best_score,run_id,prompt_sha1,num_cases,num_queries,top1_hits,top5_hits,top10_hits,recall@1,recall@5,recall@10,candidate_size,text_score_weight,text_rerank_topk,checkpoint,descriptions_path,query_records_path,prompt
+2026-06-06 20:14:09,True,recall@1,0.495,,20260606_195959_a61c45559d,a61c45559d31d2381106d6034687bc56adbcca7c,50,1600,792,1390,1547,0.495,0.86875,0.966875,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_a61c45559d_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_195959_a61c45559d.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 10-14 words: name the most discriminative overhead-visible anchor, including its footprint, roof, or surrounding landmark relation.
+Phrases 2-4 must be short supporting cues: use stable layout evidence such as building shape, roof color/texture, courtyard/open space, sports field, water edge, parking pattern, road geometry, tree belt, or relative position.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-06 21:10:56,False,recall@1,0.11,0.495,20260606_210136_a61c45559d,a61c45559d31d2381106d6034687bc56adbcca7c,50,1600,176,632,888,0.11,0.395,0.555,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_a61c45559d_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_210136_a61c45559d.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 10-14 words: name the most discriminative overhead-visible anchor, including its footprint, roof, or surrounding landmark relation.
+Phrases 2-4 must be short supporting cues: use stable layout evidence such as building shape, roof color/texture, courtyard/open space, sports field, water edge, parking pattern, road geometry, tree belt, or relative position.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-06 21:20:14,False,recall@1,0.105,0.495,20260606_211207_1ecb9c63ad,1ecb9c63adee4456656d8d1c55bb0a56fb079bbc,50,1600,168,616,880,0.105,0.385,0.55,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_1ecb9c63ad_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_211207_1ecb9c63ad.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output one line with exactly 4 comma-separated English noun phrases and nothing else.
+Use exactly 3 commas total. Do not write periods, semicolons, conjunction chains, markdown, numbering, headings, or explanatory sentences.
+
+Phrase 1 must be 9-13 words: name the most discriminative overhead-visible anchor, including footprint, roof type, or surrounding landmark relation.
+Phrases 2-4 must be 2-6 words each: use stable layout evidence such as building shape, roof color/texture, courtyard/open space, sports field, water edge, parking pattern, road geometry, tree belt, or relative position.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-06 21:29:29,False,recall@1,0.095,0.495,20260606_212123_4467af0bd9,4467af0bd940b49b503637d8b46f159a0478c878,50,1600,152,512,808,0.095,0.32,0.505,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_4467af0bd9_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_212123_4467af0bd9.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead. Prioritize the target anchor and its nearest permanent neighbors.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 10-14 words: name the most discriminative overhead-visible anchor plus one nearby landmark relation.
+Phrases 2-4 must be short supporting cues: use object-to-object layout evidence such as beside a sports field, enclosed by courtyards, along a curved road, next to water, within tree belts, near parking rows, or between distinctive roof blocks.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-06 21:39:11,False,recall@1,0.125,0.495,20260606_213039_f09f76732a,f09f76732ab025f12acb4f2f2d6580500364c679,50,1600,200,648,912,0.125,0.405,0.57,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_f09f76732a_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_213039_f09f76732a.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Use this phrase order: main anchor, footprint or roof cue, nearest permanent neighbor, boundary or access pattern.
+Phrase 1 must be 10-14 words: name the most discriminative overhead-visible anchor, including its footprint, roof, or surrounding landmark relation.
+Phrases 2-4 must be short supporting cues: use stable layout evidence such as building shape, roof color/texture, courtyard/open space, sports field, water edge, parking pattern, road geometry, tree belt, or relative position.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-06 21:48:16,False,recall@1,0.14,0.495,20260606_214004_30c6f46d63,30c6f46d634fd2ce1fae87cc30ed31fb06cf7daa,50,1600,224,576,864,0.14,0.36,0.54,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_30c6f46d63_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_214004_30c6f46d63.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+Follow this format with real details: distinctive overhead anchor near landmark, roof or footprint cue, adjacent permanent neighbor, boundary or access pattern.
+
+Phrase 1 must be 10-14 words: name the most discriminative overhead-visible anchor, including its footprint, roof, or surrounding landmark relation.
+Phrases 2-4 must be short supporting cues: use stable layout evidence such as building shape, roof color/texture, courtyard/open space, sports field, water edge, parking pattern, road geometry, tree belt, or relative position.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-06 21:57:49,False,recall@1,0.1,0.495,20260606_214914_af6f9f71dd,af6f9f71dd1c2956afb8e6748cca6abce3c9180e,50,1600,160,688,960,0.1,0.43,0.6,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_af6f9f71dd_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_214914_af6f9f71dd.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 10-14 words: name the most discriminative overhead-visible anchor, including its footprint, roof, or surrounding landmark relation.
+Phrases 2-4 must be short supporting cues ordered by evidence strength: unique structure or roof first, then nearby field/water/road geometry, then boundary context such as tree belt, courtyard, or parking pattern.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-06 22:07:43,False,recall@1,0.085,0.495,20260606_215907_bf06e9032f,bf06e9032f8b8d633d5665749658c4cc3e615b6f,50,1600,136,560,784,0.085,0.35,0.49,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_bf06e9032f_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_215907_bf06e9032f.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 10-14 words: name the most discriminative overhead-visible anchor, including its footprint, roof, or surrounding landmark relation.
+Phrases 2-4 must be short supporting cues using overhead map nouns: roof, footprint, courtyard, sports field, track, court, water edge, parking rows, road curve, intersection, tree belt, plaza, or open lawn.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-06 22:16:53,False,recall@1,0.09,0.495,20260606_220859_d2f7bbb2bd,d2f7bbb2bd86c3149c2108d4249be43f4ed3bc20,50,1600,144,568,848,0.09,0.355,0.53,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_d2f7bbb2bd_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_220859_d2f7bbb2bd.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 7-10 words: name the most discriminative overhead-visible anchor and one landmark relation.
+Phrases 2-4 must be 2-5 word map tags: use stable layout evidence such as building shape, roof color/texture, courtyard/open space, sports field, water edge, parking pattern, road geometry, tree belt, or relative position.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-06 22:26:36,False,recall@1,0.14,0.495,20260606_221737_c96fc80762,c96fc8076212f7bdb83822bc3c52f0a0bc0aa62f,50,1600,224,672,912,0.14,0.42,0.57,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_c96fc80762_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_221737_c96fc80762.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 10-14 words: name the most discriminative overhead-visible anchor, including its footprint, roof, or surrounding landmark relation.
+Phrases 2-4 must be short supporting cues: use stable layout evidence such as building shape, roof color/texture, courtyard/open space, sports field, water edge, parking pattern, road geometry, tree belt, or relative position.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid compass directions, facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-06 22:35:51,False,recall@1,0.12,0.495,20260606_222746_6d4a7b1b7a,6d4a7b1b7ab6839f2adb3998bde313628d94d035,50,1600,192,632,888,0.12,0.395,0.555,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_6d4a7b1b7a_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_222746_6d4a7b1b7a.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 10-14 words: name the most discriminative overhead-visible anchor, including its footprint, roof, or surrounding landmark relation.
+Start phrase 1 with a concrete semantic anchor, not a size word: solar roof, dome, track, court, water edge, courtyard, bridge, tower, L-shaped building, or roof cluster.
+Phrases 2-4 must be short supporting cues: use stable layout evidence such as building shape, roof color/texture, courtyard/open space, sports field, water edge, parking pattern, road geometry, tree belt, or relative position.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-06 22:45:13,False,recall@1,0.12,0.495,20260606_223657_f89260d1e9,f89260d1e9758f4868c60954847f2e7c65612ec8,50,1600,192,560,856,0.12,0.35,0.535,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_f89260d1e9_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_223657_f89260d1e9.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+Use the delimiter pattern `A, B, C, D`; each slot must be replaced with real overhead-visible evidence.
+
+Phrase 1 must be 10-14 words: name the most discriminative overhead-visible anchor, including its footprint, roof, or surrounding landmark relation.
+Phrases 2-4 must be short supporting cues: use stable layout evidence such as building shape, roof color/texture, courtyard/open space, sports field, water edge, parking pattern, road geometry, tree belt, or relative position.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-06 22:56:20,False,recall@1,0.21,0.495,20260606_224655_3cf7fdb314,3cf7fdb3146d294d643baf53d8c3db839510c2c6,50,1600,336,784,1104,0.21,0.49,0.69,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_3cf7fdb314_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_224655_3cf7fdb314.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 14-18 words: name the most discriminative overhead-visible anchor, including its footprint, roof, and strongest surrounding landmark relation.
+Phrases 2-4 must be medium supporting cues with both object and context: use stable layout evidence such as building shape, roof color/texture, courtyard/open space, sports field, water edge, parking pattern, road geometry, tree belt, or relative position.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-06 23:06:25,False,recall@1,0.125,0.495,20260606_225731_e1c056bc08,e1c056bc0868627858b4b98dc16df354770dfade,50,1600,200,600,856,0.125,0.375,0.535,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_e1c056bc08_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_225731_e1c056bc08.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 10-14 words: name the most discriminative overhead-visible anchor, including its footprint, roof, or surrounding landmark relation.
+Phrases 2-4 must be short supporting cues that distinguish this place from similar nearby buildings: use stable layout evidence such as unusual roof equipment, solar panels, dome or tent roof, track/court/field shape, water edge, parking pattern, road geometry, tree belt, or courtyard position.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-06 23:17:04,False,recall@1,0.175,0.495,20260606_230735_6b5fbd5238,6b5fbd52385780be2e9dbfa7350058c704998e1f,50,1600,280,792,1048,0.175,0.495,0.655,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_6b5fbd5238_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_230735_6b5fbd5238.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 14-18 words: start with one core keyword, then name the most discriminative overhead-visible anchor with footprint, roof, and landmark relation.
+Phrases 2-4 must be medium keyword-plus-context cues: start with one map keyword, then add stable layout evidence such as building shape, roof color/texture, courtyard/open space, sports field, water edge, parking pattern, road geometry, tree belt, or relative position.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-06 23:27:25,False,recall@1,0.14,0.495,20260606_231826_a4568aa558,a4568aa558afa0127aa1604f05d91449eacc5539,50,1600,224,640,1024,0.14,0.4,0.64,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_a4568aa558_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_231826_a4568aa558.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 14-18 words: name the local anchor, including its footprint, roof, and closest landmark relation.
+Phrase 2 must describe the immediate neighboring structure or open space.
+Phrase 3 must describe the larger road, field, water, or courtyard layout.
+Phrase 4 must describe the boundary context such as tree belt, parking pattern, or perimeter block.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-06 23:36:21,False,recall@1,0.18,0.495,20260606_232815_eacb99bcbe,eacb99bcbedf3d83cce7aa81528ccac8b7fabfed,50,1600,288,704,1024,0.18,0.44,0.64,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_eacb99bcbe_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_232815_eacb99bcbe.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 12-16 words: name the most discriminative overhead-visible anchor with its footprint and surrounding landmark relation.
+Phrases 2-4 must each be 7-11 words: combine one stable object cue with one map relation or layout cue.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-06 23:44:48,False,recall@1,0.09,0.495,20260606_233700_a59673a9ef,a59673a9ef7dc8ee118245009c7d1f17aaa7e248,50,1600,144,624,992,0.09,0.39,0.62,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_a59673a9ef_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_233700_a59673a9ef.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 10-14 words: name the most discriminative overhead-visible anchor, including its footprint, roof, or surrounding landmark relation.
+Phrases 2-4 must be short supporting cues: use stable layout evidence such as building shape, roof color/texture, courtyard/open space, sports field, water edge, parking pattern, road geometry, tree belt, or relative position.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences.
+Treat tiny isolated objects, background clutter, and ambiguous textures as noise unless they form a stable overhead pattern."
+2026-06-06 23:53:31,False,recall@1,0.125,0.495,20260606_234531_0458df954d,0458df954d91dfe2f3c8e2a0db9668d80111276b,50,1600,200,544,824,0.125,0.34,0.515,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_0458df954d_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_234531_0458df954d.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+Choose cues that appear consistently across multiple view directions or clearly imply an overhead footprint.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 10-14 words: name the most discriminative overhead-visible anchor, including its footprint, roof, or surrounding landmark relation.
+Phrases 2-4 must be short supporting cues: use stable layout evidence such as building shape, roof color/texture, courtyard/open space, sports field, water edge, parking pattern, road geometry, tree belt, or relative position.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-07 00:02:23,False,recall@1,0.13,0.495,20260606_235423_80efee4c77,80efee4c770c5ac006d81192c2d7b2ee4ee227f0,50,1600,208,640,952,0.13,0.4,0.595,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_80efee4c77_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260606_235423_80efee4c77.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 10-14 words: name the most discriminative overhead-visible anchor, including its footprint, roof, or surrounding landmark relation.
+Phrases 2-4 must be short supporting cues: include relative-position wording such as beside, between, attached to, surrounded by, or along when natural.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-07 00:10:48,False,recall@1,0.095,0.495,20260607_000305_172df148f9,172df148f9137acc7e2cd4fea60b335e4954eb7b,50,1600,152,616,896,0.095,0.385,0.56,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_172df148f9_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260607_000305_172df148f9.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 10-14 words: name the most discriminative overhead-visible anchor, including its footprint, roof, or surrounding landmark relation.
+Phrases 2-4 must be short supporting cues: use stable layout evidence such as building shape, roof color/texture, courtyard/open space, sports field, water edge, parking pattern, road geometry, tree belt, or relative position.
+Start each phrase with a concrete map category noun such as building, roof, courtyard, road, field, water edge, parking lot, or tree belt.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences."
+2026-06-07 00:20:30,False,recall@1,0.135,0.495,20260607_001209_eb71acd7c6,eb71acd7c67075a045d949f6364236a34feb319e,50,1600,216,632,960,0.135,0.395,0.6,50,0.3,50,/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth,auto_prompt/generated_descriptions/auto_research_loop/prompt_eb71acd7c6_cases50.json,/media/data1/feihong/univerisity_dev/auto_prompt/query_records/20260607_001209_eb71acd7c6.jsonl,"You are writing a compact retrieval key for matching drone-view images to a satellite map.
+
+The four input images show the same target area at one flight height from north, east, south, and west views. First compare the four views, then keep only evidence that should remain visible from overhead.
+
+Output exactly 4 comma-separated English noun phrases and nothing else.
+
+Phrase 1 must be 10-14 words: name the most discriminative overhead-visible anchor, including its footprint, roof, or surrounding landmark relation.
+Phrases 2-4 must be short supporting cues: use stable layout evidence such as building shape, roof color/texture, courtyard/open space, sports field, water edge, parking pattern, road geometry, tree belt, or relative position.
+
+Prefer rare, local, map-verifiable details over generic campus words. Avoid facade, camera angle, lighting, sky, people, vehicles as temporary objects, uncertainty words, markdown, numbering, headings, and full sentences.
+Do not guess building functions or names; describe visible form, roof, and surrounding layout instead."

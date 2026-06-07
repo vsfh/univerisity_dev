@@ -13,7 +13,7 @@ What it does:
 - reads `auto_prompt/current_prompt.md`
 - uses `tools/generate_qwen_6_4.py` through its existing public functions, without modifying that file
 - generates descriptions for the first 50 test cases into `auto_prompt/generated_descriptions/`
-- loads `/data/feihong/ckpt/model_test_geo_input_ids/last.pth`
+- loads `/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth`
 - evaluates retrieval with `Encoder_test`
 - appends metrics and the full prompt to `auto_prompt/result.csv`
 - writes full prompt history to `auto_prompt/prompt_history.jsonl`
@@ -23,7 +23,7 @@ Useful options:
 
 ```bash
 python -m auto_prompt.evaluate_prompt \
-  --checkpoint /data/feihong/ckpt/model_test_geo_input_ids/last.pth \
+  --checkpoint /media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth \
   --max-cases 50 \
   --candidate-size 50 \
   --text-score-weight 0.3 \
