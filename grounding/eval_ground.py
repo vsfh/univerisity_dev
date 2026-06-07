@@ -47,6 +47,28 @@ DEFAULT_GROUNDING_RUNS = {
     "encoder_test": "/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth",
 }
 
+
+def _resolve_local_hf_snapshot(model_name: str, cache_dir: str) -> str:
+    """Use an existing Hugging Face snapshot path when available to avoid downloads."""
+    repo_cache_name = f"models--{model_name.replace('/', '--')}"
+    repo_cache_dir = Path(cache_dir) / repo_cache_name
+    refs_main = repo_cache_dir / "refs" / "main"
+    snapshots_dir = repo_cache_dir / "snapshots"
+
+    if refs_main.exists():
+        revision = refs_main.read_text(encoding="utf-8").strip()
+        snapshot_dir = snapshots_dir / revision
+        if snapshot_dir.is_dir():
+            return str(snapshot_dir)
+
+    if snapshots_dir.is_dir():
+        snapshots = sorted(path for path in snapshots_dir.iterdir() if path.is_dir())
+        if snapshots:
+            return str(snapshots[-1])
+
+    return model_name
+
+
 EVAL_CONFIG = {
     "device": DEFAULT_DEVICE,
     "batch_size": BATCH_SIZE,
@@ -266,18 +288,36 @@ def build_model(
 ) -> torch.nn.Module:
     model_type = _canonical_model_type(model_type)
     if model_type == "siglip":
-        return SigLIPModel(model_name=MODEL_NAME_SIGLIP, proj_dim=768)
+        return SigLIPModel(
+            model_name=_resolve_local_hf_snapshot(MODEL_NAME_SIGLIP, CACHE_DIR),
+            proj_dim=768,
+        )
     if model_type == "encoder_abla":
         EncoderAbla, _, _ = _load_encoder_classes()
         if EncoderAbla is None:
             raise AttributeError("model.py does not export Encoder_text_angle required by encoder_abla.")
-        return EncoderAbla(model_name=MODEL_NAME_SIGLIP, proj_dim=768, usesg=True, useap=True)
+        return EncoderAbla(
+            model_name=_resolve_local_hf_snapshot(MODEL_NAME_SIGLIP, CACHE_DIR),
+            proj_dim=768,
+            usesg=True,
+            useap=True,
+        )
     if model_type == "encoder_heat":
         _, EncoderHeat, _ = _load_encoder_classes()
-        return EncoderHeat(model_name=MODEL_NAME_SIGLIP2, proj_dim=768, usesg=True, useap=True)
+        return EncoderHeat(
+            model_name=_resolve_local_hf_snapshot(MODEL_NAME_SIGLIP2, CACHE_DIR),
+            proj_dim=768,
+            usesg=True,
+            useap=True,
+        )
     if model_type == "encoder_test":
         _, _, EncoderTest = _load_encoder_classes()
-        return EncoderTest(model_name=MODEL_NAME_SIGLIP2, proj_dim=768, usesg=True, useap=True)
+        return EncoderTest(
+            model_name=_resolve_local_hf_snapshot(MODEL_NAME_SIGLIP2, CACHE_DIR),
+            proj_dim=768,
+            usesg=True,
+            useap=True,
+        )
     if model_type == "det":
         return DetGeoLite(emb_size=512)
     if model_type == "lpn":
@@ -371,13 +411,14 @@ def create_test_loader(config: EvalConfig) -> DataLoader:
     # Use SigLIP processor only for siglip model; others use simple tensor wrapper.
     if model_type in {"siglip", "encoder_abla", "encoder_heat", "encoder_test"}:
         hf_model_name = MODEL_NAME_SIGLIP2 if model_type in {"encoder_heat", "encoder_test"} else MODEL_NAME_SIGLIP
-        processor = AutoImageProcessor.from_pretrained(hf_model_name, cache_dir=CACHE_DIR)
+        hf_model_path = _resolve_local_hf_snapshot(hf_model_name, CACHE_DIR)
+        processor = AutoImageProcessor.from_pretrained(hf_model_path, cache_dir=CACHE_DIR)
         processor_sat = AutoImageProcessor.from_pretrained(
-            hf_model_name,
+            hf_model_path,
             cache_dir=CACHE_DIR,
             size={"height": int(config.sat_size[0]), "width": int(config.sat_size[1])},
         )
-        tokenizer = AutoTokenizer.from_pretrained(hf_model_name, cache_dir=CACHE_DIR)
+        tokenizer = AutoTokenizer.from_pretrained(hf_model_path, cache_dir=CACHE_DIR)
     else:
         processor = TransformProcessorWrapper(DEFAULT_DRONE_SIZE)
         processor_sat = TransformProcessorWrapper(config.sat_size)
