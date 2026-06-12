@@ -10,6 +10,7 @@ from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
 from typing import List, Dict, Tuple
 
+
 def get_world_map_two():
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature

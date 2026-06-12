@@ -29,9 +29,11 @@ DEFAULT_SUBSET_HEIGHTS = [150, 200, 250, 300]
 DEFAULT_SUBSET_ANGLES = [0, 45, 90, 135, 180, 225, 270, 315]
 DEFAULT_ENABLE_TIMING_LOG = False
 DEFAULT_TIMING_LOG_INTERVAL = 200
-DEFAULT_MODEL_NAME = "google/siglip-base-patch16-224"
+DEFAULT_MODEL_NAME = "google/siglip2-base-patch16-224"
 DEFAULT_CACHE_DIR = "/media/data1/feihong/hf_cache"
-TEXT_DESCRIPTION_FILE = "gemma_5_28_description.json"
+# TEXT_DESCRIPTION_FILE = "gemma_5_28_description.json"
+TEXT_DESCRIPTION_FILE = "qwen_6_7_description.json"
+
 TRAIN_HEIGHT_TO_BOX_SIZE = {
 	150: 330//2,
 	200: 414//2,

@@ -30,6 +30,7 @@ import torchvision.models as torchvision_models
 from torch.autograd import Variable
 from pathlib import Path
 import sys
+from transformers import AutoModel
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -54,6 +55,11 @@ LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 PRINT_FREQ = 50
 SAVE_DIR = "/media/data1/feihong/ckpt/ground_cvos"
+
+MODEL_NAME = "google/siglip2-base-patch16-224"
+SIGLIP2_MODEL_NAME = MODEL_NAME
+CACHE_DIR = "/media/data1/feihong/hf_cache"
+PROJECTION_DIM = 768
 
 CVOGL_TRANSFORM = Compose(
     [
@@ -313,7 +319,99 @@ class LPNGeoLite(nn.Module):
     def bbox_forward(self, query_imgs, reference_imgs, geo=None):
         return self.forward(query_imgs, reference_imgs, geo=geo)
 
+class SiglipLite(nn.Module):
+    """DetGeo based on original DetGeo architecture with ResNet-18 and Darknet."""
 
+    def __init__(
+        self,
+        emb_size=512,
+        model_name = MODEL_NAME,
+        use_instnorm=False,
+    ):
+        super(SiglipLite, self).__init__()
+
+        model = AutoModel.from_pretrained(model_name, cache_dir=CACHE_DIR)
+        self.vision_model = model.vision_model
+
+        self.combine_clickptns_conv = ConvBatchNormReLU(
+            4, 3, 1, 1, 0, 1, leaky=True, instance=use_instnorm
+        )
+        self.crossview_fusionmodule = CrossViewFusionModule()
+
+        self.query_visudim = int(self.vision_model.config.hidden_size)
+        self.reference_visudim = int(self.vision_model.config.hidden_size)
+
+        self.query_mapping_visu = ConvBatchNormReLU(
+            self.query_visudim, emb_size, 1, 1, 0, 1, leaky=True, instance=use_instnorm
+        )
+        self.reference_mapping_visu = ConvBatchNormReLU(
+            self.reference_visudim,
+            emb_size,
+            1,
+            1,
+            0,
+            1,
+            leaky=True,
+            instance=use_instnorm,
+        )
+        self.geo_conditioner = GeoConditioner(emb_size)
+
+        self.fcn_out = nn.Sequential(
+            ConvBatchNormReLU(
+                emb_size, emb_size // 2, 1, 1, 0, 1, leaky=True, instance=use_instnorm
+            ),
+            nn.Conv2d(emb_size // 2, 9 * 5, kernel_size=1),
+        )
+    def bbox_forward(self, query_imgs, reference_imgs, click_pts=None, geo=None):
+        query_imgs = torch.nn.functional.interpolate(query_imgs, size=(224, 224), mode="bilinear", align_corners=False)
+        query_fvisu = self.vision_model(query_imgs).last_hidden_state.permute(0, 2, 1).view(query_imgs.size(0), -1, 14, 14)
+
+        reference_fvisu = self.vision_model(reference_imgs, interpolate_pos_encoding=True).last_hidden_state.permute(0, 2, 1).view(reference_imgs.size(0), -1, 27, 48)
+
+        query_fvisu = self.query_mapping_visu(query_fvisu)
+        reference_fvisu = self.reference_mapping_visu(reference_fvisu)
+
+        B, D, Hquery, Wquery = query_fvisu.shape
+        B, D, Hreference, Wreference = reference_fvisu.shape
+
+        query_gvisu = torch.mean(
+            query_fvisu.view(B, D, Hquery * Wquery), dim=2, keepdims=False
+        ).view(B, D)
+        fused_features, attn_score = self.crossview_fusionmodule(
+            query_gvisu, reference_fvisu
+        )
+        fused_features = self.geo_conditioner(fused_features, geo)
+        attn_score = attn_score.squeeze(1)
+
+        outbox = self.fcn_out(fused_features)
+
+        return outbox, outbox
+    
+    def forward(self, query_imgs, reference_imgs, click_pts=None, geo=None):
+        query_imgs = torch.nn.functional.interpolate(query_imgs, size=(224, 224), mode="bilinear", align_corners=False)
+        query_fvisu = self.vision_model(query_imgs).last_hidden_state.permute(0, 2, 1).view(query_imgs.size(0), -1, 14, 14)
+
+        reference_fvisu = self.vision_model(reference_imgs, interpolate_pos_encoding=True).last_hidden_state.permute(0, 2, 1).view(reference_imgs.size(0), -1, 27, 48)
+
+        query_fvisu = self.query_mapping_visu(query_fvisu)
+        reference_fvisu = self.reference_mapping_visu(reference_fvisu)
+
+        B, D, Hquery, Wquery = query_fvisu.shape
+        B, D, Hreference, Wreference = reference_fvisu.shape
+
+        query_gvisu = torch.mean(
+            query_fvisu.view(B, D, Hquery * Wquery), dim=2, keepdims=False
+        ).view(B, D)
+        fused_features, attn_score = self.crossview_fusionmodule(
+            query_gvisu, reference_fvisu
+        )
+        fused_features = self.geo_conditioner(fused_features, geo)
+        attn_score = attn_score.squeeze(1)
+
+        outbox = self.fcn_out(fused_features)
+
+        return outbox, outbox
+    
 class DetGeoLite(nn.Module):
     """DetGeo based on original DetGeo architecture with ResNet-18 and Darknet."""
 
@@ -432,7 +530,6 @@ class DetGeoLite(nn.Module):
         coodrs = self.coodrs_out(fused_features)
 
         return outbox, coodrs
-
 
 def visualize_bbox_comparison(
     query_img: np.ndarray,

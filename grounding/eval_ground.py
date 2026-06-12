@@ -21,14 +21,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from ground_cvos import DetGeoLite, LPNGeoLite, SampleGeoLite, TROGeoLite
-from ground_siglip import Encoder as SigLIPModel
+from model_ground import Encoder_ground as SigLIPModel
 from train_ocg import OCGNetLite
 from train_sm import SMGeoLite
 from bbox.yolo_utils import bbox_iou, build_target, eval_iou_acc
 
 
 # --- Configuration ---
-MODEL_NAME_SIGLIP = "google/siglip-base-patch16-224"
+MODEL_NAME_SIGLIP = "google/siglip2-base-patch16-224"
 CACHE_DIR = "/media/data1/feihong/hf_cache"
 DEFAULT_SAT_SIZE = (432, 768)  # (H, W)
 DEFAULT_DRONE_SIZE = (256, 256)  # (H, W)
@@ -51,12 +51,12 @@ EVAL_CONFIG = {
     "heatmap_confidence_weight": 0.5,
     "models": {
         "det": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_det/last.pth",},
-        # "siglip": {"run": False, "checkpoint": None},
+        "siglip": {"run": True, "checkpoint": "/media/data1/feihong/ckpt/ground_siglip/last.pth"},
         # "encoder_abla": {"run": True, "checkpoint": '/media/data1/feihong/ckpt/0.1_full_model/best_iou.pth'},
         # "encoder_heat": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/0.5_mix_model_heat/last.pth"},
         "lpn": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_lpn/last.pth"},
-        "sample4geo": {"run": True, "checkpoint": "/media/data1/feihong/ckpt/ground_sample/last.pth"},
-        "smgeo": {"run": True, "checkpoint": "/media/data1/feihong/ckpt/ground_sm/last.pth"},
+        "sample4geo": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_sample/last.pth"},
+        "smgeo": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_sm/last.pth"},
         "ocg": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_ocg/last.pth"},
         "trogeolite": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_cvos/last.pth"},
     },
@@ -80,7 +80,7 @@ def _load_encoder_classes():
     return module.Encoder_text_angle, module.Encoder_heat
 
 
-EncoderAbla, EncoderHeat = _load_encoder_classes()
+# EncoderAbla, EncoderHeat = _load_encoder_classes()
 
 
 def _load_shared_dataset_class():
@@ -241,7 +241,7 @@ def build_model(
 ) -> torch.nn.Module:
     model_type = _canonical_model_type(model_type)
     if model_type == "siglip":
-        return SigLIPModel(model_name=MODEL_NAME_SIGLIP, proj_dim=768)
+        return SigLIPModel()
     if model_type == "encoder_abla":
         return EncoderAbla(model_name=MODEL_NAME_SIGLIP, proj_dim=768, usesg=True, useap=True)
     if model_type == "encoder_heat":
@@ -337,7 +337,7 @@ def _filter_dataset_by_drone_names(dataset: Any, allowed_names: Optional[Set[str
 def create_test_loader(config: EvalConfig) -> DataLoader:
     model_type = _canonical_model_type(config.model_type)
     # Use SigLIP processor only for siglip model; others use simple tensor wrapper.
-    if model_type in {"siglip", "encoder_abla", "encoder_heat"}:
+    if model_type in {"encoder_abla", "encoder_heat"}:
         processor = AutoImageProcessor.from_pretrained(MODEL_NAME_SIGLIP, cache_dir=CACHE_DIR)
         processor_sat = AutoImageProcessor.from_pretrained(
             MODEL_NAME_SIGLIP,
@@ -595,7 +595,7 @@ def evaluate(config: EvalConfig) -> Dict[str, Any]:
         with torch.no_grad():
             if hasattr(model, "bbox_forward"):
                 try:
-                    output = model.bbox_forward(query_imgs, search_imgs, geo=geo)
+                    output = model.bbox_forward(query_imgs, search_imgs, angle=geo)
                 except TypeError:
                     output = model.bbox_forward(query_imgs, search_imgs)
             elif model_type in {"encoder_abla", "encoder_heat"}:

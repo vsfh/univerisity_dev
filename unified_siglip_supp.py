@@ -1218,15 +1218,15 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                             align_anchor_feats,
                             pair_labels,
                         )
-                        text_satellite_retrieval_loss = info_nce_loss(
-                            text_feats.detach(),
-                            candidate_feats,
-                            positive_indices,
-                        )
+                        # text_satellite_retrieval_loss = info_nce_loss(
+                        #     text_feats.detach(),
+                        #     candidate_feats,
+                        #     positive_indices,
+                        # )
                         image_retrieval_loss = (
                             image_retrieval_loss
                             + current_text_pooler_align_weight * text_pooler_align_loss
-                            + current_text_pooler_align_weight * text_satellite_retrieval_loss
+                            # + current_text_pooler_align_weight * text_satellite_retrieval_loss
                         )
 
                     # scheduled_bbox_weight, scheduled_retrieval_weight = get_loss_weights(
@@ -1258,7 +1258,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
             total_heatmap_loss += heatmap_loss.item()
             total_text_anchor_loss += text_anchor_loss.item()
             total_text_pooler_align_loss += text_pooler_align_loss.item()
-            total_text_satellite_retrieval_loss += text_satellite_retrieval_loss.item()
+            # total_text_satellite_retrieval_loss += text_satellite_retrieval_loss.item()
             global_step = epoch * len(train_dataloader) + i
             progress_bar.set_postfix(
                 {
@@ -1266,7 +1266,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     "heatmap_loss": f"{heatmap_loss.item():.4f}",
                     "text_anchor": f"{text_anchor_loss.item():.4f}",
                     "text_pooler": f"{text_pooler_align_loss.item():.4f}",
-                    "text_sat": f"{text_satellite_retrieval_loss.item():.4f}",
+                    # "text_sat": f"{text_satellite_retrieval_loss.item():.4f}",
                     "text_pooler_w": f"{current_text_pooler_align_weight:.4f}",
                     "retrieval_loss": f"{image_retrieval_loss.item():.4f}",
                     "retrieval_weight": f"{retrieval_weight:.4f}",
@@ -1282,7 +1282,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 writer.add_scalar("Loss/heatmap_step", heatmap_loss.item(), global_step)
                 writer.add_scalar("Loss/text_anchor_step", text_anchor_loss.item(), global_step)
                 writer.add_scalar("Loss/text_pooler_align_step", text_pooler_align_loss.item(), global_step)
-                writer.add_scalar("Loss/text_satellite_retrieval_step", text_satellite_retrieval_loss.item(), global_step)
+                # writer.add_scalar("Loss/text_satellite_retrieval_step", text_satellite_retrieval_loss.item(), global_step)
                 writer.add_scalar("Weight/text_pooler_align", current_text_pooler_align_weight, global_step)
                 writer.add_scalar("Loss/retrieval_step", image_retrieval_loss.item(), global_step)
                 writer.add_scalar("Weight/retrieval", retrieval_weight, global_step)
@@ -1309,12 +1309,12 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 clearml_logger.report_scalar(
                     "train", "text_pooler_align_loss", text_pooler_align_loss.item(), global_step
                 )
-                clearml_logger.report_scalar(
-                    "train",
-                    "text_satellite_retrieval_loss",
-                    text_satellite_retrieval_loss.item(),
-                    global_step,
-                )
+                # clearml_logger.report_scalar(
+                #     "train",
+                #     "text_satellite_retrieval_loss",
+                #     text_satellite_retrieval_loss.item(),
+                #     global_step,
+                # )
                 clearml_logger.report_scalar(
                     "train", "image_retrieval_loss", image_retrieval_loss.item(), global_step
                 )
@@ -1349,11 +1349,11 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 total_text_pooler_align_loss / len(train_dataloader),
                 epoch,
             )
-            writer.add_scalar(
-                "Loss/text_satellite_retrieval_epoch",
-                total_text_satellite_retrieval_loss / len(train_dataloader),
-                epoch,
-            )
+            # writer.add_scalar(
+            #     "Loss/text_satellite_retrieval_epoch",
+            #     total_text_satellite_retrieval_loss / len(train_dataloader),
+            #     epoch,
+            # )
             writer.add_scalar("lr/learning_rate", optimizer.param_groups[0]["lr"], epoch)
             for group_idx, group in enumerate(optimizer.param_groups):
                 group_name = str(group.get("name", f"group_{group_idx}"))

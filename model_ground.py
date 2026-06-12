@@ -524,6 +524,23 @@ class Encoder_ground(Encoder_heat):
             angle=angle,
             attention_mask=attention_mask,
         )
+    def bbox_forward(
+        self,
+        anchor_pixel_values: torch.Tensor,
+        search_pixel_values: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+        angle: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
+        anchor_pixel_values = torch.nn.functional.interpolate(anchor_pixel_values, size=(224, 224), mode="bilinear", align_corners=False)
+
+        return super().forward(
+            anchor_pixel_values=anchor_pixel_values,
+            search_pixel_values=search_pixel_values,
+            input_ids=input_ids,
+            angle=angle,
+            attention_mask=attention_mask,
+        )
     
 class Encoder_test(Encoder_heat):
     def __init__(
