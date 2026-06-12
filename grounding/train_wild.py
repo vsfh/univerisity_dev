@@ -16,7 +16,7 @@ import numpy as np
 from tqdm import tqdm
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader, Subset
-from torch.optim import Adam
+from torch.optim import AdamW
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image, ImageDraw
 import os
@@ -39,9 +39,10 @@ IMG_SIZE = (768, 432)  # (width, height)
 BATCH_SIZE = 8
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
-NUM_EPOCHS = 4
+NUM_EPOCHS = 20
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
+GRAD_CLIP_NORM = 10.0
 PRINT_FREQ = 50
 UNIV_IMAGE_FOLDER = "/media/data1/feihong/image_1024"
 UNIV_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
@@ -50,18 +51,26 @@ UNIV_TEST_FILE = "/media/data1/feihong/ckpt/test.txt"
 UNIV_CROP_SIZE = (640, 640)
 UNIV_DRONE_SIZE = (256, 256)
 UNIV_SAT_SIZE = IMG_SIZE
-DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+DEFAULT_OFFICIAL_PRETRAIN = "/media/data1/feihong/ckpt/trogeo_droneaerial_model_best.pth.tar"
 
 CVOGL_TRANSFORM = None
 
 class TransformProcessorWrapper:
-    def __init__(self):
+    def __init__(self, image_size=IMG_SIZE):
         self.to_tensor = torch.nn.Identity()
-        self.size = {"height": IMG_SIZE[1], "width": IMG_SIZE[0]}
+        self.size = {"height": int(image_size[1]), "width": int(image_size[0])}
+        self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
     def __call__(self, images, return_tensors="pt"):
+        target_h = int(self.size["height"])
+        target_w = int(self.size["width"])
+        if images.size != (target_w, target_h):
+            images = images.resize((target_w, target_h), Image.Resampling.BILINEAR)
         image_np = np.array(images, dtype=np.float32) / 255.0
         pixel_values = torch.from_numpy(image_np).permute(2, 0, 1)
+        pixel_values = (pixel_values - self.mean) / self.std
         return {"pixel_values": pixel_values.unsqueeze(0)}
 
 
@@ -90,6 +99,47 @@ def build_geo_features(batch: Dict, device: torch.device) -> torch.Tensor:
         ],
         dim=1,
     )
+
+
+def _unwrap_state_dict(checkpoint):
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model", "model_state_dict", "net"):
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                return value
+        return checkpoint
+    raise TypeError(f"Expected checkpoint/state_dict dict, got {type(checkpoint)}.")
+
+
+def load_compatible_checkpoint(model: nn.Module, checkpoint_path: str) -> Dict[str, int]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = _unwrap_state_dict(checkpoint)
+    model_state = model.state_dict()
+    compatible_state = {}
+    skipped_shape = 0
+    skipped_missing = 0
+
+    for key, value in state_dict.items():
+        clean_key = str(key).removeprefix("module.")
+        if clean_key not in model_state:
+            skipped_missing += 1
+            continue
+        if tuple(value.shape) != tuple(model_state[clean_key].shape):
+            skipped_shape += 1
+            continue
+        compatible_state[clean_key] = value
+
+    if not compatible_state:
+        raise ValueError(f"No compatible checkpoint weights found in {checkpoint_path}.")
+
+    result = model.load_state_dict(compatible_state, strict=False)
+    return {
+        "loaded": len(compatible_state),
+        "skipped_missing": skipped_missing,
+        "skipped_shape": skipped_shape,
+        "missing_after_load": len(result.missing_keys),
+        "unexpected_after_load": len(result.unexpected_keys),
+    }
 
 
 def format_satellite_img_bbox(
@@ -193,6 +243,7 @@ def train_epoch(
     anchors_full,
     img_size,
     print_freq=PRINT_FREQ,
+    grad_clip_norm=GRAD_CLIP_NORM,
 ):
     """Train for one epoch."""
     model.train()
@@ -223,13 +274,20 @@ def train_epoch(
         )
 
         loss_geo, loss_cls = yolo_loss(
-            pred_anchor, new_gt_bbox, anchors_full, best_anchor_gi_gj, image_wh
+            pred_anchor,
+            new_gt_bbox,
+            anchors_full,
+            best_anchor_gi_gj,
+            image_wh,
+            confidence_loss_type="balanced_bce",
         )
         bbox_loss = loss_geo + loss_cls
         loss = bbox_loss
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         optimizer.step()
 
         losses.update(loss.item(), query_imgs.shape[0])
@@ -307,19 +365,20 @@ def main(args):
     writer = SummaryWriter(f"runs/{exp_name}")
 
     print("Creating datasets from shared data source...")
-    processor = TransformProcessorWrapper()
+    processor = TransformProcessorWrapper(UNIV_DRONE_SIZE)
+    processor_sat = TransformProcessorWrapper(args.img_size)
     tokenizer = DummyTokenizer()
     train_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
-        processor_sat=processor,
+        processor_sat=processor_sat,
         tokenizer=tokenizer,
         split="train",
     )
     val_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
-        processor_sat=processor,
+        processor_sat=processor_sat,
         tokenizer=tokenizer,
-        split="test",
+        split="train",
     )
 
     print(f"Found {len(train_dataset)} training samples, {len(val_dataset)} validation samples")
@@ -344,9 +403,13 @@ def main(args):
     )
 
     print("Creating model...")
-    model = TROGeoLite(emb_size=768).to(DEVICE)
+    model = TROGeoLite(emb_size=768)
+    if args.official_pretrain and not args.no_official_pretrain:
+        load_info = load_compatible_checkpoint(model, args.official_pretrain)
+        print(f"Loaded TROGeo official pretrain: {load_info}")
+    model = model.to(DEVICE)
 
-    optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     anchors_full = np.array([float(x) for x in ANCHORS.split(",")])
     anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
@@ -364,15 +427,26 @@ def main(args):
             anchors_full,
             args.img_size,
             args.print_freq,
+            args.grad_clip_norm,
         )
 
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/train_geo", train_geo, epoch)
         writer.add_scalar("Loss/train_cls", train_cls, epoch)
+        val_accu50, val_accu25, val_iou = validate(
+            val_loader,
+            model,
+            anchors_full,
+            args.img_size,
+        )
+        writer.add_scalar("ValTrain/mean_iou", val_iou, epoch)
+        writer.add_scalar("ValTrain/accu50", val_accu50, epoch)
+        writer.add_scalar("ValTrain/accu25", val_accu25, epoch)
 
         print(
             f"Epoch {epoch + 1}/{args.max_epoch}:\t"
-            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})"
+            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})\t"
+            f"ValTrain IoU: {val_iou:.4f}, Accu50: {val_accu50:.4f}, Accu25: {val_accu25:.4f}"
         )
         torch.save(model.state_dict(), f"{args.checkpoint}/last.pth")
 
@@ -382,11 +456,12 @@ def main(args):
 
 def eval(args):
     print("Evaluating checkpoint on test split...")
-    processor = TransformProcessorWrapper()
+    processor = TransformProcessorWrapper(UNIV_DRONE_SIZE)
+    processor_sat = TransformProcessorWrapper(args.img_size)
     tokenizer = DummyTokenizer()
     test_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
-        processor_sat=processor,
+        processor_sat=processor_sat,
         tokenizer=tokenizer,
         split="test",
     )
@@ -421,11 +496,13 @@ def eval(args):
         persistent_workers=args.num_workers > 0,
     )
 
-    model = TROGeoLite(emb_size=768).to(DEVICE)
+    model = TROGeoLite(emb_size=768)
     checkpoint_path = args.checkpoint_path or f"{args.checkpoint}/last.pth"
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=False)
+    load_info = load_compatible_checkpoint(model, checkpoint_path)
+    print(f"Loaded eval checkpoint: {load_info}")
+    model = model.to(DEVICE)
 
     anchors_full = np.array([float(x) for x in ANCHORS.split(",")])
     anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
@@ -451,6 +528,13 @@ if __name__ == "__main__":
         "--max-epoch", type=int, default=NUM_EPOCHS, help="training epoch"
     )
     parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="learning rate")
+    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="AdamW weight decay")
+    parser.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=GRAD_CLIP_NORM,
+        help="max gradient norm; <=0 disables clipping",
+    )
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="batch size")
     parser.add_argument(
         "--img-size",
@@ -461,7 +545,7 @@ if __name__ == "__main__":
         help="image size as WIDTH HEIGHT",
     )
     parser.add_argument(
-        "--savename", type=str, default="ground_smgeo", help="Name head for saved model"
+        "--savename", type=str, default="ground_cvos", help="Name head for saved model"
     )
     parser.add_argument("--seed", type=int, default=2024, help="random seed")
     parser.add_argument(
@@ -472,6 +556,17 @@ if __name__ == "__main__":
         type=str,
         default="/media/data1/feihong/ckpt/ground_cvos",
         help="Path to save model checkpoints",
+    )
+    parser.add_argument(
+        "--official-pretrain",
+        type=str,
+        default=DEFAULT_OFFICIAL_PRETRAIN,
+        help="Official TROGeo checkpoint loaded before training",
+    )
+    parser.add_argument(
+        "--no-official-pretrain",
+        action="store_true",
+        help="Do not load --official-pretrain before training",
     )
     parser.add_argument(
         "--eval-only",

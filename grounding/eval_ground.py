@@ -1,3 +1,4 @@
+import argparse
 import importlib.util
 import json
 import os
@@ -35,6 +36,37 @@ DEFAULT_DRONE_SIZE = (256, 256)  # (H, W)
 DEFAULT_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 BATCH_SIZE = 8
+DEFAULT_GROUNDING_RUNS = {
+    "det": "/media/data1/feihong/ckpt/ground_det/last.pth",
+    "lpn": "/media/data1/feihong/ckpt/ground_lpn/last.pth",
+    "sample4geo": "/media/data1/feihong/ckpt/ground_sample/last.pth",
+    "smgeo": "/media/data1/feihong/ckpt/ground_sm/last.pth",
+    "ocg": "/media/data1/feihong/ckpt/ground_ocg/last.pth",
+    "trogeolite": "/media/data1/feihong/ckpt/ground_cvos/last.pth",
+    "encoder_test": "/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth",
+}
+
+
+def _resolve_local_hf_snapshot(model_name: str, cache_dir: str) -> str:
+    """Use an existing Hugging Face snapshot path when available to avoid downloads."""
+    repo_cache_name = f"models--{model_name.replace('/', '--')}"
+    repo_cache_dir = Path(cache_dir) / repo_cache_name
+    refs_main = repo_cache_dir / "refs" / "main"
+    snapshots_dir = repo_cache_dir / "snapshots"
+
+    if refs_main.exists():
+        revision = refs_main.read_text(encoding="utf-8").strip()
+        snapshot_dir = snapshots_dir / revision
+        if snapshot_dir.is_dir():
+            return str(snapshot_dir)
+
+    if snapshots_dir.is_dir():
+        snapshots = sorted(path for path in snapshots_dir.iterdir() if path.is_dir())
+        if snapshots:
+            return str(snapshots[-1])
+
+    return model_name
+
 
 EVAL_CONFIG = {
     "device": DEFAULT_DEVICE,
@@ -47,7 +79,8 @@ EVAL_CONFIG = {
     # "subset_heights": [250, 300],
     # "subset_angles": [0, 45, 90, 135],
     "output_dir": "/media/data1/feihong/univerisity_dev/eval_results",
-    "visualize_output_dir": "",
+    "visualize_output_dir": "/media/data1/feihong/univerisity_dev/eval_results/visualizations",
+    "visualize_num_cases": 10,
     "heatmap_confidence_weight": 0.5,
     "models": {
         "det": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_det/last.pth",},
@@ -59,6 +92,7 @@ EVAL_CONFIG = {
         "smgeo": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_sm/last.pth"},
         "ocg": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_ocg/last.pth"},
         "trogeolite": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_cvos/last.pth"},
+        "encoder_test": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth"},
     },
 }
 
@@ -66,7 +100,7 @@ EVAL_CONFIG = {
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _load_encoder_classes():
+def _load_encoder_classes() -> Tuple[Optional[type], type, type]:
     """Load root model.py explicitly to avoid import ambiguity."""
     repo_root_str = str(REPO_ROOT)
     if repo_root_str not in sys.path:
@@ -101,16 +135,21 @@ ShiftedSatelliteDroneDataset = _load_shared_dataset_class()
 class TransformProcessorWrapper:
     """Tensor wrapper matching training behavior for cvos-based models."""
 
-    def __init__(self, image_size: Tuple[int, int]):
+    def __init__(self, image_size: Tuple[int, int], normalize: bool = True):
         self.size = {"height": int(image_size[0]), "width": int(image_size[1])}
+        self.normalize = bool(normalize)
+        self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
     def __call__(self, images, return_tensors="pt"):
         target_h = int(self.size["height"])
         target_w = int(self.size["width"])
         if images.size != (target_w, target_h):
-            images = images.resize((target_w, target_h))
+            images = images.resize((target_w, target_h), Image.Resampling.BILINEAR)
         image_np = np.array(images, dtype=np.float32) / 255.0
         pixel_values = torch.from_numpy(image_np).permute(2, 0, 1)
+        if self.normalize:
+            pixel_values = (pixel_values - self.mean) / self.std
         return {"pixel_values": pixel_values.unsqueeze(0)}
 
 
@@ -142,6 +181,7 @@ class EvalConfig:
     output_dir: str
     heatmap_confidence_weight: float = 0.0
     drone_name_filter_path: Optional[str] = None
+    visualize_num_cases: int = 10
 
 
 def _canonical_model_type(model_type: str) -> str:
@@ -150,10 +190,14 @@ def _canonical_model_type(model_type: str) -> str:
         return "encoder_abla"
     if name in {"heat", "encoder_heat"}:
         return "encoder_heat"
+    if name in {"test", "encoder_test"}:
+        return "encoder_test"
     if name in {"sample", "samplegeo", "sample4geo"}:
         return "sample4geo"
     if name in {"sm", "smgeo", "smgeolite"}:
         return "smgeo"
+    if name in {"wild", "trogeo", "trogeolite"}:
+        return "trogeolite"
     return name
 
 
@@ -243,15 +287,37 @@ def build_model(
     if model_type == "siglip":
         return SigLIPModel()
     if model_type == "encoder_abla":
-        return EncoderAbla(model_name=MODEL_NAME_SIGLIP, proj_dim=768, usesg=True, useap=True)
+        EncoderAbla, _, _ = _load_encoder_classes()
+        if EncoderAbla is None:
+            raise AttributeError("model.py does not export Encoder_text_angle required by encoder_abla.")
+        return EncoderAbla(
+            model_name=_resolve_local_hf_snapshot(MODEL_NAME_SIGLIP, CACHE_DIR),
+            proj_dim=768,
+            usesg=True,
+            useap=True,
+        )
     if model_type == "encoder_heat":
-        return EncoderHeat(model_name=MODEL_NAME_SIGLIP, proj_dim=768, usesg=True, useap=True)
+        _, EncoderHeat, _ = _load_encoder_classes()
+        return EncoderHeat(
+            model_name=_resolve_local_hf_snapshot(MODEL_NAME_SIGLIP2, CACHE_DIR),
+            proj_dim=768,
+            usesg=True,
+            useap=True,
+        )
+    if model_type == "encoder_test":
+        _, _, EncoderTest = _load_encoder_classes()
+        return EncoderTest(
+            model_name=_resolve_local_hf_snapshot(MODEL_NAME_SIGLIP2, CACHE_DIR),
+            proj_dim=768,
+            usesg=True,
+            useap=True,
+        )
     if model_type == "det":
         return DetGeoLite(emb_size=512)
     if model_type == "lpn":
         return LPNGeoLite()
     if model_type == "sample4geo":
-        return SampleGeoLite(pretrained=False)
+        return SampleGeoGrounding(emb_size=1024, pretrained=False)
     if model_type == "smgeo":
         kwargs = _infer_smgeo_kwargs(checkpoint_state)
         if kwargs:
@@ -340,11 +406,11 @@ def create_test_loader(config: EvalConfig) -> DataLoader:
     if model_type in {"encoder_abla", "encoder_heat"}:
         processor = AutoImageProcessor.from_pretrained(MODEL_NAME_SIGLIP, cache_dir=CACHE_DIR)
         processor_sat = AutoImageProcessor.from_pretrained(
-            MODEL_NAME_SIGLIP,
+            hf_model_path,
             cache_dir=CACHE_DIR,
             size={"height": int(config.sat_size[0]), "width": int(config.sat_size[1])},
         )
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME_SIGLIP)
+        tokenizer = AutoTokenizer.from_pretrained(hf_model_path, cache_dir=CACHE_DIR)
     else:
         processor = TransformProcessorWrapper(DEFAULT_DRONE_SIZE)
         processor_sat = TransformProcessorWrapper(config.sat_size)
@@ -396,6 +462,39 @@ def _to_xyxy_pixels(pred_bbox: torch.Tensor, image_h: int, image_w: int) -> torc
     return pred
 
 
+def _decode_anchor_free_bbox(
+    heatmap_logits: torch.Tensor,
+    bbox_raw: torch.Tensor,
+    image_wh: Tuple[int, int],
+) -> torch.Tensor:
+    if heatmap_logits.ndim != 4 or heatmap_logits.shape[1] != 1:
+        raise ValueError(f"Expected heatmap logits shape (B, 1, H, W), got {tuple(heatmap_logits.shape)}.")
+    if bbox_raw.ndim != 4 or bbox_raw.shape[1] != 4:
+        raise ValueError(f"Expected bbox raw shape (B, 4, H, W), got {tuple(bbox_raw.shape)}.")
+
+    batch_size, _, feat_h, feat_w = heatmap_logits.shape
+    image_w, image_h = float(image_wh[0]), float(image_wh[1])
+    heat_prob = torch.sigmoid(heatmap_logits[:, 0])
+    flat_idx = heat_prob.flatten(1).argmax(dim=1)
+    gj = torch.div(flat_idx, feat_w, rounding_mode="floor")
+    gi = flat_idx % feat_w
+    batch_idx = torch.arange(batch_size, device=heatmap_logits.device)
+
+    selected_bbox = bbox_raw[batch_idx, :, gj, gi]
+    offset = torch.sigmoid(selected_bbox[:, :2])
+    wh = torch.sigmoid(selected_bbox[:, 2:]).clamp_min(1e-4)
+    cx = (gi.to(dtype=bbox_raw.dtype) + offset[:, 0]) / float(feat_w) * image_w
+    cy = (gj.to(dtype=bbox_raw.dtype) + offset[:, 1]) / float(feat_h) * image_h
+    bw = wh[:, 0] * image_w
+    bh = wh[:, 1] * image_h
+
+    x1 = (cx - 0.5 * bw).clamp(0.0, image_w)
+    y1 = (cy - 0.5 * bh).clamp(0.0, image_h)
+    x2 = (cx + 0.5 * bw).clamp(0.0, image_w)
+    y2 = (cy + 0.5 * bh).clamp(0.0, image_h)
+    return torch.stack([x1, y1, x2, y2], dim=1)
+
+
 def _is_direct_bbox_output(output: Any) -> bool:
     return isinstance(output, torch.Tensor) and output.ndim <= 2 and output.shape[-1] == 4
 
@@ -427,6 +526,11 @@ def _tensor_chw_to_pil(image_tensor: torch.Tensor) -> Image.Image:
     image = image_tensor.detach().float().cpu()
     if image.ndim != 3:
         raise ValueError(f"Expected CHW tensor, got shape: {tuple(image.shape)}")
+
+    if image.shape[0] == 3 and (image.min().item() < -0.1 or image.max().item() > 1.1):
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=image.dtype).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], dtype=image.dtype).view(3, 1, 1)
+        image = image * std + mean
 
     image = image.permute(1, 2, 0).numpy()
     img_min = float(image.min())
@@ -550,6 +654,137 @@ def visualize_batch_with_prediction(
     return saved_files
 
 
+def _clamp_bbox_list(
+    bbox: Sequence[float],
+    image_w: int,
+    image_h: int,
+) -> List[float]:
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    x1 = max(0.0, min(float(image_w - 1), x1))
+    y1 = max(0.0, min(float(image_h - 1), y1))
+    x2 = max(0.0, min(float(image_w - 1), x2))
+    y2 = max(0.0, min(float(image_h - 1), y2))
+    if x2 <= x1:
+        x2 = min(float(image_w - 1), x1 + 1.0)
+    if y2 <= y1:
+        y2 = min(float(image_h - 1), y1 + 1.0)
+    return [x1, y1, x2, y2]
+
+
+def _resize_to_height_keep_aspect(image: Image.Image, target_h: int) -> Image.Image:
+    if image.height == target_h:
+        return image
+    target_w = max(1, int(round(image.width * target_h / max(1, image.height))))
+    return image.resize((target_w, target_h), Image.Resampling.BILINEAR)
+
+
+def _path_stem(value: Any) -> str:
+    return Path(str(value)).stem
+
+
+def _safe_filename(text: str) -> str:
+    keep = []
+    for char in str(text):
+        if char.isalnum() or char in {"-", "_", "."}:
+            keep.append(char)
+        else:
+            keep.append("_")
+    return "".join(keep).strip("_") or "sample"
+
+
+def save_composite_prediction_visualizations(
+    batch: Dict[str, Any],
+    pred_bbox_batch: torch.Tensor,
+    output_dir: str,
+    model_tag: str,
+    start_index: int,
+    max_cases: int,
+) -> List[str]:
+    """Save per-case panels: drone, satellite with GT/Pred boxes, and GT crop."""
+    if not output_dir or max_cases <= 0 or start_index >= max_cases:
+        return []
+
+    query_batch = batch["target_pixel_values"]
+    satellite_batch = batch["search_pixel_values"]
+    gt_bbox_batch = batch["bbox"]
+
+    num_samples = int(
+        min(query_batch.shape[0], satellite_batch.shape[0], gt_bbox_batch.shape[0], pred_bbox_batch.shape[0])
+    )
+    remaining = max(0, int(max_cases) - int(start_index))
+    num_samples = min(num_samples, remaining)
+    if num_samples <= 0:
+        return []
+
+    out_dir = Path(output_dir) / _safe_filename(model_tag)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_files: List[str] = []
+    panel_h = 360
+    padding = 12
+    label_h = 26
+
+    for idx in range(num_samples):
+        query_img = _tensor_chw_to_pil(query_batch[idx]).convert("RGB")
+        sat_img = _tensor_chw_to_pil(satellite_batch[idx]).convert("RGB")
+
+        gt_xyxy = _clamp_bbox_list(
+            gt_bbox_batch[idx].detach().float().cpu().tolist(),
+            sat_img.width,
+            sat_img.height,
+        )
+        pred_xyxy = _clamp_bbox_list(
+            pred_bbox_batch[idx].detach().float().cpu().tolist(),
+            sat_img.width,
+            sat_img.height,
+        )
+
+        crop_box = tuple(int(round(v)) for v in gt_xyxy)
+        gt_crop = sat_img.crop(crop_box)
+        if gt_crop.width <= 1 or gt_crop.height <= 1:
+            gt_crop = Image.new("RGB", (panel_h, panel_h), color=(20, 20, 20))
+
+        sat_draw = sat_img.copy()
+        draw = ImageDraw.Draw(sat_draw)
+        draw.rectangle(tuple(gt_xyxy), outline=(0, 255, 0), width=4)
+        draw.rectangle(tuple(pred_xyxy), outline=(255, 0, 0), width=4)
+
+        query_panel = _resize_to_height_keep_aspect(query_img, panel_h)
+        sat_panel = _resize_to_height_keep_aspect(sat_draw, panel_h)
+        crop_panel = _resize_to_height_keep_aspect(gt_crop, panel_h)
+
+        panels = [
+            ("drone query", query_panel),
+            ("satellite GT green / Pred red", sat_panel),
+            ("GT bbox crop", crop_panel),
+        ]
+        canvas_w = sum(panel.width for _, panel in panels) + padding * (len(panels) + 1)
+        canvas_h = panel_h + label_h + padding * 2
+        canvas = Image.new("RGB", (canvas_w, canvas_h), color=(18, 18, 18))
+        draw_canvas = ImageDraw.Draw(canvas)
+
+        x = padding
+        for label, panel in panels:
+            draw_canvas.text((x, padding), label, fill=(235, 235, 235))
+            canvas.paste(panel, (x, padding + label_h))
+            x += panel.width + padding
+
+        sample_idx = start_index + idx
+        sat_id = _path_stem(batch["satellite_path"][idx])
+        drone_id = _path_stem(batch["drone_path"][idx])
+        height = int(batch["height"][idx].item()) if hasattr(batch["height"][idx], "item") else int(batch["height"][idx])
+        angle = int(batch["angle"][idx].item()) if hasattr(batch["angle"][idx], "item") else int(batch["angle"][idx])
+        save_name = (
+            f"{sample_idx:03d}_{_safe_filename(model_tag)}_sat{_safe_filename(sat_id)}_"
+            f"drone{_safe_filename(drone_id)}_h{height}_a{angle}.png"
+        )
+        save_path = out_dir / save_name
+        canvas.save(save_path)
+        saved_files.append(str(save_path))
+
+    return saved_files
+
+
 def evaluate(config: EvalConfig) -> Dict[str, Any]:
     model_type = _canonical_model_type(config.model_type)
 
@@ -565,7 +800,10 @@ def evaluate(config: EvalConfig) -> Dict[str, Any]:
     center_distances: List[float] = []
     per_subset_values: Dict[Tuple[int, int], Dict[str, List[float]]] = {}
     per_angle_values: Dict[int, Dict[str, List[float]]] = {}
-    vis_saved = False
+    visualized_count = 0
+    visualize_num_cases = max(0, int(config.visualize_num_cases))
+    checkpoint_name = Path(str(config.checkpoint_path)).resolve().parent.name
+    model_tag = f"{model_type}_{checkpoint_name}"
     checkpoint_for_flags = str(config.checkpoint_path)
     for batch in tqdm(loader, desc=f"Evaluating {model_type}"):
         query_imgs = batch["target_pixel_values"].to(config.device, non_blocking=True)
@@ -593,13 +831,29 @@ def evaluate(config: EvalConfig) -> Dict[str, Any]:
         image_w = int(search_imgs.shape[-1])
 
         with torch.no_grad():
-            if hasattr(model, "bbox_forward"):
+            if model_type == "sample4geo":
+                sample_outputs = model(query_imgs, search_imgs)
+                output = _decode_anchor_free_bbox(
+                    sample_outputs["heatmap_logits"],
+                    sample_outputs["bbox_raw"],
+                    image_wh=(image_w, image_h),
+                )
+            elif hasattr(model, "bbox_forward"):
                 try:
                     output = model.bbox_forward(query_imgs, search_imgs, angle=geo)
                 except TypeError:
                     output = model.bbox_forward(query_imgs, search_imgs)
-            elif model_type in {"encoder_abla", "encoder_heat"}:
-                output = model(query_imgs, search_imgs, input_ids=input_ids, angle=geo)
+            elif model_type in {"encoder_abla", "encoder_heat", "encoder_test"}:
+                attention_mask = None
+                if model_type == "encoder_test" and input_ids is not None and "attention_mask" in batch:
+                    attention_mask = batch["attention_mask"].to(config.device, non_blocking=True)
+                output = model(
+                    query_imgs,
+                    search_imgs,
+                    input_ids=input_ids,
+                    angle=geo,
+                    attention_mask=attention_mask,
+                )
             else:
                 raise AttributeError(
                     f"Model '{model_type}' has no bbox_forward and no fallback path."
@@ -611,18 +865,25 @@ def evaluate(config: EvalConfig) -> Dict[str, Any]:
             if pred_bbox_batch.ndim == 1:
                 pred_bbox_batch = pred_bbox_batch.unsqueeze(0)
 
-            if config.visualize_output_dir and not vis_saved:
+            if config.visualize_output_dir and visualized_count < visualize_num_cases:
                 pred_vis = [
                     _to_xyxy_pixels(pred_bbox_batch[b], image_h, image_w).detach().cpu()
                     for b in range(pred_bbox_batch.shape[0])
                 ]
-                saved_files = visualize_batch_with_prediction(
+                saved_files = save_composite_prediction_visualizations(
                     batch,
                     torch.stack(pred_vis, dim=0),
+                    model_tag=model_tag,
                     output_dir=config.visualize_output_dir,
+                    start_index=visualized_count,
+                    max_cases=visualize_num_cases,
                 )
-                print(f"Saved {len(saved_files)} prediction visualizations to: {config.visualize_output_dir}")
-                vis_saved = True
+                visualized_count += len(saved_files)
+                if saved_files:
+                    print(
+                        f"Saved {len(saved_files)} {model_type} prediction visualizations "
+                        f"to: {Path(config.visualize_output_dir) / _safe_filename(model_tag)}"
+                    )
 
             for b in range(pred_bbox_batch.shape[0]):
                 pred_xyxy = _to_xyxy_pixels(pred_bbox_batch[b], image_h, image_w)
@@ -644,7 +905,7 @@ def evaluate(config: EvalConfig) -> Dict[str, Any]:
         else:
             # Anchor-map path: first output is [B, 9*5, Hf, Wf].
             pred_anchor = output if isinstance(output, torch.Tensor) else output[0]
-            heatmap_logits = output[6] if model_type == "encoder_heat" and len(output) > 6 else None
+            heatmap_logits = output[6] if model_type in {"encoder_heat", "encoder_test"} and len(output) > 6 else None
             pred_anchor = pred_anchor.view(
                 pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
             )
@@ -668,14 +929,21 @@ def evaluate(config: EvalConfig) -> Dict[str, Any]:
                 iou_threshold_list=[0.5],
             )
 
-            if config.visualize_output_dir and not vis_saved:
-                saved_files = visualize_batch_with_prediction(
+            if config.visualize_output_dir and visualized_count < visualize_num_cases:
+                saved_files = save_composite_prediction_visualizations(
                     batch,
                     pred_bbox_xyxy.detach().cpu(),
+                    model_tag=model_tag,
                     output_dir=config.visualize_output_dir,
+                    start_index=visualized_count,
+                    max_cases=visualize_num_cases,
                 )
-                print(f"Saved {len(saved_files)} prediction visualizations to: {config.visualize_output_dir}")
-                vis_saved = True
+                visualized_count += len(saved_files)
+                if saved_files:
+                    print(
+                        f"Saved {len(saved_files)} {model_type} prediction visualizations "
+                        f"to: {Path(config.visualize_output_dir) / _safe_filename(model_tag)}"
+                    )
 
             for b in range(pred_bbox_xyxy.shape[0]):
                 pred_xyxy = pred_bbox_xyxy[b].float()
@@ -819,6 +1087,7 @@ def eval_encoder_text_angle_checkpoints(
             visualize_output_dir=str(visualize_output_dir),
             output_dir=str(per_checkpoint_output_dir),
             heatmap_confidence_weight=float(EVAL_CONFIG.get("heatmap_confidence_weight", 0.5)),
+            visualize_num_cases=int(EVAL_CONFIG.get("visualize_num_cases", 10)),
         )
         metrics = evaluate(cfg)
         results.append(
@@ -885,6 +1154,7 @@ def main():
             visualize_output_dir=str(EVAL_CONFIG.get("visualize_output_dir", "")),
             output_dir=str(EVAL_CONFIG.get("output_dir", "/media/data1/feihong/univerisity_dev/eval_results")),
             heatmap_confidence_weight=float(EVAL_CONFIG.get("heatmap_confidence_weight", 0.5)),
+            visualize_num_cases=int(EVAL_CONFIG.get("visualize_num_cases", 10)),
         )
         evaluate(cfg)
 
@@ -927,13 +1197,151 @@ def main_with_drone_name_filter(drone_name_filter_path: str):
             output_dir=str(EVAL_CONFIG.get("output_dir", "/media/data1/feihong/univerisity_dev/eval_results")),
             heatmap_confidence_weight=float(EVAL_CONFIG.get("heatmap_confidence_weight", 0.5)),
             drone_name_filter_path=str(drone_name_filter_path),
+            visualize_num_cases=int(EVAL_CONFIG.get("visualize_num_cases", 10)),
         )
         evaluate(cfg)
 
 
+def _parse_optional_int_list(values: Optional[List[int]]) -> Optional[List[int]]:
+    if values is None:
+        return None
+    if len(values) == 0:
+        return None
+    return [int(value) for value in values]
+
+
+def _build_eval_config(
+    model_type: str,
+    checkpoint_path: str,
+    args: argparse.Namespace,
+) -> EvalConfig:
+    return EvalConfig(
+        model_type=model_type,
+        checkpoint_path=checkpoint_path,
+        device=str(args.device),
+        batch_size=int(args.batch_size),
+        num_workers=int(args.num_workers),
+        sat_size=(int(args.sat_size[0]), int(args.sat_size[1])),
+        test_crop_ratio=float(args.test_crop_ratio),
+        subset_heights=_parse_optional_int_list(args.subset_heights),
+        subset_angles=_parse_optional_int_list(args.subset_angles),
+        visualize_output_dir=str(args.visualize_output_dir or ""),
+        output_dir=str(args.output_dir),
+        heatmap_confidence_weight=float(args.heatmap_confidence_weight),
+        drone_name_filter_path=args.drone_name_filter,
+        visualize_num_cases=int(args.visualize_num_cases),
+    )
+
+
+def _run_cli(args: argparse.Namespace) -> None:
+    selected_models = [_canonical_model_type(model) for model in args.models]
+    if args.all_grounding:
+        selected_models = list(DEFAULT_GROUNDING_RUNS.keys())
+
+    if not selected_models:
+        raise ValueError("No models selected. Use --all-grounding or --models ...")
+    if args.checkpoint is not None and len(selected_models) != 1:
+        raise ValueError("--checkpoint can only be used with exactly one --models entry.")
+
+    for model_type in selected_models:
+        checkpoint = args.checkpoint
+        if checkpoint is None:
+            checkpoint = DEFAULT_GROUNDING_RUNS.get(model_type)
+        if not checkpoint:
+            raise ValueError(f"No default checkpoint is registered for model '{model_type}'.")
+        if not os.path.exists(checkpoint):
+            print(f"Skipping {model_type}: checkpoint not found: {checkpoint}")
+            continue
+
+        cfg = _build_eval_config(
+            model_type=model_type,
+            checkpoint_path=str(checkpoint),
+            args=args,
+        )
+        evaluate(cfg)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate grounding train_* checkpoints.")
+    parser.add_argument(
+        "--all-grounding",
+        action="store_true",
+        help="Evaluate all trained grounding models with default checkpoint paths.",
+    )
+    parser.add_argument(
+        "--models",
+        nargs="*",
+        default=[],
+        choices=[
+            "det",
+            "lpn",
+            "sample4geo",
+            "sample",
+            "smgeo",
+            "sm",
+            "ocg",
+            "trogeolite",
+            "wild",
+            "encoder_test",
+            "test",
+            "encoder_heat",
+            "heat",
+        ],
+        help="Model types to evaluate. Ignored when --all-grounding is set.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Explicit checkpoint path for a single model run.",
+    )
+    parser.add_argument("--device", type=str, default=str(EVAL_CONFIG.get("device", DEFAULT_DEVICE)))
+    parser.add_argument("--batch-size", type=int, default=int(EVAL_CONFIG.get("batch_size", BATCH_SIZE)))
+    parser.add_argument("--num-workers", type=int, default=int(EVAL_CONFIG.get("num_workers", 8)))
+    parser.add_argument(
+        "--sat-size",
+        type=int,
+        nargs=2,
+        metavar=("HEIGHT", "WIDTH"),
+        default=list(EVAL_CONFIG.get("sat_size", list(DEFAULT_SAT_SIZE))),
+        help="Satellite image size as HEIGHT WIDTH.",
+    )
+    parser.add_argument("--test-crop-ratio", type=float, default=float(EVAL_CONFIG.get("test_crop_ratio", 1.0)))
+    parser.add_argument("--subset-heights", type=int, nargs="*", default=EVAL_CONFIG.get("subset_heights"))
+    parser.add_argument("--subset-angles", type=int, nargs="*", default=EVAL_CONFIG.get("subset_angles"))
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=str(EVAL_CONFIG.get("output_dir", "/media/data1/feihong/univerisity_dev/eval_results")),
+    )
+    parser.add_argument("--visualize-output-dir", type=str, default=str(EVAL_CONFIG.get("visualize_output_dir", "")))
+    parser.add_argument(
+        "--visualize-num-cases",
+        type=int,
+        default=int(EVAL_CONFIG.get("visualize_num_cases", 10)),
+        help="Number of composite prediction visualizations to save per evaluated model.",
+    )
+    parser.add_argument(
+        "--heatmap-confidence-weight",
+        type=float,
+        default=float(EVAL_CONFIG.get("heatmap_confidence_weight", 0.5)),
+    )
+    parser.add_argument("--drone-name-filter", type=str, default=None)
+    parser.add_argument(
+        "--use-config",
+        action="store_true",
+        help="Use the legacy EVAL_CONFIG run flags instead of CLI model selection.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
     # eval_encoder_text_angle_checkpoints()
-    main()
+    cli_args = parse_args()
+    if cli_args.use_config or (not cli_args.all_grounding and not cli_args.models and not cli_args.checkpoint):
+        main()
+    else:
+        _run_cli(cli_args)
     # main_with_drone_name_filter(
     #     "/media/data1/feihong/univerisity_dev/eval_results/retrieval_xxx/eval_retrieval_xxx_top1_success_drone_names.txt"
     # )

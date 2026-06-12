@@ -15,7 +15,7 @@ import numpy as np
 from tqdm import tqdm
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader, Subset
-from torch.optim import Adam
+from torch.optim import AdamW
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image, ImageDraw
 import os
@@ -38,9 +38,10 @@ IMG_SIZE = (768, 432)  # (width, height)
 BATCH_SIZE = 8
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
-NUM_EPOCHS = 4
+NUM_EPOCHS = 20
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
+GRAD_CLIP_NORM = 10.0
 PRINT_FREQ = 50
 
 UNIV_IMAGE_FOLDER = "/media/data1/feihong/image_1024"
@@ -51,19 +52,26 @@ UNIV_CROP_SIZE = (IMG_SIZE[1], IMG_SIZE[0])
 UNIV_DRONE_SIZE = (256, 256)
 # Keep satellite tensors in HxW format for the shared dataset pipeline.
 UNIV_SAT_SIZE = (IMG_SIZE[1], IMG_SIZE[0])
-DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 
 CVOGL_TRANSFORM = None
 
 
 class TransformProcessorWrapper:
-    def __init__(self):
+    def __init__(self, image_size=IMG_SIZE):
         self.to_tensor = torch.nn.Identity()
-        self.size = {"height": UNIV_SAT_SIZE[0], "width": UNIV_SAT_SIZE[1]}
+        self.size = {"height": int(image_size[1]), "width": int(image_size[0])}
+        self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
     def __call__(self, images, return_tensors="pt"):
+        target_h = int(self.size["height"])
+        target_w = int(self.size["width"])
+        if images.size != (target_w, target_h):
+            images = images.resize((target_w, target_h), Image.Resampling.BILINEAR)
         image_np = np.array(images, dtype=np.float32) / 255.0
         pixel_values = torch.from_numpy(image_np).permute(2, 0, 1)
+        pixel_values = (pixel_values - self.mean) / self.std
         return {"pixel_values": pixel_values.unsqueeze(0)}
 
 
@@ -199,6 +207,7 @@ def train_epoch(
     anchors_full,
     img_size,
     print_freq=PRINT_FREQ,
+    grad_clip_norm=GRAD_CLIP_NORM,
 ):
     """Train for one epoch."""
     model.train()
@@ -229,12 +238,19 @@ def train_epoch(
         )
 
         loss_geo, loss_cls = yolo_loss(
-            pred_anchor, new_gt_bbox, anchors_full, best_anchor_gi_gj, image_wh
+            pred_anchor,
+            new_gt_bbox,
+            anchors_full,
+            best_anchor_gi_gj,
+            image_wh,
+            confidence_loss_type="balanced_bce",
         )
         loss = loss_geo + loss_cls
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         optimizer.step()
 
         losses.update(loss.item(), query_imgs.shape[0])
@@ -339,19 +355,20 @@ def main(args):
     writer = SummaryWriter(f"runs/{exp_name}")
 
     print("Creating datasets from shared data source...")
-    processor = TransformProcessorWrapper()
+    processor = TransformProcessorWrapper(UNIV_DRONE_SIZE)
+    processor_sat = TransformProcessorWrapper(args.img_size)
     tokenizer = DummyTokenizer()
     train_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
-        processor_sat=processor,
+        processor_sat=processor_sat,
         tokenizer=tokenizer,
         split="train",
     )
     val_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
-        processor_sat=processor,
+        processor_sat=processor_sat,
         tokenizer=tokenizer,
-        split="test",
+        split="train",
     )
 
     print(f"Found {len(train_dataset)} training samples, {len(val_dataset)} validation samples")
@@ -378,7 +395,7 @@ def main(args):
     print("Creating model...")
     model = DetGeoLite(emb_size=512).to(DEVICE)
 
-    optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     anchors_full = np.array([float(x) for x in ANCHORS.split(",")])
     anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
@@ -396,20 +413,92 @@ def main(args):
             anchors_full,
             args.img_size,
             args.print_freq,
+            args.grad_clip_norm,
         )
 
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/train_geo", train_geo, epoch)
         writer.add_scalar("Loss/train_cls", train_cls, epoch)
+        val_iou, val_accu50, val_center = validate(
+            val_loader,
+            model,
+            anchors_full,
+            args.img_size,
+        )
+        writer.add_scalar("ValTrain/mean_iou", val_iou, epoch)
+        writer.add_scalar("ValTrain/accu50", val_accu50, epoch)
+        writer.add_scalar("ValTrain/center_distance", val_center, epoch)
 
         print(
             f"Epoch {epoch + 1}/{args.max_epoch}:\t"
-            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})"
+            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})\t"
+            f"ValTrain IoU: {val_iou:.4f}, Accu50: {val_accu50:.4f}, Center: {val_center:.2f}"
         )
         torch.save(model.state_dict(), f"{args.checkpoint}/last.pth")
 
     print("\nTraining complete. Saved checkpoint to last.pth")
     writer.close()
+
+
+def eval(args):
+    print("Evaluating checkpoint on test split...")
+    processor = TransformProcessorWrapper(UNIV_DRONE_SIZE)
+    processor_sat = TransformProcessorWrapper(args.img_size)
+    tokenizer = DummyTokenizer()
+    test_dataset = ShiftedSatelliteDroneDataset(
+        processor=processor,
+        processor_sat=processor_sat,
+        tokenizer=tokenizer,
+        split="test",
+    )
+
+    if args.subset_height is not None or args.subset_angle is not None:
+        subset_indices = []
+        for idx, sample in enumerate(test_dataset.samples):
+            if args.subset_height is not None and int(sample["height"]) != args.subset_height:
+                continue
+            if args.subset_angle is not None and int(sample["angle"]) != args.subset_angle:
+                continue
+            subset_indices.append(idx)
+        if not subset_indices:
+            print(
+                f"No samples for subset filters: height={args.subset_height}, angle={args.subset_angle}"
+            )
+            return
+        test_dataset = Subset(test_dataset, subset_indices)
+        print(
+            f"Subset test samples: {len(subset_indices)} (height={args.subset_height}, angle={args.subset_angle})"
+        )
+    else:
+        print(f"Full test samples: {len(test_dataset)}")
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        pin_memory=True,
+        drop_last=False,
+        num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
+    )
+
+    model = DetGeoLite(emb_size=512).to(DEVICE)
+    checkpoint_path = args.checkpoint_path or f"{args.checkpoint}/last.pth"
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=False)
+
+    anchors_full = np.array([float(x) for x in ANCHORS.split(",")])
+    anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
+    anchors_full = torch.tensor(anchors_full, dtype=torch.float32).to(DEVICE)
+
+    mean_iou, accu50, mean_center_distance = validate(
+        test_loader, model, anchors_full, args.img_size
+    )
+    print(
+        f"Eval IoU: {mean_iou:.4f}, Accu50: {accu50:.4f}, "
+        f"CenterDist: {mean_center_distance:.2f}"
+    )
 
 
 
@@ -424,6 +513,13 @@ if __name__ == "__main__":
         "--max-epoch", type=int, default=NUM_EPOCHS, help="num workers for data loading"
     )
     parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="learning rate")
+    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="AdamW weight decay")
+    parser.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=GRAD_CLIP_NORM,
+        help="max gradient norm; <=0 disables clipping",
+    )
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="batch size")
     parser.add_argument(
         "--img-size",

@@ -42,20 +42,22 @@ from bbox.yolo_utils import bbox_iou
 # --- Configuration ---
 IMG_SIZE = (768, 432)  # (width, height)
 DRONE_SIZE = (256, 256)  # (width, height)
-BATCH_SIZE = 16
-NUM_EPOCHS = 8
+BATCH_SIZE = 12
+NUM_EPOCHS = 20
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 PRINT_FREQ = 50
 HEATMAP_SIGMA = 1.5
 BBOX_LOSS_WEIGHT = 5.0
 MOE_ENTROPY_WEIGHT = 0.01
-DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
 
 
 class TransformProcessorWrapper:
     def __init__(self, image_size: Tuple[int, int]):
         self.size = {"height": int(image_size[1]), "width": int(image_size[0])}
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
     def __call__(self, images, return_tensors="pt"):
         target_h = int(self.size["height"])
@@ -64,6 +66,7 @@ class TransformProcessorWrapper:
             images = images.resize((target_w, target_h), Image.Resampling.BILINEAR)
         image_np = np.array(images, dtype=np.float32) / 255.0
         pixel_values = torch.from_numpy(image_np).permute(2, 0, 1)
+        pixel_values = (pixel_values - self.mean) / self.std
         return {"pixel_values": pixel_values.unsqueeze(0)}
 
 
@@ -81,8 +84,9 @@ class DummyTokenizer:
 
 
 class PatchEmbed(nn.Module):
-    def __init__(self, in_channels=3, embed_dim=64, patch_size=8):
+    def __init__(self, in_channels=4, embed_dim=64, patch_size=8):
         super().__init__()
+        self.in_channels = int(in_channels)
         self.proj = nn.Conv2d(
             in_channels,
             embed_dim,
@@ -92,11 +96,27 @@ class PatchEmbed(nn.Module):
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
+        if x.shape[1] == 3 and self.in_channels == 4:
+            h, w = x.shape[-2:]
+            y = torch.linspace(-1.0, 1.0, h, device=x.device, dtype=x.dtype).view(1, 1, h, 1)
+            x_grid = torch.linspace(-1.0, 1.0, w, device=x.device, dtype=x.dtype).view(1, 1, 1, w)
+            extra = torch.exp(-0.5 * (x_grid.square() + y.square()) / (0.35 ** 2))
+            extra = extra.expand(x.shape[0], 1, h, w)
+            x = torch.cat([x, extra], dim=1)
+        if x.shape[1] != self.in_channels:
+            raise ValueError(f"PatchEmbed expected {self.in_channels} channels, got {x.shape[1]}.")
         x = self.proj(x)
         B, C, H, W = x.shape
         tokens = x.flatten(2).transpose(1, 2)
         tokens = self.norm(tokens)
         return tokens.transpose(1, 2).reshape(B, C, H, W)
+
+
+class PatchEmbeds(nn.Module):
+    def __init__(self, embed_dim: int, patch_size: int):
+        super().__init__()
+        self.query = PatchEmbed(4, embed_dim, patch_size=patch_size)
+        self.sat = PatchEmbed(3, embed_dim, patch_size=patch_size)
 
 
 def window_partition(x, window_size: int):
@@ -134,12 +154,9 @@ def window_reverse(windows, window_size: int, hw_padded: Tuple[int, int], hw_ori
     return x[:, :H, :W, :].contiguous()
 
 
-class SparseMoEFFN(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, num_experts: int = 4, top_k: int = 2):
+class ExpertPool(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int, num_experts: int):
         super().__init__()
-        self.num_experts = int(num_experts)
-        self.top_k = max(1, min(int(top_k), self.num_experts))
-        self.router = nn.Linear(dim, self.num_experts)
         self.experts = nn.ModuleList(
             [
                 nn.Sequential(
@@ -147,19 +164,38 @@ class SparseMoEFFN(nn.Module):
                     nn.GELU(),
                     nn.Linear(hidden_dim, dim),
                 )
-                for _ in range(self.num_experts)
+                for _ in range(num_experts)
             ]
         )
 
     def forward(self, x):
-        router_logits = self.router(x)
+        return torch.stack([expert(x) for expert in self.experts], dim=1)
+
+
+class SparseMoEFFN(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        num_experts: int = 4,
+        top_k: int = 2,
+        expert_pool: ExpertPool | None = None,
+    ):
+        super().__init__()
+        self.num_experts = int(num_experts)
+        self.top_k = max(1, min(int(top_k), self.num_experts))
+        self.gate = nn.Linear(dim, self.num_experts)
+        self.expert_pool = expert_pool if expert_pool is not None else ExpertPool(dim, hidden_dim, self.num_experts)
+
+    def forward(self, x):
+        router_logits = self.gate(x)
         router_probs = F.softmax(router_logits, dim=-1)
         topk_probs, topk_idx = router_probs.topk(self.top_k, dim=-1)
         sparse_probs = torch.zeros_like(router_probs)
         sparse_probs.scatter_(dim=-1, index=topk_idx, src=topk_probs)
         sparse_probs = sparse_probs / sparse_probs.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
-        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=1)
+        expert_outputs = self.expert_pool(x)
         out = torch.einsum("ne,ned->nd", sparse_probs, expert_outputs)
         entropy = -(router_probs * router_probs.clamp_min(1e-6).log()).sum(dim=-1).mean()
         return out, entropy
@@ -175,6 +211,7 @@ class SwinMoEBlock(nn.Module):
         use_moe: bool = False,
         num_experts: int = 4,
         top_k: int = 2,
+        expert_pool: ExpertPool | None = None,
     ):
         super().__init__()
         self.window_size = int(window_size)
@@ -184,7 +221,13 @@ class SwinMoEBlock(nn.Module):
         self.use_moe = bool(use_moe)
         hidden_dim = dim * mlp_ratio
         if self.use_moe:
-            self.ffn = SparseMoEFFN(dim, hidden_dim, num_experts=num_experts, top_k=top_k)
+            self.ffn = SparseMoEFFN(
+                dim,
+                hidden_dim,
+                num_experts=num_experts,
+                top_k=top_k,
+                expert_pool=expert_pool,
+            )
         else:
             self.ffn = nn.Sequential(
                 nn.Linear(dim, hidden_dim),
@@ -214,11 +257,23 @@ class SwinMoEBlock(nn.Module):
 class PatchMerging(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
-        self.proj = nn.Conv2d(in_dim, out_dim, kernel_size=2, stride=2)
-        self.norm = nn.BatchNorm2d(out_dim)
+        self.reduction = nn.Linear(4 * in_dim, out_dim, bias=False)
+        self.norm = nn.LayerNorm(4 * in_dim)
 
     def forward(self, x):
-        return self.norm(self.proj(x))
+        B, C, H, W = x.shape
+        if H % 2 or W % 2:
+            x = F.pad(x, (0, W % 2, 0, H % 2))
+            H, W = x.shape[-2:]
+        x = x.permute(0, 2, 3, 1).contiguous()
+        x0 = x[:, 0::2, 0::2, :]
+        x1 = x[:, 1::2, 0::2, :]
+        x2 = x[:, 0::2, 1::2, :]
+        x3 = x[:, 1::2, 1::2, :]
+        x = torch.cat([x0, x1, x2, x3], dim=-1)
+        x = self.norm(x)
+        x = self.reduction(x)
+        return x.permute(0, 3, 1, 2).contiguous()
 
 
 class SwinMoEStage(nn.Module):
@@ -233,15 +288,22 @@ class SwinMoEStage(nn.Module):
         top_k: int,
     ):
         super().__init__()
+        self.moe_blocks = tuple(int(idx) for idx in moe_blocks)
+        self.expert_pool = (
+            ExpertPool(dim, dim * 4, num_experts)
+            if self.moe_blocks
+            else None
+        )
         self.blocks = nn.ModuleList(
             [
                 SwinMoEBlock(
                     dim=dim,
                     num_heads=num_heads,
                     window_size=window_size,
-                    use_moe=idx in set(moe_blocks),
+                    use_moe=idx in set(self.moe_blocks),
                     num_experts=num_experts,
                     top_k=top_k,
+                    expert_pool=self.expert_pool,
                 )
                 for idx in range(depth)
             ]
@@ -271,14 +333,20 @@ class SwinMoEBackbone(nn.Module):
         top_k: int = 2,
     ):
         super().__init__()
-        self.query_patch = PatchEmbed(3, embed_dim, patch_size=patch_size)
-        self.sat_patch = PatchEmbed(3, embed_dim, patch_size=patch_size)
+        self.patch_embeds = PatchEmbeds(embed_dim, patch_size)
         self.stages = nn.ModuleList()
         self.downsamples = nn.ModuleList()
 
         dim = embed_dim
         for stage_idx, depth in enumerate(depths):
-            moe_blocks = (depth - 1,) if stage_idx >= 1 else ()
+            if stage_idx == 1:
+                moe_blocks = tuple(range(depth))
+            elif stage_idx == 2:
+                moe_blocks = tuple(range(0, depth, 2))
+            elif stage_idx == 3:
+                moe_blocks = tuple(range(depth))
+            else:
+                moe_blocks = ()
             self.stages.append(
                 SwinMoEStage(
                     dim=dim,
@@ -307,8 +375,8 @@ class SwinMoEBackbone(nn.Module):
         return x, torch.stack(entropies).mean()
 
     def forward(self, query_imgs, sat_imgs):
-        query_feat = self.query_patch(query_imgs)
-        sat_feat = self.sat_patch(sat_imgs)
+        query_feat = self.patch_embeds.query(query_imgs)
+        sat_feat = self.patch_embeds.sat(sat_imgs)
         query_feat, query_entropy = self._forward_one(query_feat)
         sat_feat, sat_entropy = self._forward_one(sat_feat)
         query_vec = query_feat.flatten(2).mean(dim=-1)
@@ -318,18 +386,18 @@ class SwinMoEBackbone(nn.Module):
 class CrossViewConditioning(nn.Module):
     def __init__(self, channels: int):
         super().__init__()
-        self.query_to_scale_shift = nn.Sequential(
-            nn.LayerNorm(channels),
-            nn.Linear(channels, channels * 2),
-        )
-        nn.init.zeros_(self.query_to_scale_shift[-1].weight)
-        nn.init.zeros_(self.query_to_scale_shift[-1].bias)
+        self.channels = int(channels)
 
     def forward(self, query_vec, sat_feat):
-        gamma, beta = self.query_to_scale_shift(query_vec).chunk(2, dim=-1)
-        gamma = gamma.view(-1, sat_feat.shape[1], 1, 1)
-        beta = beta.view(-1, sat_feat.shape[1], 1, 1)
-        return sat_feat * (1.0 + gamma) + beta
+        if query_vec.shape[1] != self.channels or sat_feat.shape[1] != self.channels:
+            raise ValueError(
+                f"CrossViewConditioning expected {self.channels} channels, got query={query_vec.shape[1]}, sat={sat_feat.shape[1]}."
+            )
+        query_norm = F.normalize(query_vec, p=2, dim=1).view(-1, self.channels, 1, 1)
+        sat_norm = F.normalize(sat_feat, p=2, dim=1)
+        sim = (sat_norm * query_norm).sum(dim=1, keepdim=True)
+        gate = torch.sigmoid(sim)
+        return sat_feat * (1.0 + gate)
 
 
 class AnchorFreeHead(nn.Module):
@@ -385,6 +453,45 @@ class SMGeoLite(nn.Module):
         return decode_anchor_free(heatmap_logits, bbox_raw, (sat_imgs.shape[-1], sat_imgs.shape[-2]))
 
 
+def _unwrap_smgeo_state_dict(checkpoint):
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model", "model_state_dict", "net"):
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                return value
+    if isinstance(checkpoint, dict):
+        return checkpoint
+    raise TypeError(f"Expected SMGeo checkpoint/state_dict dict, got {type(checkpoint)}.")
+
+
+def load_smgeo_pretrained(model: nn.Module, checkpoint_path: str) -> Dict[str, int]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state_dict = _unwrap_smgeo_state_dict(checkpoint)
+    model_state = model.state_dict()
+    compatible_state = {}
+    skipped_shape = 0
+    skipped_missing = 0
+    for key, value in state_dict.items():
+        clean_key = key.removeprefix("module.")
+        if clean_key not in model_state:
+            skipped_missing += 1
+            continue
+        if tuple(value.shape) != tuple(model_state[clean_key].shape):
+            skipped_shape += 1
+            continue
+        compatible_state[clean_key] = value
+    if not compatible_state:
+        raise ValueError(f"No compatible SMGeo weights found in {checkpoint_path}.")
+    result = model.load_state_dict(compatible_state, strict=False)
+    return {
+        "loaded": len(compatible_state),
+        "skipped_missing": skipped_missing,
+        "skipped_shape": skipped_shape,
+        "model_missing": len(result.missing_keys),
+        "unexpected": len(result.unexpected_keys),
+    }
+
+
 def build_heatmap_target(gt_bbox, feature_hw: Tuple[int, int], image_wh: Tuple[int, int], sigma: float):
     B = gt_bbox.shape[0]
     feat_h, feat_w = int(feature_hw[0]), int(feature_hw[1])
@@ -427,6 +534,8 @@ def anchor_free_loss(
     gt_bbox,
     image_wh: Tuple[int, int],
     heatmap_sigma: float = HEATMAP_SIGMA,
+    focal_alpha: float = 2.0,
+    focal_beta: float = 4.0,
 ):
     B, _, feat_h, feat_w = heatmap_logits.shape
     heatmap_target = build_heatmap_target(
@@ -438,34 +547,18 @@ def anchor_free_loss(
     bbox_target, gi, gj = build_bbox_target(gt_bbox, (feat_h, feat_w), image_wh)
     batch_idx = torch.arange(B, device=gt_bbox.device)
 
-    # Keep the heatmap positive cell from being averaged away by the full map.
-    # The gaussian target still shapes nearby cells, while the exact center
-    # receives an explicit positive-objectness loss.
-    center_target = torch.zeros_like(heatmap_logits)
-    center_target[batch_idx, 0, gj, gi] = 1.0
-    objectness_bce = F.binary_cross_entropy_with_logits(
-        heatmap_logits,
-        center_target,
-        reduction="none",
-    )
-    pos_mask = center_target.bool()
-    neg_mask = ~pos_mask
-    pos_heatmap_loss = objectness_bce[pos_mask].mean()
-    neg_heatmap_loss = objectness_bce[neg_mask].mean()
-
     pred_prob = torch.sigmoid(heatmap_logits)
-    gaussian_bce = F.binary_cross_entropy_with_logits(
-        heatmap_logits,
-        heatmap_target,
-        reduction="none",
+    heatmap_target = heatmap_target.clone()
+    heatmap_target[batch_idx, 0, gj, gi] = 1.0
+    pos_mask = heatmap_target.eq(1.0)
+    neg_mask = heatmap_target.lt(1.0)
+    pos_loss = -torch.log(pred_prob.clamp_min(1e-6)) * (1.0 - pred_prob).pow(focal_alpha)
+    neg_loss = (
+        -torch.log((1.0 - pred_prob).clamp_min(1e-6))
+        * pred_prob.pow(focal_alpha)
+        * (1.0 - heatmap_target).pow(focal_beta)
     )
-    gaussian_weight = torch.where(
-        heatmap_target > 0.5,
-        (1.0 - pred_prob).pow(2.0),
-        pred_prob.pow(2.0) * (1.0 - heatmap_target).pow(4.0),
-    )
-    gaussian_heatmap_loss = (gaussian_bce * gaussian_weight).sum() / max(float(B), 1.0)
-    heatmap_loss = pos_heatmap_loss + 0.25 * neg_heatmap_loss + 0.1 * gaussian_heatmap_loss
+    heatmap_loss = (pos_loss[pos_mask].sum() + neg_loss[neg_mask].sum()) / pos_mask.sum().clamp_min(1)
 
     selected_bbox = bbox_raw[batch_idx, :, gj, gi]
     selected_bbox = torch.cat(
@@ -630,7 +723,17 @@ def build_loaders(args):
         persistent_workers=args.num_workers > 0,
         prefetch_factor=4 if args.num_workers > 0 else None,
     )
-    return train_loader, len(train_dataset)
+    val_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        pin_memory=True,
+        drop_last=False,
+        num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=4 if args.num_workers > 0 else None,
+    )
+    return train_loader, val_loader, len(train_dataset)
 
 
 def main(args):
@@ -644,7 +747,7 @@ def main(args):
     writer = SummaryWriter(f"runs/{args.savename}")
 
     print("Creating datasets from shared data source...")
-    train_loader, train_count = build_loaders(args)
+    train_loader, val_loader, train_count = build_loaders(args)
     print(f"Found {train_count} training samples")
 
     print("Creating SMGeoLite model...")
@@ -655,6 +758,11 @@ def main(args):
         num_experts=args.num_experts,
         top_k=args.top_k,
     ).to(DEVICE)
+    if args.pretrained_checkpoint:
+        if not os.path.exists(args.pretrained_checkpoint):
+            raise FileNotFoundError(f"SMGeo pretrained checkpoint not found: {args.pretrained_checkpoint}")
+        load_info = load_smgeo_pretrained(model, args.pretrained_checkpoint)
+        print(f"Loaded SMGeo pretrained checkpoint: {load_info}")
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
 
     print(f"Starting training for {args.max_epoch} epochs...")
@@ -672,11 +780,16 @@ def main(args):
         writer.add_scalar("Loss/train_heatmap", train_heat, epoch)
         writer.add_scalar("Loss/train_bbox", train_bbox, epoch)
         writer.add_scalar("MoE/entropy", moe_entropy, epoch)
+        val_iou, val_accu50, val_center = validate(val_loader, model)
+        writer.add_scalar("ValTrain/mean_iou", val_iou, epoch)
+        writer.add_scalar("ValTrain/accu50", val_accu50, epoch)
+        writer.add_scalar("ValTrain/center_distance", val_center, epoch)
 
         print(
             f"Epoch {epoch + 1}/{args.max_epoch}:\t"
             f"Train Loss: {train_loss:.4f} (Heat: {train_heat:.4f}, Bbox: {train_bbox:.4f})\t"
-            f"MoE-H: {moe_entropy:.4f}"
+            f"MoE-H: {moe_entropy:.4f}\t"
+            f"ValTrain IoU: {val_iou:.4f}, Accu50: {val_accu50:.4f}, Center: {val_center:.2f}"
         )
 
         torch.save(model.state_dict(), os.path.join(args.checkpoint, "last.pth"))
@@ -710,6 +823,19 @@ if __name__ == "__main__":
     parser.add_argument("--heatmap-sigma", type=float, default=HEATMAP_SIGMA, help="Gaussian target sigma in feature cells")
     parser.add_argument("--bbox-loss-weight", type=float, default=BBOX_LOSS_WEIGHT, help="bbox loss weight")
     parser.add_argument("--moe-entropy-weight", type=float, default=MOE_ENTROPY_WEIGHT, help="weight for encouraging high expert entropy")
+    parser.add_argument(
+        "--pretrained-checkpoint",
+        type=str,
+        default="/media/data1/feihong/ckpt/SMGeo.pth",
+        help="Official SMGeo checkpoint used to initialize the Swin-MoE grounding model",
+    )
+    parser.add_argument(
+        "--no-pretrained-checkpoint",
+        dest="pretrained_checkpoint",
+        action="store_const",
+        const=None,
+        help="Disable SMGeo checkpoint initialization",
+    )
     parser.add_argument(
         "--checkpoint",
         type=str,

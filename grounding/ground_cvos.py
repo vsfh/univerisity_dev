@@ -69,6 +69,132 @@ CVOGL_TRANSFORM = Compose(
 )
 
 
+def _unwrap_state_dict(checkpoint):
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model", "model_state_dict", "net"):
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                return value
+    if isinstance(checkpoint, dict):
+        return checkpoint
+    raise TypeError(f"Expected checkpoint/state_dict dict, got {type(checkpoint)}.")
+
+
+def load_sample4geo_backbone(model: nn.Module, checkpoint_path: str) -> Dict[str, int]:
+    """Load official Sample4Geo single-backbone weights into query/reference towers."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = _unwrap_state_dict(checkpoint)
+    loaded_logit_scale = False
+    if "logit_scale" in state_dict and hasattr(model, "logit_scale"):
+        with torch.no_grad():
+            model.logit_scale.copy_(state_dict["logit_scale"])
+        loaded_logit_scale = True
+
+    backbone_state = {}
+    for key, value in state_dict.items():
+        if key == "logit_scale":
+            continue
+        if not key.startswith("model."):
+            continue
+        backbone_state[key[len("model."):]] = value
+    if not backbone_state:
+        raise ValueError(f"No Sample4Geo 'model.*' backbone weights found in {checkpoint_path}.")
+
+    if hasattr(model, "backbone"):
+        result = model.backbone.load_state_dict(backbone_state, strict=False)
+        return {
+            "loaded": len(backbone_state),
+            "missing": len(result.missing_keys),
+            "unexpected": len(result.unexpected_keys),
+            "logit_scale": int(loaded_logit_scale),
+        }
+
+    query_result = model.query_model.load_state_dict(backbone_state, strict=False)
+    reference_result = model.reference_model.load_state_dict(backbone_state, strict=False)
+    return {
+        "loaded": len(backbone_state),
+        "query_missing": len(query_result.missing_keys),
+        "query_unexpected": len(query_result.unexpected_keys),
+        "reference_missing": len(reference_result.missing_keys),
+        "reference_unexpected": len(reference_result.unexpected_keys),
+        "logit_scale": int(loaded_logit_scale),
+    }
+
+
+class SampleGeoBBoxHead(nn.Module):
+    """Lightweight grounding head on top of original Sample4Geo descriptors."""
+
+    def __init__(self, emb_size: int = 1024, hidden_dim: int = 512):
+        super().__init__()
+        self.query_to_scale_shift = nn.Sequential(
+            nn.LayerNorm(emb_size),
+            nn.Linear(emb_size, emb_size * 2),
+        )
+        nn.init.zeros_(self.query_to_scale_shift[-1].weight)
+        nn.init.zeros_(self.query_to_scale_shift[-1].bias)
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(emb_size, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.heatmap = nn.Conv2d(hidden_dim, 1, kernel_size=1)
+        self.bbox = nn.Conv2d(hidden_dim, 4, kernel_size=1)
+        nn.init.constant_(self.heatmap.bias, -2.0)
+
+    def forward(self, query_global, sat_map):
+        gamma, beta = self.query_to_scale_shift(query_global).chunk(2, dim=-1)
+        gamma = gamma.view(-1, sat_map.shape[1], 1, 1)
+        beta = beta.view(-1, sat_map.shape[1], 1, 1)
+        feat = sat_map * (1.0 + gamma) + beta
+        feat = self.conv(feat)
+        return self.heatmap(feat), self.bbox(feat)
+
+
+class SampleGeoGrounding(nn.Module):
+    """Original Sample4Geo retrieval path plus an auxiliary bbox head."""
+
+    def __init__(self, emb_size: int = 1024, pretrained: bool = False):
+        super().__init__()
+        model_name = "convnext_base.fb_in22k_ft_in1k_384"
+        self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1.0 / 0.07))
+        self.fallback_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.bbox_head = SampleGeoBBoxHead(emb_size=emb_size)
+
+    def encode_map(self, images):
+        features = self.backbone.forward_features(images)
+        if features.ndim != 4:
+            raise ValueError(f"Expected ConvNeXt feature map shape (B, C, H, W), got {tuple(features.shape)}.")
+        return features
+
+    def encode_global(self, feature_map):
+        if hasattr(self.backbone, "forward_head"):
+            return self.backbone.forward_head(feature_map, pre_logits=False)
+        return self.fallback_pool(feature_map).flatten(1)
+
+    def forward(self, query_imgs, reference_imgs):
+        query_map = self.encode_map(query_imgs)
+        reference_map = self.encode_map(reference_imgs)
+        query_feats = self.encode_global(query_map)
+        reference_feats = self.encode_global(reference_map)
+        heatmap_logits, bbox_raw = self.bbox_head(query_feats, reference_map)
+        return {
+            "query_feats": query_feats,
+            "reference_feats": reference_feats,
+            "logit_scale": self.logit_scale.exp().clamp(max=100.0),
+            "heatmap_logits": heatmap_logits,
+            "bbox_raw": bbox_raw,
+        }
+
+    def bbox_forward(self, query_imgs, reference_imgs):
+        outputs = self.forward(query_imgs, reference_imgs)
+        return outputs["heatmap_logits"], outputs["bbox_raw"]
+
+
 def double_conv(in_channels, out_channels):
     return nn.Sequential(
         nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
