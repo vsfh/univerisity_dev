@@ -10,7 +10,7 @@ import numpy as np
 from collections import defaultdict, OrderedDict
 
 # from utils.parse_config import *
-from utils.utils import *
+from grounding.utils.utils import *
 # import matplotlib.pyplot as plt
 # import matplotlib.patches as patches
 

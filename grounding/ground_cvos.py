@@ -35,9 +35,6 @@ from transformers import AutoModel
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
-GROUNDING_ROOT = Path(__file__).resolve().parent
-if str(GROUNDING_ROOT) not in sys.path:
-    sys.path.append(str(GROUNDING_ROOT))
 
 from grounding.model.TROGeo import SwinTransformer
 from grounding.model.attention import SpatialTransformer
