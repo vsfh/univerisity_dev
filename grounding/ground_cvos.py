@@ -28,13 +28,7 @@ from einops import rearrange
 import timm
 import torchvision.models as torchvision_models
 from torch.autograd import Variable
-from pathlib import Path
-import sys
 from transformers import AutoModel
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
 
 from grounding.model.TROGeo import SwinTransformer
 from grounding.model.attention import SpatialTransformer
