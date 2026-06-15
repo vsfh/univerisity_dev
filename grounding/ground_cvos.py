@@ -35,11 +35,13 @@ from transformers import AutoModel
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
+GROUNDING_ROOT = Path(__file__).resolve().parent
+if str(GROUNDING_ROOT) not in sys.path:
+    sys.path.append(str(GROUNDING_ROOT))
 
 from grounding.model.TROGeo import SwinTransformer
 from grounding.model.attention import SpatialTransformer
 from bbox.yolo_utils import yolo_loss, build_target
-from grounding.model.loss import adjust_learning_rate
 from grounding.utils.utils import AverageMeter, eval_iou_acc
 from grounding.utils.checkpoint import save_checkpoint
 from grounding.model.darknet import *
@@ -60,6 +62,13 @@ MODEL_NAME = "google/siglip2-base-patch16-224"
 SIGLIP2_MODEL_NAME = MODEL_NAME
 CACHE_DIR = "/media/data1/feihong/hf_cache"
 PROJECTION_DIM = 768
+
+
+def adjust_learning_rate(args, optimizer, i_iter):
+    lr = args.lr * (0.1 ** (i_iter // 10))
+    print(("lr", lr))
+    for param in optimizer.param_groups:
+        param["lr"] = lr
 
 CVOGL_TRANSFORM = Compose(
     [
@@ -390,12 +399,12 @@ class SampleGeoLite(nn.Module):
 class LPNGeoLite(nn.Module):
     """Simplified TROGeo without click point input for direct bbox regression."""
 
-    def __init__(self, emb_size=2048):
+    def __init__(self, emb_size=2048, pretrained=False):
         super(LPNGeoLite, self).__init__()
 
         model_name = "resnet50"
         base_model = timm.create_model(
-            model_name, pretrained=True, features_only=True, out_indices=[4]
+            model_name, pretrained=pretrained, features_only=True, out_indices=[4]
         )
         self.query_model = base_model
         self.reference_model = base_model

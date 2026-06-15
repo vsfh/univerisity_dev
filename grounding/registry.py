@@ -46,7 +46,7 @@ def _build_siglip_ground(cfg: Dict[str, Any]) -> nn.Module:
 def _build_lpn(cfg: Dict[str, Any]) -> nn.Module:
     from grounding.ground_cvos import LPNGeoLite
 
-    return LPNGeoLite()
+    return LPNGeoLite(pretrained=False)
 
 
 def _build_sample4geo(cfg: Dict[str, Any]) -> nn.Module:

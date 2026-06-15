@@ -22,9 +22,10 @@ def build_geo_features(batch: Dict[str, Any], device: torch.device) -> Optional[
     height = batch.get("height")
     if angle is None or height is None:
         return None
-    angle = angle.to(device=device, dtype=torch.float32).view(-1) / 360.0
+    angle = angle.to(device=device, dtype=torch.float32).view(-1)
     height = height.to(device=device, dtype=torch.float32).view(-1) / 300.0
-    return torch.stack([angle, height], dim=1)
+    angle_rad = torch.deg2rad(angle)
+    return torch.stack([torch.cos(angle_rad), torch.sin(angle_rad), height], dim=1)
 
 
 def build_heatmap_target(
