@@ -1,0 +1,11 @@
+exp_name: siglip2_test
+save_dir: /media/data1/feihong/ckpt/ground_siglip2_test
+
+model:
+  type: siglip2_test
+  use_angle: true
+  use_heatmap: true
+  use_text: false
+
+eval:
+  output_dir: eval_results/grounding/siglip2_test

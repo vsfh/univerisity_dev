@@ -1,0 +1,11 @@
+exp_name: det
+save_dir: /media/data1/feihong/ckpt/ground_det
+
+model:
+  type: det
+  use_angle: true
+  use_heatmap: false
+  use_text: false
+
+eval:
+  output_dir: eval_results/grounding/det

@@ -1,0 +1,11 @@
+exp_name: siglip_ground
+save_dir: /media/data1/feihong/ckpt/ground_siglip
+
+model:
+  type: siglip_ground
+  use_angle: true
+  use_heatmap: true
+  use_text: false
+
+eval:
+  output_dir: eval_results/grounding/siglip_ground
