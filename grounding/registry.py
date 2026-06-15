@@ -3,7 +3,7 @@ from typing import Any, Callable, Dict, Type
 
 import torch.nn as nn
 
-from grounding.adapters import BaseAdapter, DirectBboxAdapter, LegacyAnchorAdapter, SiglipTupleAdapter
+from grounding.adapters import BaseAdapter, DirectBboxAdapter, LegacyAnchorAdapter, SMGeoAdapter, SiglipTupleAdapter
 
 
 @dataclass
@@ -52,7 +52,7 @@ def _build_lpn(cfg: Dict[str, Any]) -> nn.Module:
 def _build_sample4geo(cfg: Dict[str, Any]) -> nn.Module:
     from grounding.ground_cvos import SampleGeoLite
 
-    return SampleGeoLite()
+    return SampleGeoLite(pretrained=False)
 
 
 def _build_smgeo(cfg: Dict[str, Any]) -> nn.Module:
@@ -84,8 +84,8 @@ REGISTRY: Dict[str, ModelEntry] = {
     "siglip2_test": ModelEntry(_build_siglip2_test, SiglipTupleAdapter),
     "siglip_ground": ModelEntry(_build_siglip_ground, SiglipTupleAdapter),
     "lpn": ModelEntry(_build_lpn, LegacyAnchorAdapter),
-    "sample4geo": ModelEntry(_build_sample4geo, DirectBboxAdapter),
-    "smgeo": ModelEntry(_build_smgeo, DirectBboxAdapter),
+    "sample4geo": ModelEntry(_build_sample4geo, LegacyAnchorAdapter),
+    "smgeo": ModelEntry(_build_smgeo, SMGeoAdapter),
     "ocg": ModelEntry(_build_ocg, LegacyAnchorAdapter),
     "trogeolite": ModelEntry(_build_trogeolite, LegacyAnchorAdapter),
     "det": ModelEntry(_build_det, LegacyAnchorAdapter),

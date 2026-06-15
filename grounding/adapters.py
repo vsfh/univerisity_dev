@@ -50,12 +50,30 @@ class LegacyAnchorAdapter(BaseAdapter):
         target = batch["target_pixel_values"].to(device, non_blocking=True)
         search = batch["search_pixel_values"].to(device, non_blocking=True)
         geo = build_geo_features(batch, device) if self.cfg["model"]["use_angle"] else None
-        outputs = self.model(target, search, geo) if geo is not None else self.model(target, search)
+        if geo is None:
+            outputs = self.model(target, search)
+        else:
+            try:
+                outputs = self.model(target, search, geo=geo)
+            except TypeError:
+                outputs = self.model(target, search)
         pred_anchor = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
         return GroundingOutput(
             device=target.device,
             image_wh=(search.shape[-1], search.shape[-2]),
             pred_anchor=pred_anchor,
+        )
+
+
+class SMGeoAdapter(BaseAdapter):
+    def forward(self, batch: Dict[str, Any], device: torch.device) -> GroundingOutput:
+        target = batch["target_pixel_values"].to(device, non_blocking=True)
+        search = batch["search_pixel_values"].to(device, non_blocking=True)
+        pred_bbox = self.model.bbox_forward(target, search)
+        return GroundingOutput(
+            device=target.device,
+            image_wh=(search.shape[-1], search.shape[-2]),
+            pred_bbox=pred_bbox,
         )
 
 
