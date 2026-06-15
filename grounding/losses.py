@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from bbox.yolo_utils import bbox_iou, build_target, eval_iou_acc, xywh2xyxy, yolo_loss
+from bbox.yolo_utils import bbox_iou, build_target, xywh2xyxy, yolo_loss
 
 
 @dataclass
@@ -83,6 +83,11 @@ def heatmap_loss_fn(
     image_wh: Tuple[int, int],
     cfg: Dict[str, Any],
 ) -> torch.Tensor:
+    """Compute loss for the post-spatial-softmax heatmap probability map.
+
+    This matches unified_siglip_supp.py: callers pass the model-produced
+    probability map, then both prediction and target are normalized again here.
+    """
     heatmap_target = build_heatmap_target(
         target_bbox=target_bbox,
         heatmap_hw=heatmap.shape[-2:],
@@ -90,10 +95,10 @@ def heatmap_loss_fn(
         edge_value=float(cfg["loss"]["heatmap_bbox_center_edge_value"]),
         log_scale=float(cfg["loss"]["heatmap_bbox_center_log_scale"]),
     )
-    pred = heatmap.float().flatten(1)
+    pred_prob_map = heatmap.float().flatten(1)
     target = heatmap_target.float().flatten(1)
     target_prob = target / target.sum(dim=1, keepdim=True).clamp_min(1e-6)
-    pred_prob = pred / pred.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    pred_prob = pred_prob_map / pred_prob_map.sum(dim=1, keepdim=True).clamp_min(1e-6)
 
     loss = heatmap.new_zeros(())
     loss_types = cfg["loss"]["heatmap_loss_type"]
