@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-@file train_lpn.py
-@desc Training LPNGeoLite on GroundSmgeoDataset with geo conditioning.
+@file train_det.py
+@desc Training DetGeoLite on GroundSmgeoDataset.
 """
 
 import time
@@ -11,7 +11,6 @@ import json
 import sys
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 import torch.backends.cudnn as cudnn
@@ -24,19 +23,19 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import argparse
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-from ground_cvos import LPNGeoLite
-from bbox.yolo_utils import build_target, eval_iou_acc, yolo_loss
-from grounding.model.loss import adjust_learning_rate
-from utils.utils import AverageMeter
+from ground_cvos import DetGeoLite
+from bbox.yolo_utils import bbox_iou, build_target, eval_iou_acc, yolo_loss
+from grounding.legacy.model.loss import adjust_learning_rate
+from grounding.legacy.utils.utils import AverageMeter
 
 from dataset import ShiftedSatelliteDroneDataset
 
 IMG_SIZE = (768, 432)  # (width, height)
-BATCH_SIZE = 6
+BATCH_SIZE = 8
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
 NUM_EPOCHS = 20
@@ -44,16 +43,19 @@ LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 GRAD_CLIP_NORM = 10.0
 PRINT_FREQ = 50
+
 UNIV_IMAGE_FOLDER = "/media/data1/feihong/image_1024"
 UNIV_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
 UNIV_TRAIN_FILE = "/media/data1/feihong/ckpt/train.txt"
 UNIV_TEST_FILE = "/media/data1/feihong/ckpt/test.txt"
-# UNIV_CROP_SIZE = (640, 640)
+UNIV_CROP_SIZE = (IMG_SIZE[1], IMG_SIZE[0])
 UNIV_DRONE_SIZE = (256, 256)
-UNIV_SAT_SIZE = IMG_SIZE
+# Keep satellite tensors in HxW format for the shared dataset pipeline.
+UNIV_SAT_SIZE = (IMG_SIZE[1], IMG_SIZE[0])
 DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 
 CVOGL_TRANSFORM = None
+
 
 class TransformProcessorWrapper:
     def __init__(self, image_size=IMG_SIZE):
@@ -145,13 +147,17 @@ def format_satellite_img_bbox(
     bottom = top + crop_size
 
     image = image.crop((left, top, right, bottom))
-    ratio = image.size[0] / target_size[0]
-    image = image.resize(target_size)
+    crop_w, crop_h = image.size
 
-    new_x1 = (x1 - left) / ratio
-    new_y1 = (y1 - top) / ratio
-    new_x2 = (x2 - left) / ratio
-    new_y2 = (y2 - top) / ratio
+    target_h, target_w = int(target_size[0]), int(target_size[1])
+    image = image.resize((target_w, target_h), Image.Resampling.BILINEAR)
+
+    scale_x = target_w / max(float(crop_w), 1.0)
+    scale_y = target_h / max(float(crop_h), 1.0)
+    new_x1 = (x1 - left) * scale_x
+    new_y1 = (y1 - top) * scale_y
+    new_x2 = (x2 - left) * scale_x
+    new_y2 = (y2 - top) * scale_y
     return image, [new_x1, new_y1, new_x2, new_y2]
 
 
@@ -239,8 +245,7 @@ def train_epoch(
             image_wh,
             confidence_loss_type="balanced_bce",
         )
-        bbox_loss = loss_geo + loss_cls
-        loss = bbox_loss
+        loss = loss_geo + loss_cls
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -268,12 +273,11 @@ def train_epoch(
 
 
 def validate(loader, model, anchors_full, img_size):
-    """Validate model."""
+    """Validate model with eval_ground-style metrics."""
     model.eval()
 
-    accu50_meter = AverageMeter()
-    accu25_meter = AverageMeter()
-    iou_meter = AverageMeter()
+    iou_values: List[float] = []
+    center_distances: List[float] = []
 
     for batch in tqdm(loader, desc="Validating"):
         query_imgs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
@@ -295,7 +299,7 @@ def validate(loader, model, anchors_full, img_size):
             ori_gt_bbox, anchors_full, image_wh, grid_wh
         )
 
-        accu_list, accu_center, iou, _, _, _ = eval_iou_acc(
+        _, _, _, _, pred_bbox_xyxy, target_bbox_xyxy = eval_iou_acc(
             pred_anchor,
             ori_gt_bbox,
             anchors_full,
@@ -305,11 +309,39 @@ def validate(loader, model, anchors_full, img_size):
             iou_threshold_list=[0.5, 0.25],
         )
 
-        accu50_meter.update(accu_list[0].item(), query_imgs.shape[0])
-        accu25_meter.update(accu_list[1].item(), query_imgs.shape[0])
-        iou_meter.update(iou.item(), query_imgs.shape[0])
+        for idx in range(pred_bbox_xyxy.shape[0]):
+            pred_xyxy = pred_bbox_xyxy[idx].float()
+            gt_xyxy = target_bbox_xyxy[idx].float()
 
-    return accu50_meter.avg, accu25_meter.avg, iou_meter.avg
+            iou = float(
+                bbox_iou(
+                    pred_xyxy.unsqueeze(0),
+                    gt_xyxy.unsqueeze(0),
+                    x1y1x2y2=True,
+                ).item()
+            )
+
+            pred_cx = 0.5 * (pred_xyxy[0] + pred_xyxy[2])
+            pred_cy = 0.5 * (pred_xyxy[1] + pred_xyxy[3])
+            gt_cx = 0.5 * (gt_xyxy[0] + gt_xyxy[2])
+            gt_cy = 0.5 * (gt_xyxy[1] + gt_xyxy[3])
+            center_dist = float(
+                torch.sqrt((pred_cx - gt_cx) ** 2 + (pred_cy - gt_cy) ** 2).item()
+            )
+
+            iou_values.append(iou)
+            center_distances.append(center_dist)
+
+    if not iou_values:
+        return 0.0, 0.0, 0.0
+
+    iou_arr = np.array(iou_values, dtype=np.float32)
+    center_arr = np.array(center_distances, dtype=np.float32)
+    mean_iou = float(iou_arr.mean())
+    ratio_iou_gt_0_5 = float((iou_arr > 0.5).mean())
+    mean_center_distance = float(center_arr.mean())
+
+    return mean_iou, ratio_iou_gt_0_5, mean_center_distance
 
 
 def main(args):
@@ -319,7 +351,7 @@ def main(args):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    exp_name = args.savename if args.savename else "ground_lpn_exp"
+    exp_name = args.savename if args.savename else "ground_det_exp"
     writer = SummaryWriter(f"runs/{exp_name}")
 
     print("Creating datasets from shared data source...")
@@ -361,7 +393,7 @@ def main(args):
     )
 
     print("Creating model...")
-    model = LPNGeoLite(emb_size=2048).to(DEVICE)
+    model = DetGeoLite(emb_size=512).to(DEVICE)
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -387,7 +419,7 @@ def main(args):
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/train_geo", train_geo, epoch)
         writer.add_scalar("Loss/train_cls", train_cls, epoch)
-        val_accu50, val_accu25, val_iou = validate(
+        val_iou, val_accu50, val_center = validate(
             val_loader,
             model,
             anchors_full,
@@ -395,12 +427,12 @@ def main(args):
         )
         writer.add_scalar("ValTrain/mean_iou", val_iou, epoch)
         writer.add_scalar("ValTrain/accu50", val_accu50, epoch)
-        writer.add_scalar("ValTrain/accu25", val_accu25, epoch)
+        writer.add_scalar("ValTrain/center_distance", val_center, epoch)
 
         print(
             f"Epoch {epoch + 1}/{args.max_epoch}:\t"
             f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})\t"
-            f"ValTrain IoU: {val_iou:.4f}, Accu50: {val_accu50:.4f}, Accu25: {val_accu25:.4f}"
+            f"ValTrain IoU: {val_iou:.4f}, Accu50: {val_accu50:.4f}, Center: {val_center:.2f}"
         )
         torch.save(model.state_dict(), f"{args.checkpoint}/last.pth")
 
@@ -450,7 +482,7 @@ def eval(args):
         persistent_workers=args.num_workers > 0,
     )
 
-    model = LPNGeoLite(emb_size=2048).to(DEVICE)
+    model = DetGeoLite(emb_size=512).to(DEVICE)
     checkpoint_path = args.checkpoint_path or f"{args.checkpoint}/last.pth"
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -460,24 +492,25 @@ def eval(args):
     anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
     anchors_full = torch.tensor(anchors_full, dtype=torch.float32).to(DEVICE)
 
-    accu50, accu25, val_iou = validate(
+    mean_iou, accu50, mean_center_distance = validate(
         test_loader, model, anchors_full, args.img_size
     )
     print(
-        f"Eval Accu50: {accu50:.4f}, Accu25: {accu25:.4f}, IoU: {val_iou:.4f}"
+        f"Eval IoU: {mean_iou:.4f}, Accu50: {accu50:.4f}, "
+        f"CenterDist: {mean_center_distance:.2f}"
     )
+
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="LPNGeoLite Training on GroundSmgeoDataset with Geo Conditioning"
+        description="DetGeoLite Training on GroundSmgeoDataset"
     )
-    parser.add_argument("--gpu", default="1", help="GPU id (e.g., '1' or '1,2')")
     parser.add_argument(
         "--num-workers", type=int, default=8, help="num workers for data loading"
     )
     parser.add_argument(
-        "--max-epoch", type=int, default=NUM_EPOCHS, help="training epoch"
+        "--max-epoch", type=int, default=NUM_EPOCHS, help="num workers for data loading"
     )
     parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="learning rate")
     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="AdamW weight decay")
@@ -497,7 +530,7 @@ if __name__ == "__main__":
         help="image size as WIDTH HEIGHT",
     )
     parser.add_argument(
-        "--savename", type=str, default="ground_lpn", help="Name head for saved model"
+        "--savename", type=str, default="ground_det", help="Name head for saved model"
     )
     parser.add_argument("--seed", type=int, default=2024, help="random seed")
     parser.add_argument(
@@ -506,7 +539,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/media/data1/feihong/ckpt/ground_lpn",
+        default="/media/data1/feihong/ckpt/ground_det",
         help="Path to save model checkpoints",
     )
     parser.add_argument(

@@ -30,12 +30,12 @@ import torchvision.models as torchvision_models
 from torch.autograd import Variable
 from transformers import AutoModel
 
-from grounding.model.TROGeo import SwinTransformer
-from grounding.model.attention import SpatialTransformer
+from grounding.legacy.model.TROGeo import SwinTransformer
+from grounding.legacy.model.attention import SpatialTransformer
 from bbox.yolo_utils import yolo_loss, build_target
-from grounding.utils.utils import AverageMeter, eval_iou_acc
-from grounding.utils.checkpoint import save_checkpoint
-from grounding.model.darknet import *
+from grounding.legacy.utils.utils import AverageMeter, eval_iou_acc
+from grounding.legacy.utils.checkpoint import save_checkpoint
+from grounding.legacy.model.darknet import *
 
 DATA_ROOT = "/media/data1/feihong/CVOGL"
 DATA_NAME = "CVOGL_DroneAerial"

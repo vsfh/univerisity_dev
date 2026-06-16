@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-@file train_det.py
-@desc Training DetGeoLite on GroundSmgeoDataset.
+@file train_siglip.py
+@desc Training SiglipLite on GroundSmgeoDataset.
 """
 
 import time
@@ -11,6 +11,7 @@ import json
 import sys
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 import torch.backends.cudnn as cudnn
@@ -18,30 +19,42 @@ from torch.utils.data import DataLoader, Subset
 from torch.optim import AdamW
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image, ImageDraw
+from transformers import AutoImageProcessor
 import os
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import argparse
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-from ground_cvos import DetGeoLite
 from bbox.yolo_utils import bbox_iou, build_target, eval_iou_acc, yolo_loss
-from grounding.model.loss import adjust_learning_rate
-from utils.utils import AverageMeter
-
+from grounding.legacy.model.loss import adjust_learning_rate
+from grounding.legacy.utils.utils import AverageMeter
+from model_ground import Encoder_ground as SiglipLite
 from dataset import ShiftedSatelliteDroneDataset
 
+MODEL_NAME = "google/siglip2-base-patch16-224"
+CACHE_DIR = "/media/data1/feihong/hf_cache"
 IMG_SIZE = (768, 432)  # (width, height)
-BATCH_SIZE = 8
+BATCH_SIZE = 32
+GRAD_ACCUMULATION_STEPS = 2
+GRAD_CLIP_NORM = 1.0
+USE_AMP = True
+USE_HEATMAP_LOSS = True
+HEATMAP_LOSS_WEIGHT = 0.2
+HEATMAP_CONFIDENCE_WEIGHT = 0.5
+HEATMAP_LOSS_TYPE = ("mse", "cross_entropy")
+HEATMAP_SIGMA = 1.5
+HEATMAP_RADIUS = 4.5
+HEATMAP_BBOX_CENTER_EDGE_VALUE = 0.2
+HEATMAP_BBOX_CENTER_LOG_SCALE = 9.0
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
 NUM_EPOCHS = 20
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 5e-5
 WEIGHT_DECAY = 1e-4
-GRAD_CLIP_NORM = 10.0
 PRINT_FREQ = 50
 
 UNIV_IMAGE_FOLDER = "/media/data1/feihong/image_1024"
@@ -58,21 +71,33 @@ CVOGL_TRANSFORM = None
 
 
 class TransformProcessorWrapper:
-    def __init__(self, image_size=IMG_SIZE):
+    def __init__(self):
         self.to_tensor = torch.nn.Identity()
-        self.size = {"height": int(image_size[1]), "width": int(image_size[0])}
-        self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
-        self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+        self.size = {"height": UNIV_SAT_SIZE[0], "width": UNIV_SAT_SIZE[1]}
 
     def __call__(self, images, return_tensors="pt"):
-        target_h = int(self.size["height"])
-        target_w = int(self.size["width"])
-        if images.size != (target_w, target_h):
-            images = images.resize((target_w, target_h), Image.Resampling.BILINEAR)
         image_np = np.array(images, dtype=np.float32) / 255.0
         pixel_values = torch.from_numpy(image_np).permute(2, 0, 1)
-        pixel_values = (pixel_values - self.mean) / self.std
         return {"pixel_values": pixel_values.unsqueeze(0)}
+
+
+class SiglipProcessorWrapper:
+    """SigLIP2 image processor wrapper matching unified_siglip_supp.py."""
+
+    def __init__(
+        self,
+        model_name: str = MODEL_NAME,
+        cache_dir: str = CACHE_DIR,
+        size: Optional[Dict[str, int]] = None,
+    ):
+        kwargs = {"cache_dir": cache_dir}
+        if size is not None:
+            kwargs["size"] = size
+        self.processor = AutoImageProcessor.from_pretrained(model_name, **kwargs)
+        self.size = self.processor.size
+
+    def __call__(self, images, return_tensors="pt"):
+        return self.processor(images=images, return_tensors=return_tensors)
 
 
 class DummyTokenizer:
@@ -161,11 +186,6 @@ def format_satellite_img_bbox(
     return image, [new_x1, new_y1, new_x2, new_y2]
 
 
-def resize_drone_image(image, target_size=UNIV_DRONE_SIZE):
-    """Resize drone image to target size."""
-    return image.resize(target_size, Image.Resampling.BILINEAR)
-
-
 def visualize(
     image_tensor: torch.Tensor,
     bbox_tensor: torch.Tensor,
@@ -199,15 +219,128 @@ def visualize(
     pil_image.save(output_path)
 
 
+def build_heatmap_target(
+    target_bbox: torch.Tensor,
+    heatmap_hw: Tuple[int, int],
+    image_wh: Tuple[int, int],
+) -> torch.Tensor:
+    """Build bbox-center heatmap targets matching unified_siglip_supp defaults."""
+    grid_h, grid_w = int(heatmap_hw[0]), int(heatmap_hw[1])
+    image_w, image_h = float(image_wh[0]), float(image_wh[1])
+    device = target_bbox.device
+    dtype = target_bbox.dtype
+
+    x1 = torch.minimum(target_bbox[:, 0], target_bbox[:, 2]).clamp(0.0, image_w)
+    y1 = torch.minimum(target_bbox[:, 1], target_bbox[:, 3]).clamp(0.0, image_h)
+    x2 = torch.maximum(target_bbox[:, 0], target_bbox[:, 2]).clamp(0.0, image_w)
+    y2 = torch.maximum(target_bbox[:, 1], target_bbox[:, 3]).clamp(0.0, image_h)
+
+    center_x = (x1 + x2) * 0.5 / max(image_w, 1.0) * grid_w
+    center_y = (y1 + y2) * 0.5 / max(image_h, 1.0) * grid_h
+    center_x = center_x.clamp(0.0, grid_w - 1e-6)
+    center_y = center_y.clamp(0.0, grid_h - 1e-6)
+
+    ys = torch.arange(grid_h, device=device, dtype=dtype).view(1, grid_h, 1)
+    xs = torch.arange(grid_w, device=device, dtype=dtype).view(1, 1, grid_w)
+    x_img = (xs + 0.5) / max(float(grid_w), 1.0) * image_w
+    y_img = (ys + 0.5) / max(float(grid_h), 1.0) * image_h
+
+    inside_x = (x_img >= x1.view(-1, 1, 1)) & (x_img <= x2.view(-1, 1, 1))
+    inside_y = (y_img >= y1.view(-1, 1, 1)) & (y_img <= y2.view(-1, 1, 1))
+    inside = inside_x & inside_y
+
+    center_img_x = (x1 + x2).view(-1, 1, 1) * 0.5
+    center_img_y = (y1 + y2).view(-1, 1, 1) * 0.5
+    half_w = ((x2 - x1) * 0.5).view(-1, 1, 1).clamp_min(1e-6)
+    half_h = ((y2 - y1) * 0.5).view(-1, 1, 1).clamp_min(1e-6)
+
+    norm_radius = torch.maximum(
+        (x_img - center_img_x).abs() / half_w,
+        (y_img - center_img_y).abs() / half_h,
+    ).clamp(0.0, 1.0)
+    log_scale = max(float(HEATMAP_BBOX_CENTER_LOG_SCALE), 1e-6)
+    decay = torch.log1p(norm_radius * log_scale) / np.log1p(log_scale)
+    target = 1.0 - (1.0 - float(HEATMAP_BBOX_CENTER_EDGE_VALUE)) * decay
+    target = target * inside.to(dtype=dtype)
+
+    center_x_idx = torch.floor(center_x).long().clamp(0, grid_w - 1)
+    center_y_idx = torch.floor(center_y).long().clamp(0, grid_h - 1)
+    batch_idx = torch.arange(target.shape[0], device=device)
+    target[batch_idx, center_y_idx, center_x_idx] = 1.0
+    return target.unsqueeze(1).clamp(0.0, 1.0)
+
+
+def heatmap_loss_fn(
+    heatmap_logits: torch.Tensor,
+    target_bbox: torch.Tensor,
+    image_wh: Tuple[int, int],
+) -> torch.Tensor:
+    heatmap_target = build_heatmap_target(
+        target_bbox=target_bbox,
+        heatmap_hw=heatmap_logits.shape[-2:],
+        image_wh=image_wh,
+    )
+    pred = heatmap_logits.float().flatten(1)
+    target = heatmap_target.float().flatten(1)
+    target_prob = target / target.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    pred_prob = pred / pred.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+    loss = heatmap_logits.new_zeros(())
+    if "mse" in HEATMAP_LOSS_TYPE:
+        loss = loss + F.mse_loss(
+            pred_prob,
+            target_prob,
+            reduction="mean",
+        ) * pred_prob.shape[1]
+    if "cross_entropy" in HEATMAP_LOSS_TYPE:
+        loss = loss + -(
+            target_prob * pred_prob.clamp_min(1e-8).log()
+        ).sum(dim=1).mean()
+    return loss
+
+
+def add_heatmap_to_confidence(
+    pred_anchor: torch.Tensor,
+    heatmap_logits: Optional[torch.Tensor],
+    confidence_weight: float = HEATMAP_CONFIDENCE_WEIGHT,
+) -> torch.Tensor:
+    if heatmap_logits is None or confidence_weight <= 0.0:
+        return pred_anchor
+
+    if heatmap_logits.shape[-2:] != pred_anchor.shape[-2:]:
+        heatmap_logits = F.interpolate(
+            heatmap_logits,
+            size=pred_anchor.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+
+    heatmap_logits = heatmap_logits.detach().to(dtype=pred_anchor.dtype)
+    heat_confidence = float(confidence_weight) * heatmap_logits.unsqueeze(1)
+    return torch.cat(
+        [
+            pred_anchor[:, :, :4, :, :],
+            pred_anchor[:, :, 4:5, :, :] + heat_confidence,
+        ],
+        dim=2,
+    )
+
+
 def train_epoch(
     loader,
     model,
     optimizer,
+    scaler,
     epoch,
     anchors_full,
     img_size,
-    print_freq=PRINT_FREQ,
+    use_amp=USE_AMP,
+    grad_accumulation_steps=GRAD_ACCUMULATION_STEPS,
     grad_clip_norm=GRAD_CLIP_NORM,
+    use_heatmap_loss=USE_HEATMAP_LOSS,
+    heatmap_loss_weight=HEATMAP_LOSS_WEIGHT,
+    heatmap_confidence_weight=HEATMAP_CONFIDENCE_WEIGHT,
+    print_freq=PRINT_FREQ,
 ):
     """Train for one epoch."""
     model.train()
@@ -216,6 +349,13 @@ def train_epoch(
     losses = AverageMeter()
     geo_losses = AverageMeter()
     cls_losses = AverageMeter()
+    heatmap_losses = AverageMeter()
+
+    amp_enabled = (
+        bool(use_amp) and torch.cuda.is_available() and str(DEVICE).startswith("cuda")
+    )
+    grad_accumulation_steps = max(1, int(grad_accumulation_steps))
+    optimizer.zero_grad(set_to_none=True)
 
     end = time.time()
     for batch_idx, batch in enumerate(loader):
@@ -224,38 +364,56 @@ def train_epoch(
         ori_gt_bbox = batch["bbox"].to(DEVICE)
         geo = build_geo_features(batch, torch.device(DEVICE))
 
-        pred_anchor, _ = model(query_imgs, rs_imgs, geo=geo)
+        with torch.amp.autocast("cuda", enabled=amp_enabled):
+            output = model(query_imgs, rs_imgs, angle=geo)
+            pred_anchor = output[0]
+            heatmap_logits = output[6] if len(output) > 6 else None
+            pred_anchor = pred_anchor.view(
+                pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
+            )
+            pred_anchor = add_heatmap_to_confidence(
+                pred_anchor,
+                heatmap_logits,
+                confidence_weight=heatmap_confidence_weight,
+            )
 
-        pred_anchor = pred_anchor.view(
-            pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
+            image_wh = (rs_imgs.shape[-1], rs_imgs.shape[-2])
+            grid_wh = (pred_anchor.shape[4], pred_anchor.shape[3])
+
+            new_gt_bbox, best_anchor_gi_gj = build_target(
+                ori_gt_bbox, anchors_full, image_wh, grid_wh
+            )
+
+            loss_geo, loss_cls = yolo_loss(
+                pred_anchor, new_gt_bbox, anchors_full, best_anchor_gi_gj, image_wh
+            )
+            heatmap_loss = pred_anchor.new_zeros(())
+            if use_heatmap_loss and heatmap_logits is not None:
+                heatmap_loss = heatmap_loss_fn(
+                    heatmap_logits,
+                    ori_gt_bbox,
+                    image_wh=image_wh,
+                )
+            loss = loss_geo + loss_cls + heatmap_loss_weight * heatmap_loss
+
+        loss_to_backward = loss / grad_accumulation_steps
+        scaler.scale(loss_to_backward).backward()
+        should_step = (
+            (batch_idx + 1) % grad_accumulation_steps == 0
+            or (batch_idx + 1) == len(loader)
         )
-
-        image_wh = (rs_imgs.shape[-1], rs_imgs.shape[-2])
-        grid_wh = (pred_anchor.shape[4], pred_anchor.shape[3])
-
-        new_gt_bbox, best_anchor_gi_gj = build_target(
-            ori_gt_bbox, anchors_full, image_wh, grid_wh
-        )
-
-        loss_geo, loss_cls = yolo_loss(
-            pred_anchor,
-            new_gt_bbox,
-            anchors_full,
-            best_anchor_gi_gj,
-            image_wh,
-            confidence_loss_type="balanced_bce",
-        )
-        loss = loss_geo + loss_cls
-
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        if grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-        optimizer.step()
+        if should_step:
+            if grad_clip_norm is not None and grad_clip_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         losses.update(loss.item(), query_imgs.shape[0])
         geo_losses.update(loss_geo.item(), query_imgs.shape[0])
         cls_losses.update(loss_cls.item(), query_imgs.shape[0])
+        heatmap_losses.update(heatmap_loss.item(), query_imgs.shape[0])
 
         batch_time.update(time.time() - end)
         end = time.time()
@@ -266,10 +424,11 @@ def train_epoch(
                 f"Time: {batch_time.val:.3f}\t"
                 f"Loss: {losses.val:.4f} ({losses.avg:.4f})\t"
                 f"Geo: {geo_losses.val:.4f} ({geo_losses.avg:.4f})\t"
-                f"Cls: {cls_losses.val:.4f} ({cls_losses.avg:.4f})"
+                f"Cls: {cls_losses.val:.4f} ({cls_losses.avg:.4f})\t"
+                f"Heatmap: {heatmap_losses.val:.4f} ({heatmap_losses.avg:.4f})"
             )
 
-    return losses.avg, geo_losses.avg, cls_losses.avg
+    return losses.avg, geo_losses.avg, cls_losses.avg, heatmap_losses.avg
 
 
 def validate(loader, model, anchors_full, img_size):
@@ -351,12 +510,16 @@ def main(args):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    exp_name = args.savename if args.savename else "ground_det_exp"
+    exp_name = args.savename if args.savename else "ground_siglip"
     writer = SummaryWriter(f"runs/{exp_name}")
 
     print("Creating datasets from shared data source...")
-    processor = TransformProcessorWrapper(UNIV_DRONE_SIZE)
-    processor_sat = TransformProcessorWrapper(args.img_size)
+    processor = SiglipProcessorWrapper(MODEL_NAME, cache_dir=CACHE_DIR)
+    processor_sat = SiglipProcessorWrapper(
+        MODEL_NAME,
+        cache_dir=CACHE_DIR,
+        size={"height": UNIV_SAT_SIZE[0], "width": UNIV_SAT_SIZE[1]},
+    )
     tokenizer = DummyTokenizer()
     train_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
@@ -368,7 +531,7 @@ def main(args):
         processor=processor,
         processor_sat=processor_sat,
         tokenizer=tokenizer,
-        split="train",
+        split="test",
     )
 
     print(f"Found {len(train_dataset)} training samples, {len(val_dataset)} validation samples")
@@ -393,9 +556,13 @@ def main(args):
     )
 
     print("Creating model...")
-    model = DetGeoLite(emb_size=512).to(DEVICE)
+    model = SiglipLite(usesg=True).to(DEVICE)
 
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = AdamW(model.parameters(), lr=args.lr)
+    amp_enabled = (
+        bool(args.use_amp) and torch.cuda.is_available() and DEVICE.startswith("cuda")
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     anchors_full = np.array([float(x) for x in ANCHORS.split(",")])
     anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
@@ -405,100 +572,38 @@ def main(args):
     for epoch in range(args.max_epoch):
         adjust_learning_rate(args, optimizer, epoch)
 
-        train_loss, train_geo, train_cls = train_epoch(
+        train_loss, train_geo, train_cls, train_heatmap = train_epoch(
             train_loader,
             model,
             optimizer,
+            scaler,
             epoch,
             anchors_full,
             args.img_size,
-            args.print_freq,
+            args.use_amp,
+            args.grad_accumulation_steps,
             args.grad_clip_norm,
+            args.use_heatmap_loss,
+            args.heatmap_loss_weight,
+            args.heatmap_confidence_weight,
+            args.print_freq,
         )
 
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/train_geo", train_geo, epoch)
         writer.add_scalar("Loss/train_cls", train_cls, epoch)
-        val_iou, val_accu50, val_center = validate(
-            val_loader,
-            model,
-            anchors_full,
-            args.img_size,
-        )
-        writer.add_scalar("ValTrain/mean_iou", val_iou, epoch)
-        writer.add_scalar("ValTrain/accu50", val_accu50, epoch)
-        writer.add_scalar("ValTrain/center_distance", val_center, epoch)
+        writer.add_scalar("Loss/train_heatmap", train_heatmap, epoch)
 
         print(
             f"Epoch {epoch + 1}/{args.max_epoch}:\t"
-            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})\t"
-            f"ValTrain IoU: {val_iou:.4f}, Accu50: {val_accu50:.4f}, Center: {val_center:.2f}"
+            f"Train Loss: {train_loss:.4f} "
+            f"(Geo: {train_geo:.4f}, Cls: {train_cls:.4f}, "
+            f"Heatmap: {train_heatmap:.4f})"
         )
         torch.save(model.state_dict(), f"{args.checkpoint}/last.pth")
 
     print("\nTraining complete. Saved checkpoint to last.pth")
     writer.close()
-
-
-def eval(args):
-    print("Evaluating checkpoint on test split...")
-    processor = TransformProcessorWrapper(UNIV_DRONE_SIZE)
-    processor_sat = TransformProcessorWrapper(args.img_size)
-    tokenizer = DummyTokenizer()
-    test_dataset = ShiftedSatelliteDroneDataset(
-        processor=processor,
-        processor_sat=processor_sat,
-        tokenizer=tokenizer,
-        split="test",
-    )
-
-    if args.subset_height is not None or args.subset_angle is not None:
-        subset_indices = []
-        for idx, sample in enumerate(test_dataset.samples):
-            if args.subset_height is not None and int(sample["height"]) != args.subset_height:
-                continue
-            if args.subset_angle is not None and int(sample["angle"]) != args.subset_angle:
-                continue
-            subset_indices.append(idx)
-        if not subset_indices:
-            print(
-                f"No samples for subset filters: height={args.subset_height}, angle={args.subset_angle}"
-            )
-            return
-        test_dataset = Subset(test_dataset, subset_indices)
-        print(
-            f"Subset test samples: {len(subset_indices)} (height={args.subset_height}, angle={args.subset_angle})"
-        )
-    else:
-        print(f"Full test samples: {len(test_dataset)}")
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        pin_memory=True,
-        drop_last=False,
-        num_workers=args.num_workers,
-        persistent_workers=args.num_workers > 0,
-    )
-
-    model = DetGeoLite(emb_size=512).to(DEVICE)
-    checkpoint_path = args.checkpoint_path or f"{args.checkpoint}/last.pth"
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=False)
-
-    anchors_full = np.array([float(x) for x in ANCHORS.split(",")])
-    anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
-    anchors_full = torch.tensor(anchors_full, dtype=torch.float32).to(DEVICE)
-
-    mean_iou, accu50, mean_center_distance = validate(
-        test_loader, model, anchors_full, args.img_size
-    )
-    print(
-        f"Eval IoU: {mean_iou:.4f}, Accu50: {accu50:.4f}, "
-        f"CenterDist: {mean_center_distance:.2f}"
-    )
 
 
 
@@ -513,14 +618,19 @@ if __name__ == "__main__":
         "--max-epoch", type=int, default=NUM_EPOCHS, help="num workers for data loading"
     )
     parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="learning rate")
-    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="AdamW weight decay")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="batch size")
+    parser.add_argument(
+        "--grad-accumulation-steps",
+        type=int,
+        default=GRAD_ACCUMULATION_STEPS,
+        help="Number of mini-batches to accumulate before optimizer step",
+    )
     parser.add_argument(
         "--grad-clip-norm",
         type=float,
         default=GRAD_CLIP_NORM,
-        help="max gradient norm; <=0 disables clipping",
+        help="Max gradient norm before optimizer step. Use <= 0 to disable.",
     )
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="batch size")
     parser.add_argument(
         "--img-size",
         type=int,
@@ -530,16 +640,42 @@ if __name__ == "__main__":
         help="image size as WIDTH HEIGHT",
     )
     parser.add_argument(
-        "--savename", type=str, default="ground_det", help="Name head for saved model"
+        "--savename", type=str, default="ground_siglip", help="Name head for saved model"
     )
     parser.add_argument("--seed", type=int, default=2024, help="random seed")
     parser.add_argument(
         "--print-freq", type=int, default=PRINT_FREQ, help="print frequency"
     )
     parser.add_argument(
+        "--no-amp",
+        dest="use_amp",
+        action="store_false",
+        help="Disable AMP autocast and GradScaler during training",
+    )
+    parser.set_defaults(use_amp=USE_AMP)
+    parser.add_argument(
+        "--no-heatmap-loss",
+        dest="use_heatmap_loss",
+        action="store_false",
+        help="Disable heatmap loss during training",
+    )
+    parser.set_defaults(use_heatmap_loss=USE_HEATMAP_LOSS)
+    parser.add_argument(
+        "--heatmap-loss-weight",
+        type=float,
+        default=HEATMAP_LOSS_WEIGHT,
+        help="Weight for heatmap loss",
+    )
+    parser.add_argument(
+        "--heatmap-confidence-weight",
+        type=float,
+        default=HEATMAP_CONFIDENCE_WEIGHT,
+        help="Weight added from heatmap to anchor confidence",
+    )
+    parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/media/data1/feihong/ckpt/ground_det",
+        default="/media/data1/feihong/ckpt/ground_siglip",
         help="Path to save model checkpoints",
     )
     parser.add_argument(

@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from einops import rearrange
 
-from grounding.model.attention import SpatialTransformer
+from grounding.legacy.model.attention import SpatialTransformer
 
 import numpy as np
 import torchvision.models as models

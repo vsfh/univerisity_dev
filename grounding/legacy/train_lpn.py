@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-@file train_siglip.py
-@desc Training SiglipLite on GroundSmgeoDataset.
+@file train_lpn.py
+@desc Training LPNGeoLite on GroundSmgeoDataset with geo conditioning.
 """
 
 import time
@@ -11,11 +11,12 @@ import json
 import sys
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader, Subset
-from torch.optim import Adam
+from torch.optim import AdamW
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image, ImageDraw
 import os
@@ -23,46 +24,52 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import argparse
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-from bbox.yolo_utils import bbox_iou, build_target, eval_iou_acc, yolo_loss
-from grounding.model.loss import adjust_learning_rate
-from utils.utils import AverageMeter
-from model_ground import Encoder_ground as SiglipLite
+from ground_cvos import LPNGeoLite
+from bbox.yolo_utils import build_target, eval_iou_acc, yolo_loss
+from grounding.legacy.model.loss import adjust_learning_rate
+from grounding.legacy.utils.utils import AverageMeter
+
 from dataset import ShiftedSatelliteDroneDataset
 
 IMG_SIZE = (768, 432)  # (width, height)
-BATCH_SIZE = 16
+BATCH_SIZE = 6
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
-NUM_EPOCHS = 25
+NUM_EPOCHS = 20
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
+GRAD_CLIP_NORM = 10.0
 PRINT_FREQ = 50
-
 UNIV_IMAGE_FOLDER = "/media/data1/feihong/image_1024"
 UNIV_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
 UNIV_TRAIN_FILE = "/media/data1/feihong/ckpt/train.txt"
 UNIV_TEST_FILE = "/media/data1/feihong/ckpt/test.txt"
-UNIV_CROP_SIZE = (IMG_SIZE[1], IMG_SIZE[0])
+# UNIV_CROP_SIZE = (640, 640)
 UNIV_DRONE_SIZE = (256, 256)
-# Keep satellite tensors in HxW format for the shared dataset pipeline.
-UNIV_SAT_SIZE = (IMG_SIZE[1], IMG_SIZE[0])
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+UNIV_SAT_SIZE = IMG_SIZE
+DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 
 CVOGL_TRANSFORM = None
 
-
 class TransformProcessorWrapper:
-    def __init__(self):
+    def __init__(self, image_size=IMG_SIZE):
         self.to_tensor = torch.nn.Identity()
-        self.size = {"height": UNIV_SAT_SIZE[0], "width": UNIV_SAT_SIZE[1]}
+        self.size = {"height": int(image_size[1]), "width": int(image_size[0])}
+        self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
     def __call__(self, images, return_tensors="pt"):
+        target_h = int(self.size["height"])
+        target_w = int(self.size["width"])
+        if images.size != (target_w, target_h):
+            images = images.resize((target_w, target_h), Image.Resampling.BILINEAR)
         image_np = np.array(images, dtype=np.float32) / 255.0
         pixel_values = torch.from_numpy(image_np).permute(2, 0, 1)
+        pixel_values = (pixel_values - self.mean) / self.std
         return {"pixel_values": pixel_values.unsqueeze(0)}
 
 
@@ -138,18 +145,19 @@ def format_satellite_img_bbox(
     bottom = top + crop_size
 
     image = image.crop((left, top, right, bottom))
-    crop_w, crop_h = image.size
+    ratio = image.size[0] / target_size[0]
+    image = image.resize(target_size)
 
-    target_h, target_w = int(target_size[0]), int(target_size[1])
-    image = image.resize((target_w, target_h), Image.Resampling.BILINEAR)
-
-    scale_x = target_w / max(float(crop_w), 1.0)
-    scale_y = target_h / max(float(crop_h), 1.0)
-    new_x1 = (x1 - left) * scale_x
-    new_y1 = (y1 - top) * scale_y
-    new_x2 = (x2 - left) * scale_x
-    new_y2 = (y2 - top) * scale_y
+    new_x1 = (x1 - left) / ratio
+    new_y1 = (y1 - top) / ratio
+    new_x2 = (x2 - left) / ratio
+    new_y2 = (y2 - top) / ratio
     return image, [new_x1, new_y1, new_x2, new_y2]
+
+
+def resize_drone_image(image, target_size=UNIV_DRONE_SIZE):
+    """Resize drone image to target size."""
+    return image.resize(target_size, Image.Resampling.BILINEAR)
 
 
 def visualize(
@@ -193,6 +201,7 @@ def train_epoch(
     anchors_full,
     img_size,
     print_freq=PRINT_FREQ,
+    grad_clip_norm=GRAD_CLIP_NORM,
 ):
     """Train for one epoch."""
     model.train()
@@ -209,8 +218,8 @@ def train_epoch(
         ori_gt_bbox = batch["bbox"].to(DEVICE)
         geo = build_geo_features(batch, torch.device(DEVICE))
 
-        output = model(query_imgs, rs_imgs, angle=geo)
-        pred_anchor = output[0]
+        pred_anchor, _ = model(query_imgs, rs_imgs, geo=geo)
+
         pred_anchor = pred_anchor.view(
             pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
         )
@@ -223,12 +232,20 @@ def train_epoch(
         )
 
         loss_geo, loss_cls = yolo_loss(
-            pred_anchor, new_gt_bbox, anchors_full, best_anchor_gi_gj, image_wh
+            pred_anchor,
+            new_gt_bbox,
+            anchors_full,
+            best_anchor_gi_gj,
+            image_wh,
+            confidence_loss_type="balanced_bce",
         )
-        loss = loss_geo + loss_cls
+        bbox_loss = loss_geo + loss_cls
+        loss = bbox_loss
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         optimizer.step()
 
         losses.update(loss.item(), query_imgs.shape[0])
@@ -251,11 +268,12 @@ def train_epoch(
 
 
 def validate(loader, model, anchors_full, img_size):
-    """Validate model with eval_ground-style metrics."""
+    """Validate model."""
     model.eval()
 
-    iou_values: List[float] = []
-    center_distances: List[float] = []
+    accu50_meter = AverageMeter()
+    accu25_meter = AverageMeter()
+    iou_meter = AverageMeter()
 
     for batch in tqdm(loader, desc="Validating"):
         query_imgs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
@@ -277,7 +295,7 @@ def validate(loader, model, anchors_full, img_size):
             ori_gt_bbox, anchors_full, image_wh, grid_wh
         )
 
-        _, _, _, _, pred_bbox_xyxy, target_bbox_xyxy = eval_iou_acc(
+        accu_list, accu_center, iou, _, _, _ = eval_iou_acc(
             pred_anchor,
             ori_gt_bbox,
             anchors_full,
@@ -287,39 +305,11 @@ def validate(loader, model, anchors_full, img_size):
             iou_threshold_list=[0.5, 0.25],
         )
 
-        for idx in range(pred_bbox_xyxy.shape[0]):
-            pred_xyxy = pred_bbox_xyxy[idx].float()
-            gt_xyxy = target_bbox_xyxy[idx].float()
+        accu50_meter.update(accu_list[0].item(), query_imgs.shape[0])
+        accu25_meter.update(accu_list[1].item(), query_imgs.shape[0])
+        iou_meter.update(iou.item(), query_imgs.shape[0])
 
-            iou = float(
-                bbox_iou(
-                    pred_xyxy.unsqueeze(0),
-                    gt_xyxy.unsqueeze(0),
-                    x1y1x2y2=True,
-                ).item()
-            )
-
-            pred_cx = 0.5 * (pred_xyxy[0] + pred_xyxy[2])
-            pred_cy = 0.5 * (pred_xyxy[1] + pred_xyxy[3])
-            gt_cx = 0.5 * (gt_xyxy[0] + gt_xyxy[2])
-            gt_cy = 0.5 * (gt_xyxy[1] + gt_xyxy[3])
-            center_dist = float(
-                torch.sqrt((pred_cx - gt_cx) ** 2 + (pred_cy - gt_cy) ** 2).item()
-            )
-
-            iou_values.append(iou)
-            center_distances.append(center_dist)
-
-    if not iou_values:
-        return 0.0, 0.0, 0.0
-
-    iou_arr = np.array(iou_values, dtype=np.float32)
-    center_arr = np.array(center_distances, dtype=np.float32)
-    mean_iou = float(iou_arr.mean())
-    ratio_iou_gt_0_5 = float((iou_arr > 0.5).mean())
-    mean_center_distance = float(center_arr.mean())
-
-    return mean_iou, ratio_iou_gt_0_5, mean_center_distance
+    return accu50_meter.avg, accu25_meter.avg, iou_meter.avg
 
 
 def main(args):
@@ -329,23 +319,24 @@ def main(args):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    exp_name = args.savename if args.savename else "ground_siglip"
+    exp_name = args.savename if args.savename else "ground_lpn_exp"
     writer = SummaryWriter(f"runs/{exp_name}")
 
     print("Creating datasets from shared data source...")
-    processor = TransformProcessorWrapper()
+    processor = TransformProcessorWrapper(UNIV_DRONE_SIZE)
+    processor_sat = TransformProcessorWrapper(args.img_size)
     tokenizer = DummyTokenizer()
     train_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
-        processor_sat=processor,
+        processor_sat=processor_sat,
         tokenizer=tokenizer,
         split="train",
     )
     val_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
-        processor_sat=processor,
+        processor_sat=processor_sat,
         tokenizer=tokenizer,
-        split="test",
+        split="train",
     )
 
     print(f"Found {len(train_dataset)} training samples, {len(val_dataset)} validation samples")
@@ -370,9 +361,9 @@ def main(args):
     )
 
     print("Creating model...")
-    model = SiglipLite().to(DEVICE)
+    model = LPNGeoLite(emb_size=2048).to(DEVICE)
 
-    optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     anchors_full = np.array([float(x) for x in ANCHORS.split(",")])
     anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
@@ -390,15 +381,26 @@ def main(args):
             anchors_full,
             args.img_size,
             args.print_freq,
+            args.grad_clip_norm,
         )
 
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/train_geo", train_geo, epoch)
         writer.add_scalar("Loss/train_cls", train_cls, epoch)
+        val_accu50, val_accu25, val_iou = validate(
+            val_loader,
+            model,
+            anchors_full,
+            args.img_size,
+        )
+        writer.add_scalar("ValTrain/mean_iou", val_iou, epoch)
+        writer.add_scalar("ValTrain/accu50", val_accu50, epoch)
+        writer.add_scalar("ValTrain/accu25", val_accu25, epoch)
 
         print(
             f"Epoch {epoch + 1}/{args.max_epoch}:\t"
-            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})"
+            f"Train Loss: {train_loss:.4f} (Geo: {train_geo:.4f}, Cls: {train_cls:.4f})\t"
+            f"ValTrain IoU: {val_iou:.4f}, Accu50: {val_accu50:.4f}, Accu25: {val_accu25:.4f}"
         )
         torch.save(model.state_dict(), f"{args.checkpoint}/last.pth")
 
@@ -406,18 +408,85 @@ def main(args):
     writer.close()
 
 
+def eval(args):
+    print("Evaluating checkpoint on test split...")
+    processor = TransformProcessorWrapper(UNIV_DRONE_SIZE)
+    processor_sat = TransformProcessorWrapper(args.img_size)
+    tokenizer = DummyTokenizer()
+    test_dataset = ShiftedSatelliteDroneDataset(
+        processor=processor,
+        processor_sat=processor_sat,
+        tokenizer=tokenizer,
+        split="test",
+    )
+
+    if args.subset_height is not None or args.subset_angle is not None:
+        subset_indices = []
+        for idx, sample in enumerate(test_dataset.samples):
+            if args.subset_height is not None and int(sample["height"]) != args.subset_height:
+                continue
+            if args.subset_angle is not None and int(sample["angle"]) != args.subset_angle:
+                continue
+            subset_indices.append(idx)
+        if not subset_indices:
+            print(
+                f"No samples for subset filters: height={args.subset_height}, angle={args.subset_angle}"
+            )
+            return
+        test_dataset = Subset(test_dataset, subset_indices)
+        print(
+            f"Subset test samples: {len(subset_indices)} (height={args.subset_height}, angle={args.subset_angle})"
+        )
+    else:
+        print(f"Full test samples: {len(test_dataset)}")
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        pin_memory=True,
+        drop_last=False,
+        num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
+    )
+
+    model = LPNGeoLite(emb_size=2048).to(DEVICE)
+    checkpoint_path = args.checkpoint_path or f"{args.checkpoint}/last.pth"
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=False)
+
+    anchors_full = np.array([float(x) for x in ANCHORS.split(",")])
+    anchors_full = anchors_full.reshape(-1, 2)[::-1].copy()
+    anchors_full = torch.tensor(anchors_full, dtype=torch.float32).to(DEVICE)
+
+    accu50, accu25, val_iou = validate(
+        test_loader, model, anchors_full, args.img_size
+    )
+    print(
+        f"Eval Accu50: {accu50:.4f}, Accu25: {accu25:.4f}, IoU: {val_iou:.4f}"
+    )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="DetGeoLite Training on GroundSmgeoDataset"
+        description="LPNGeoLite Training on GroundSmgeoDataset with Geo Conditioning"
     )
+    parser.add_argument("--gpu", default="1", help="GPU id (e.g., '1' or '1,2')")
     parser.add_argument(
         "--num-workers", type=int, default=8, help="num workers for data loading"
     )
     parser.add_argument(
-        "--max-epoch", type=int, default=NUM_EPOCHS, help="num workers for data loading"
+        "--max-epoch", type=int, default=NUM_EPOCHS, help="training epoch"
     )
     parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="learning rate")
+    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="AdamW weight decay")
+    parser.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=GRAD_CLIP_NORM,
+        help="max gradient norm; <=0 disables clipping",
+    )
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="batch size")
     parser.add_argument(
         "--img-size",
@@ -428,7 +497,7 @@ if __name__ == "__main__":
         help="image size as WIDTH HEIGHT",
     )
     parser.add_argument(
-        "--savename", type=str, default="ground_siglip", help="Name head for saved model"
+        "--savename", type=str, default="ground_lpn", help="Name head for saved model"
     )
     parser.add_argument("--seed", type=int, default=2024, help="random seed")
     parser.add_argument(
@@ -437,7 +506,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/media/data1/feihong/ckpt/ground_siglip",
+        default="/media/data1/feihong/ckpt/ground_lpn",
         help="Path to save model checkpoints",
     )
     parser.add_argument(

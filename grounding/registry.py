@@ -44,37 +44,37 @@ def _build_siglip_ground(cfg: Dict[str, Any]) -> nn.Module:
 
 
 def _build_lpn(cfg: Dict[str, Any]) -> nn.Module:
-    from grounding.ground_cvos import LPNGeoLite
+    from grounding.legacy.ground_cvos import LPNGeoLite
 
     return LPNGeoLite(pretrained=False)
 
 
 def _build_sample4geo(cfg: Dict[str, Any]) -> nn.Module:
-    from grounding.ground_cvos import SampleGeoLite
+    from grounding.legacy.ground_cvos import SampleGeoLite
 
     return SampleGeoLite(pretrained=False)
 
 
 def _build_smgeo(cfg: Dict[str, Any]) -> nn.Module:
-    from grounding.train_sm import SMGeoLite
+    from grounding.legacy.train_sm import SMGeoLite
 
     return SMGeoLite()
 
 
 def _build_ocg(cfg: Dict[str, Any]) -> nn.Module:
-    from grounding.train_ocg import OCGNetLite
+    from grounding.legacy.train_ocg import OCGNetLite
 
     return OCGNetLite()
 
 
 def _build_trogeolite(cfg: Dict[str, Any]) -> nn.Module:
-    from grounding.ground_cvos import TROGeoLite
+    from grounding.legacy.ground_cvos import TROGeoLite
 
     return TROGeoLite()
 
 
 def _build_det(cfg: Dict[str, Any]) -> nn.Module:
-    from grounding.ground_cvos import DetGeoLite
+    from grounding.legacy.ground_cvos import DetGeoLite
 
     return DetGeoLite()
 

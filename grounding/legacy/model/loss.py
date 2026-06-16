@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
-from utils.utils import bbox_iou, xyxy2xywh
+from grounding.legacy.utils.utils import bbox_iou, xyxy2xywh
 
 
 def _parse_hw(shape_like):

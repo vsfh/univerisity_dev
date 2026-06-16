@@ -23,7 +23,7 @@ from typing import Dict, List, Tuple, Optional
 import argparse
 from einops import rearrange
 
-from yolo_utils import (
+from grounding.legacy.yolo_utils import (
     get_tensor_anchors,
     build_target,
     yolo_loss,

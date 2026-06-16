@@ -31,14 +31,14 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision import models
 from tqdm import tqdm
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from bbox.yolo_utils import bbox_iou, build_target, eval_iou_acc, yolo_loss
 from dataset import ShiftedSatelliteDroneDataset
-from grounding.model.darknet import ConvBatchNormReLU, Darknet
-from grounding.utils.utils import AverageMeter
+from grounding.legacy.model.darknet import ConvBatchNormReLU, Darknet
+from grounding.legacy.utils.utils import AverageMeter
 
 
 # --- Configuration ---

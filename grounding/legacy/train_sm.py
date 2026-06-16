@@ -30,12 +30,12 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from dataset import ShiftedSatelliteDroneDataset
-from grounding.utils.utils import AverageMeter
+from grounding.legacy.utils.utils import AverageMeter
 from bbox.yolo_utils import bbox_iou
 
 

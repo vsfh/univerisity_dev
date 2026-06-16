@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, AutoImageProcessor, AutoTokenizer
 
-from yolo_utils import SpatialTransformer
+from grounding.legacy.yolo_utils import SpatialTransformer
 
 MODEL_NAME = "google/siglip-base-patch16-224"
 CACHE_DIR = "/media/data1/feihong/hf_cache"

@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoImageProcessor, AutoTokenizer
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 GROUNDING_ROOT = Path(__file__).resolve().parent
 if str(GROUNDING_ROOT) not in sys.path:
     sys.path.insert(0, str(GROUNDING_ROOT))
@@ -33,7 +33,7 @@ MODEL_NAME_SIGLIP = "google/siglip2-base-patch16-224"
 CACHE_DIR = "/media/data1/feihong/hf_cache"
 DEFAULT_SAT_SIZE = (432, 768)  # (H, W)
 DEFAULT_DRONE_SIZE = (256, 256)  # (H, W)
-DEFAULT_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+DEFAULT_DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 BATCH_SIZE = 8
 DEFAULT_GROUNDING_RUNS = {
@@ -97,7 +97,7 @@ EVAL_CONFIG = {
 }
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _load_encoder_classes() -> Tuple[Optional[type], type, type]:
@@ -119,7 +119,7 @@ def _load_encoder_classes() -> Tuple[Optional[type], type, type]:
 
 def _load_shared_dataset_class():
     """Load root dataset.py explicitly to avoid importing grounding/dataset.py by name."""
-    dataset_path = Path(__file__).resolve().parents[1] / "dataset.py"
+    dataset_path = Path(__file__).resolve().parents[2] / "dataset.py"
     spec = importlib.util.spec_from_file_location("shared_dataset_module", str(dataset_path))
     if spec is None or spec.loader is None:
         raise ImportError(f"Unable to load dataset module from: {dataset_path}")
