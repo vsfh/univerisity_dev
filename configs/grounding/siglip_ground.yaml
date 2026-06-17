@@ -7,5 +7,8 @@ model:
   use_heatmap: true
   use_text: false
 
+train:
+  batch_size: 32
+
 eval:
   output_dir: eval_results/grounding/siglip_ground

@@ -7,5 +7,8 @@ model:
   use_heatmap: false
   use_text: false
 
+train:
+  batch_size: 4
+
 eval:
   output_dir: eval_results/grounding/trogeolite
