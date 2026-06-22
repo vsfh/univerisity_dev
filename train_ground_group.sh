@@ -15,7 +15,7 @@ while [ "$#" -gt 0 ]; do
             ;;
         --gpus)
             if [ "$#" -lt 2 ]; then
-                echo "Missing value for --gpus, e.g. --gpus 0,1,2,3" >&2
+                echo "Missing value for --gpus, e.g. --gpus 0,1,2" >&2
                 exit 2
             fi
             GPUS_CSV="$2"
@@ -34,10 +34,11 @@ done
 
 IFS=',' read -r -a GPUS <<< "$GPUS_CSV"
 if [ "${#GPUS[@]}" -eq 0 ] || [ -z "${GPUS[0]}" ]; then
-    echo "No GPUs provided. Use --gpus 0,1 or set CUDA_VISIBLE_DEVICES." >&2
+    echo "No GPUs provided. Use --gpus 0,1,2 or set CUDA_VISIBLE_DEVICES." >&2
     exit 2
 fi
 NUM_GPUS="${#GPUS[@]}"
+FIRST_GPU="${GPUS[0]}"
 
 CONFIGS=(
     "configs/grounding/smgeo.yaml"
@@ -57,74 +58,52 @@ FINAL_JSON="${SUMMARY_DIR}/group_summary.json"
 mkdir -p "$SUMMARY_DIR"
 : > "$SUMMARY_PATH"
 
-run_worker() {
-    local WORKER_ID="$1"
-    local GPU_ID="$2"
-    local WORKER_SUMMARY="${SUMMARY_DIR}/worker_${WORKER_ID}.jsonl"
-    : > "$WORKER_SUMMARY"
+echo "Running ${#CONFIGS[@]} grounding configs sequentially on ${NUM_GPUS} GPU(s): ${GPUS_CSV}"
 
-    local CONFIG_INDEX
-    for CONFIG_INDEX in "${!CONFIGS[@]}"; do
-        if [ $((CONFIG_INDEX % NUM_GPUS)) -ne "$WORKER_ID" ]; then
-            continue
-        fi
+for CONFIG_INDEX in "${!CONFIGS[@]}"; do
+    CONFIG_PATH="${CONFIGS[$CONFIG_INDEX]}"
+    echo "============================================================"
+    echo "Running grounding config on ${NUM_GPUS} GPU(s): ${CONFIG_PATH}"
+    echo "Visible physical GPUs: ${GPUS_CSV}"
+    echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "============================================================"
 
-        local CONFIG_PATH="${CONFIGS[$CONFIG_INDEX]}"
-        echo "============================================================"
-        echo "Worker ${WORKER_ID}/${NUM_GPUS} on GPU ${GPU_ID}: ${CONFIG_PATH}"
-        echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "============================================================"
-
-        local TRAIN_STATUS="ok"
-        local EVAL_STATUS="ok"
-        local TRAIN_ARGS=("${EXTRA_ARGS[@]}")
-        local EVAL_ARGS=("${EXTRA_ARGS[@]}")
-        if [ "$DRY_RUN" -eq 1 ]; then
-            TRAIN_ARGS+=("--dry-run")
-            EVAL_ARGS+=("--dry-run")
-        fi
-
-        CUDA_VISIBLE_DEVICES="$GPU_ID" python grounding/train.py --config "$CONFIG_PATH" --device cuda:0 "${TRAIN_ARGS[@]}"
-        if [ "$?" -ne 0 ]; then
-            TRAIN_STATUS="failed"
-        fi
-
-        CUDA_VISIBLE_DEVICES="$GPU_ID" python grounding/eval.py --config "$CONFIG_PATH" --device cuda:0 "${EVAL_ARGS[@]}"
-        if [ "$?" -ne 0 ]; then
-            EVAL_STATUS="failed"
-        fi
-
-        printf '{"config_index":%s,"config":"%s","gpu":"%s","worker_id":%s,"train_status":"%s","eval_status":"%s"}\n' \
-            "$CONFIG_INDEX" "$CONFIG_PATH" "$GPU_ID" "$WORKER_ID" "$TRAIN_STATUS" "$EVAL_STATUS" >> "$WORKER_SUMMARY"
-
-        if [ "$TRAIN_STATUS" = "failed" ] || [ "$EVAL_STATUS" = "failed" ]; then
-            echo "Config failed; worker ${WORKER_ID} continues: ${CONFIG_PATH}"
-            continue
-        fi
-    done
-}
-
-echo "Running ${#CONFIGS[@]} grounding configs on ${NUM_GPUS} GPU(s): ${GPUS_CSV}"
-PIDS=()
-for WORKER_ID in "${!GPUS[@]}"; do
-    GPU_ID="${GPUS[$WORKER_ID]}"
-    run_worker "$WORKER_ID" "$GPU_ID" &
-    PIDS+=("$!")
-done
-
-EXIT_STATUS=0
-for PID in "${PIDS[@]}"; do
-    wait "$PID"
-    STATUS="$?"
-    if [ "$STATUS" -ne 0 ]; then
-        EXIT_STATUS="$STATUS"
+    TRAIN_STATUS="ok"
+    EVAL_STATUS="ok"
+    TRAIN_ARGS=("${EXTRA_ARGS[@]}")
+    EVAL_ARGS=("${EXTRA_ARGS[@]}")
+    if [ "$DRY_RUN" -eq 1 ]; then
+        TRAIN_ARGS+=("--dry-run")
+        EVAL_ARGS+=("--dry-run")
     fi
-done
 
-for WORKER_ID in "${!GPUS[@]}"; do
-    WORKER_SUMMARY="${SUMMARY_DIR}/worker_${WORKER_ID}.jsonl"
-    if [ -f "$WORKER_SUMMARY" ]; then
-        cat "$WORKER_SUMMARY" >> "$SUMMARY_PATH"
+    MASTER_PORT=$((29500 + CONFIG_INDEX))
+    CUDA_VISIBLE_DEVICES="$GPUS_CSV" python -m torch.distributed.run \
+        --master_addr 127.0.0.1 \
+        --master_port "$MASTER_PORT" \
+        --nproc_per_node="$NUM_GPUS" \
+        grounding/train.py \
+        --config "$CONFIG_PATH" \
+        --device cuda:0 \
+        "${TRAIN_ARGS[@]}"
+    if [ "$?" -ne 0 ]; then
+        TRAIN_STATUS="failed"
+    fi
+
+    CUDA_VISIBLE_DEVICES="$FIRST_GPU" python grounding/eval.py \
+        --config "$CONFIG_PATH" \
+        --device cuda:0 \
+        "${EVAL_ARGS[@]}"
+    if [ "$?" -ne 0 ]; then
+        EVAL_STATUS="failed"
+    fi
+
+    printf '{"config_index":%s,"config":"%s","gpus":"%s","num_gpus":%s,"train_status":"%s","eval_status":"%s"}\n' \
+        "$CONFIG_INDEX" "$CONFIG_PATH" "$GPUS_CSV" "$NUM_GPUS" "$TRAIN_STATUS" "$EVAL_STATUS" >> "$SUMMARY_PATH"
+
+    if [ "$TRAIN_STATUS" = "failed" ] || [ "$EVAL_STATUS" = "failed" ]; then
+        echo "Config failed; continue to next config: ${CONFIG_PATH}"
+        continue
     fi
 done
 
@@ -165,5 +144,3 @@ items.sort(key=lambda item: int(item.get("config_index", 0)))
 final_json.write_text(json.dumps(items, indent=2, sort_keys=True), encoding="utf-8")
 print(f"Wrote {final_json}")
 PY
-
-exit "$EXIT_STATUS"

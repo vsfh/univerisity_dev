@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from grounding.losses import build_geo_features, decode_anchor_prediction
+from grounding.legacy.train_sm import decode_anchor_free
 
 
 @dataclass
@@ -69,7 +70,12 @@ class SMGeoAdapter(BaseAdapter):
     def forward(self, batch: Dict[str, Any], device: torch.device) -> GroundingOutput:
         target = batch["target_pixel_values"].to(device, non_blocking=True)
         search = batch["search_pixel_values"].to(device, non_blocking=True)
-        pred_bbox = self.model.bbox_forward(target, search)
+        heatmap_logits, bbox_raw, _ = self.model(target, search)
+        pred_bbox = decode_anchor_free(
+            heatmap_logits,
+            bbox_raw,
+            (search.shape[-1], search.shape[-2]),
+        )
         return GroundingOutput(
             device=target.device,
             image_wh=(search.shape[-1], search.shape[-2]),

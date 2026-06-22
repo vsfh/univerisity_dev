@@ -8,7 +8,7 @@ model:
   use_text: false
 
 train:
-  batch_size: 32
+  batch_size: 48
 
 eval:
   output_dir: eval_results/grounding/siglip2_heat
