@@ -127,12 +127,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", required=True)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-steps", type=int, default=0)
+    parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
+    if args.device:
+        cfg["train"]["device"] = args.device
     result = train(cfg, dry_run=args.dry_run, max_steps=args.max_steps)
     print(result)
 

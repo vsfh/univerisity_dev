@@ -84,12 +84,12 @@ run_worker() {
             EVAL_ARGS+=("--dry-run")
         fi
 
-        CUDA_VISIBLE_DEVICES="$GPU_ID" python grounding/train.py --config "$CONFIG_PATH" "${TRAIN_ARGS[@]}"
+        CUDA_VISIBLE_DEVICES="$GPU_ID" python grounding/train.py --config "$CONFIG_PATH" --device cuda:0 "${TRAIN_ARGS[@]}"
         if [ "$?" -ne 0 ]; then
             TRAIN_STATUS="failed"
         fi
 
-        CUDA_VISIBLE_DEVICES="$GPU_ID" python grounding/eval.py --config "$CONFIG_PATH" "${EVAL_ARGS[@]}"
+        CUDA_VISIBLE_DEVICES="$GPU_ID" python grounding/eval.py --config "$CONFIG_PATH" --device cuda:0 "${EVAL_ARGS[@]}"
         if [ "$?" -ne 0 ]; then
             EVAL_STATUS="failed"
         fi
