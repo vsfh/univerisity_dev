@@ -416,6 +416,127 @@ def download_qwen_3_6_35b_a3b_fp8(
                 os.environ["HF_HUB_DISABLE_XET"] = previous_disable_xet
 
 
+def download_qwen_3_6_35b_a3b(
+    cache_dir=custom_cache_path,
+    use_china_mirror=True,
+    mirror_endpoint="https://hf-mirror.com",
+    revision=None,
+    verify_load=False,
+    disable_xet=True,
+    max_workers=1,
+    download_timeout=60,
+    direct_fallback=True,
+):
+    """
+    Download Qwen/Qwen3.6-35B-A3B into the local Hugging Face cache.
+
+    Args:
+        cache_dir (str): Target HF cache directory.
+        use_china_mirror (bool): Whether to use a China mirror endpoint.
+        mirror_endpoint (str): Mirror endpoint, e.g. https://hf-mirror.com.
+        revision (str|None): Optional model revision.
+        verify_load (bool): If True, try to load the processor and model class.
+        disable_xet (bool): Disable HF Xet transport and use regular resumable HTTP.
+        max_workers (int): Number of snapshot download workers.
+        download_timeout (int): Per-request HF Hub download timeout in seconds.
+        direct_fallback (bool): If snapshot_download fails on mirror metadata,
+            resume files directly from /resolve URLs into a local snapshot.
+
+    Returns:
+        dict: Metadata including local snapshot directory.
+    """
+    model_id = "Qwen/Qwen3.6-35B-A3B"
+    os.makedirs(cache_dir, exist_ok=True)
+
+    os.environ["HF_HOME"] = cache_dir
+    os.environ["HUGGINGFACE_HUB_CACHE"] = cache_dir
+    os.environ["TRANSFORMERS_CACHE"] = cache_dir
+
+    previous_endpoint = os.environ.get("HF_ENDPOINT")
+    previous_disable_xet = os.environ.get("HF_HUB_DISABLE_XET")
+    previous_download_timeout = os.environ.get("HF_HUB_DOWNLOAD_TIMEOUT")
+
+    os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = str(int(download_timeout))
+    if disable_xet:
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+    if use_china_mirror:
+        os.environ["HF_ENDPOINT"] = mirror_endpoint.rstrip("/")
+
+    from huggingface_hub import snapshot_download
+
+    try:
+        print(f"Downloading {model_id} to cache: {cache_dir}")
+        if use_china_mirror:
+            print(f"Using HF mirror endpoint: {os.environ['HF_ENDPOINT']}")
+        if disable_xet:
+            print("HF Xet transport disabled: HF_HUB_DISABLE_XET=1")
+        print(f"HF Hub download timeout: {os.environ['HF_HUB_DOWNLOAD_TIMEOUT']}s")
+        print(f"Snapshot max_workers: {int(max_workers)}")
+
+        try:
+            snapshot_dir = snapshot_download(
+                repo_id=model_id,
+                cache_dir=cache_dir,
+                revision=revision,
+                resume_download=True,
+                max_workers=int(max_workers),
+            )
+        except Exception as exc:
+            if not direct_fallback:
+                raise
+            print(f"snapshot_download failed: {exc}")
+            print("Trying direct resumable fallback for Qwen files...")
+            snapshot_dir = _download_repo_files_direct(
+                cache_dir=cache_dir,
+                model_id=model_id,
+                endpoint=os.environ.get("HF_ENDPOINT", "https://huggingface.co"),
+                revision=revision or "main",
+                timeout=int(download_timeout),
+            )
+
+        result = {
+            "model_id": model_id,
+            "cache_dir": cache_dir,
+            "snapshot_dir": snapshot_dir,
+            "hf_endpoint": os.environ.get("HF_ENDPOINT", "https://huggingface.co"),
+        }
+
+        if verify_load:
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            _ = AutoTokenizer.from_pretrained(
+                model_id,
+                cache_dir=cache_dir,
+                trust_remote_code=True,
+            )
+            _ = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                cache_dir=cache_dir,
+                dtype="auto",
+                device_map="auto",
+                trust_remote_code=True,
+            )
+            result["verify_load"] = True
+
+        print(f"Download completed: {snapshot_dir}")
+        return result
+    finally:
+        if use_china_mirror:
+            if previous_endpoint is None:
+                os.environ.pop("HF_ENDPOINT", None)
+            else:
+                os.environ["HF_ENDPOINT"] = previous_endpoint
+        if previous_download_timeout is None:
+            os.environ.pop("HF_HUB_DOWNLOAD_TIMEOUT", None)
+        else:
+            os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = previous_download_timeout
+        if disable_xet:
+            if previous_disable_xet is None:
+                os.environ.pop("HF_HUB_DISABLE_XET", None)
+            else:
+                os.environ["HF_HUB_DISABLE_XET"] = previous_disable_xet
+
+
 def _gemma_cache_root(cache_dir):
     return Path(cache_dir) / "models--google--gemma-4-31B-it"
 

@@ -8,7 +8,7 @@ model:
   use_text: false
 
 train:
-  batch_size: 8
+  batch_size: 16
 
 eval:
   output_dir: eval_results/grounding/det

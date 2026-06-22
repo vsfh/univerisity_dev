@@ -30,7 +30,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "weight_decay": 1.0e-4,
         "amp": True,
         "grad_clip_norm": 1.0,
-        "device": "cuda:0",
+        "device": "cuda:1",
     },
     "loss": {
         "bbox_weight": 1.0,

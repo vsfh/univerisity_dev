@@ -31,8 +31,7 @@ DEFAULT_ENABLE_TIMING_LOG = False
 DEFAULT_TIMING_LOG_INTERVAL = 200
 DEFAULT_MODEL_NAME = "google/siglip2-base-patch16-224"
 DEFAULT_CACHE_DIR = "/media/data1/feihong/hf_cache"
-# TEXT_DESCRIPTION_FILE = "gemma_5_28_description.json"
-TEXT_DESCRIPTION_FILE = "qwen_6_7_description.json"
+TEXT_DESCRIPTION_FILE = "qwen_6_19_description.json"
 
 TRAIN_HEIGHT_TO_BOX_SIZE = {
 	150: 330//2,
@@ -657,29 +656,65 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			return candidate_2
 		return None
 
-	def _load_height_descriptions(self, drone_dir: Path) -> Optional[Dict[int, str]]:
-		text_path = drone_dir / TEXT_DESCRIPTION_FILE
+	def _load_height_text_options(self, text_path: Path) -> Optional[Dict[int, List[str]]]:
 		if not text_path.exists():
 			return None
 
 		with open(text_path, "r", encoding="utf-8") as f:
 			payload = json.load(f)
 
-		descriptions = payload.get("descriptions")
-		if not isinstance(descriptions, dict):
+		description_segments = payload.get("description_segments")
+		if not isinstance(description_segments, dict):
 			return None
 
-		height_descriptions: Dict[int, str] = {}
-		for raw_height, raw_text in descriptions.items():
+		height_to_texts: Dict[int, List[str]] = {}
+		for raw_height, raw_segments in description_segments.items():
 			height = _safe_int(str(raw_height))
-			if height is None or not isinstance(raw_text, str):
+			if height is None or not isinstance(raw_segments, list):
 				continue
-			text = raw_text.strip()
-			if text:
-				height_descriptions[height] = text
-		if not height_descriptions:
+			indexed_texts: List[Tuple[int, str]] = []
+			for raw_segment in raw_segments:
+				if not isinstance(raw_segment, dict):
+					continue
+				raw_text = raw_segment.get("text")
+				if not isinstance(raw_text, str):
+					continue
+				text = raw_text.strip()
+				if not text:
+					continue
+				index = raw_segment.get("index")
+				if not isinstance(index, int):
+					index = len(indexed_texts) + 1
+				indexed_texts.append((index, text))
+			options: List[str] = []
+			for _, text in sorted(indexed_texts, key=lambda item: item[0]):
+				if text not in options:
+					options.append(text)
+			if options:
+				height_to_texts[height] = options
+		if not height_to_texts:
 			return None
-		return height_descriptions
+		return height_to_texts
+
+	def _load_random_height_descriptions(
+		self,
+		drone_dir: Path,
+	) -> Optional[Dict[int, List[str]]]:
+		return self._load_height_text_options(drone_dir / TEXT_DESCRIPTION_FILE)
+
+	def _choose_sample_text(
+		self,
+		sample: Dict[str, Any],
+		rng: Optional[random.Random] = None,
+	) -> str:
+		text_options = sample.get("text_options")
+		if isinstance(text_options, list) and text_options:
+			chooser = rng if rng is not None else random
+			return chooser.choice(text_options)
+		text = sample.get("text")
+		if isinstance(text, str) and text:
+			return text
+		raise ValueError("Sample does not contain usable text.")
 
 	def _build_samples(self) -> List[Dict[str, Any]]:
 		samples: List[Dict[str, Any]] = []
@@ -701,8 +736,8 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			if drone_dir is None:
 				continue
 
-			height_descriptions = self._load_height_descriptions(drone_dir)
-			if height_descriptions is None:
+			height_text_options = self._load_random_height_descriptions(drone_dir)
+			if height_text_options is None:
 				continue
 
 			sat_bbox_dict: Dict[str, List[float]] = {}
@@ -726,8 +761,8 @@ class ShiftedSatelliteDroneDataset(Dataset):
 					continue
 				if int(angle) not in self.subset_angles:
 					continue
-				text = height_descriptions.get(int(height))
-				if text is None:
+				text_options = height_text_options.get(int(height))
+				if not text_options:
 					continue
 				# if str(angle).endswith("5"):
 				# 	continue
@@ -738,7 +773,8 @@ class ShiftedSatelliteDroneDataset(Dataset):
 					"satellite_id": sat_id_int,
 					"height": height,
 					"angle": angle,
-					"text": text,
+					"text": text_options[0],
+					"text_options": list(text_options),
 				}
 
 				if self.split in {"val", "test"}:
@@ -809,7 +845,7 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		row_idx = min(int(center_y * 3), 2)
 		index = row_idx * 3 + col_idx
 
-		input_ids, attention_mask = self._tokenize_text(sample["text"])
+		input_ids, attention_mask = self._tokenize_text(self._choose_sample_text(sample))
 		query_inputs = self.processor(images=query_image, return_tensors="pt")
 		search_inputs = self.processor_sat(
 			images=augmented_search_image,

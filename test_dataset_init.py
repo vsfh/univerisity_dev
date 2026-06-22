@@ -23,8 +23,14 @@ def _write_image(path: Path, size=(64, 64)) -> None:
 
 def _write_unified_text(drone_dir: Path, text: str = "test description") -> None:
     drone_dir.mkdir(parents=True, exist_ok=True)
-    payload = {"unified_description": text}
-    with open(drone_dir / "unified_description.json", "w", encoding="utf-8") as f:
+    payload = {
+        "description_segments": {
+            "150": [
+                {"index": 1, "text": text},
+            ]
+        }
+    }
+    with open(drone_dir / "qwen_6_19_description.json", "w", encoding="utf-8") as f:
         json.dump(payload, f)
 
 

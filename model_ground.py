@@ -515,14 +515,52 @@ class Encoder_ground(Encoder_heat):
         angle: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ):
+        del input_ids, attention_mask
         anchor_pixel_values = torch.nn.functional.interpolate(anchor_pixel_values, size=(224, 224), mode="bilinear", align_corners=False)
+        batch_size = anchor_pixel_values.shape[0]
+        self._validate_geo(angle, batch_size)
 
-        return super().forward(
-            anchor_pixel_values=anchor_pixel_values,
-            search_pixel_values=search_pixel_values,
-            input_ids=input_ids,
-            angle=angle,
-            attention_mask=attention_mask,
+        anchor_output = self._vision_forward(anchor_pixel_values)
+        anchor_feats = anchor_output.last_hidden_state
+        if anchor_feats.ndim != 3 or anchor_feats.shape[0] != batch_size or anchor_feats.shape[2] != self.feature_dim:
+            raise ValueError(f"Unexpected anchor feature shape: {tuple(anchor_feats.shape)}.")
+
+        anchor_pooler = self.attnPooling(anchor_feats, 1)[:, 0, :]
+        anchor_pooler = F.normalize(anchor_pooler, p=2, dim=1)
+        text_feats = None
+        fused_feats = None
+
+        sat_output = self._vision_forward(
+            search_pixel_values,
+            interpolate_pos_encoding=True,
+        )
+        sat_feats = sat_output.last_hidden_state
+        if sat_feats.ndim != 3 or sat_feats.shape[0] != batch_size or sat_feats.shape[2] != self.feature_dim:
+            raise ValueError(f"Unexpected satellite feature shape: {tuple(sat_feats.shape)}.")
+
+        sat_feature_2d_pool = self.attnPooling(sat_feats, 9)
+        grid_h, grid_w = _infer_patch_grid(
+            sat_feats.shape[1],
+            search_pixel_values.shape[-2],
+            search_pixel_values.shape[-1],
+        )
+        sat_features_2d = sat_feats.permute(0, 2, 1).reshape(batch_size, self.feature_dim, grid_h, grid_w)
+
+        pred_anchor, heatmap_out = self._bbox_forward_from_anchor_feats(
+            anchor_feats,
+            sat_features_2d,
+            angle,
+            detach_anchor=True,
+        )
+
+        return (
+            pred_anchor,
+            None,
+            text_feats,
+            anchor_pooler,
+            sat_feature_2d_pool,
+            fused_feats,
+            heatmap_out,
         )
     def bbox_forward(
         self,

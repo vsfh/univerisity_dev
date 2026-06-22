@@ -39,6 +39,8 @@ COMMON_ARGS=(
 #     --no-encoder-heat-use-text \
 #     "${COMMON_ARGS[@]}" \
 #     "$@"
+# --checkpoint "/media/data1/feihong/ckpt/model_test_geo_input_ids/${CHECKPOINT_NAME}" \
+
 
 echo "============================================================"
 echo "Testing Encoder_test with geo and input_ids"
@@ -46,7 +48,7 @@ echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================"
 python test_unify.py \
     --model-types encoder_test \
-    --checkpoint "/media/data1/feihong/ckpt/model_test_geo_input_ids/${CHECKPOINT_NAME}" \
+    --checkpoint "/media/data1/feihong/ckpt/model_bbox_only/${CHECKPOINT_NAME}" \
     --encoder-heat-use-angle \
     --no-encoder-heat-use-text \
     "${COMMON_ARGS[@]}" \
