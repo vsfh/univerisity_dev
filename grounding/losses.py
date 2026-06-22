@@ -110,6 +110,94 @@ def heatmap_loss_fn(
     return loss
 
 
+def build_smgeo_heatmap_target(
+    target_bbox: torch.Tensor,
+    feature_hw: Tuple[int, int],
+    image_wh: Tuple[int, int],
+    sigma: float,
+) -> torch.Tensor:
+    batch_size = target_bbox.shape[0]
+    feat_h, feat_w = int(feature_hw[0]), int(feature_hw[1])
+    image_w, image_h = float(image_wh[0]), float(image_wh[1])
+    center_x = ((target_bbox[:, 0] + target_bbox[:, 2]) * 0.5 / image_w) * feat_w
+    center_y = ((target_bbox[:, 1] + target_bbox[:, 3]) * 0.5 / image_h) * feat_h
+
+    grid_y = torch.arange(feat_h, device=target_bbox.device, dtype=target_bbox.dtype).view(1, feat_h, 1)
+    grid_x = torch.arange(feat_w, device=target_bbox.device, dtype=target_bbox.dtype).view(1, 1, feat_w)
+    heatmap = torch.exp(
+        -0.5
+        * (
+            (grid_x - center_x.view(batch_size, 1, 1)).square()
+            + (grid_y - center_y.view(batch_size, 1, 1)).square()
+        )
+        / max(float(sigma) ** 2, 1e-6)
+    )
+    return heatmap.unsqueeze(1).clamp(0.0, 1.0)
+
+
+def build_smgeo_bbox_target(
+    target_bbox: torch.Tensor,
+    feature_hw: Tuple[int, int],
+    image_wh: Tuple[int, int],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    feat_h, feat_w = int(feature_hw[0]), int(feature_hw[1])
+    image_w, image_h = float(image_wh[0]), float(image_wh[1])
+
+    cx = ((target_bbox[:, 0] + target_bbox[:, 2]) * 0.5 / image_w) * feat_w
+    cy = ((target_bbox[:, 1] + target_bbox[:, 3]) * 0.5 / image_h) * feat_h
+    gi = cx.floor().long().clamp(0, feat_w - 1)
+    gj = cy.floor().long().clamp(0, feat_h - 1)
+    frac_x = cx - gi.to(dtype=target_bbox.dtype)
+    frac_y = cy - gj.to(dtype=target_bbox.dtype)
+    box_w = (target_bbox[:, 2] - target_bbox[:, 0]).clamp_min(1.0) / image_w
+    box_h = (target_bbox[:, 3] - target_bbox[:, 1]).clamp_min(1.0) / image_h
+    return torch.stack([frac_x, frac_y, box_w, box_h], dim=1), gi, gj
+
+
+def smgeo_anchor_free_loss(
+    heatmap_logits: torch.Tensor,
+    bbox_raw: torch.Tensor,
+    target_bbox: torch.Tensor,
+    image_wh: Tuple[int, int],
+    heatmap_sigma: float = 1.5,
+    focal_alpha: float = 2.0,
+    focal_beta: float = 4.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    batch_size, _, feat_h, feat_w = heatmap_logits.shape
+    heatmap_target = build_smgeo_heatmap_target(
+        target_bbox,
+        feature_hw=(feat_h, feat_w),
+        image_wh=image_wh,
+        sigma=heatmap_sigma,
+    )
+    bbox_target, gi, gj = build_smgeo_bbox_target(target_bbox, (feat_h, feat_w), image_wh)
+    batch_idx = torch.arange(batch_size, device=target_bbox.device)
+
+    pred_prob = torch.sigmoid(heatmap_logits)
+    heatmap_target = heatmap_target.clone()
+    heatmap_target[batch_idx, 0, gj, gi] = 1.0
+    pos_mask = heatmap_target.eq(1.0)
+    neg_mask = heatmap_target.lt(1.0)
+    pos_loss = -torch.log(pred_prob.clamp_min(1e-6)) * (1.0 - pred_prob).pow(focal_alpha)
+    neg_loss = (
+        -torch.log((1.0 - pred_prob).clamp_min(1e-6))
+        * pred_prob.pow(focal_alpha)
+        * (1.0 - heatmap_target).pow(focal_beta)
+    )
+    heatmap_loss = (pos_loss[pos_mask].sum() + neg_loss[neg_mask].sum()) / pos_mask.sum().clamp_min(1)
+
+    selected_bbox = bbox_raw[batch_idx, :, gj, gi]
+    selected_bbox = torch.cat(
+        [
+            selected_bbox[:, :2].sigmoid(),
+            selected_bbox[:, 2:4].sigmoid(),
+        ],
+        dim=1,
+    )
+    bbox_loss = F.l1_loss(selected_bbox, bbox_target)
+    return heatmap_loss, bbox_loss
+
+
 def add_heatmap_to_confidence(
     pred_anchor: torch.Tensor,
     heatmap: Optional[torch.Tensor],
@@ -127,6 +215,24 @@ def compute_grounding_loss(output: Any, batch: Dict[str, Any], anchors_full: tor
     target_bbox = batch["bbox"].to(output.device)
     image_wh = output.image_wh
     pred_anchor = output.pred_anchor
+
+    if cfg["model"]["type"] == "smgeo" and output.heatmap is not None and output.bbox_raw is not None:
+        heatmap_loss, bbox_loss = smgeo_anchor_free_loss(
+            output.heatmap,
+            output.bbox_raw,
+            target_bbox,
+            image_wh,
+            heatmap_sigma=float(cfg["loss"].get("smgeo_heatmap_sigma", 1.5)),
+        )
+        moe_entropy = output.moe_entropy
+        moe_loss = heatmap_loss.new_zeros(()) if moe_entropy is None else -moe_entropy.to(heatmap_loss.device).mean()
+        total = (
+            heatmap_loss
+            + float(cfg["loss"]["bbox_weight"]) * bbox_loss
+            + float(cfg["loss"].get("moe_entropy_weight", 0.0)) * moe_loss
+        )
+        zero = bbox_loss.new_zeros(())
+        return GroundingLoss(total=total, bbox=bbox_loss, geo=bbox_loss, cls=zero, heatmap=heatmap_loss)
 
     if pred_anchor is None:
         pred_bbox = output.pred_bbox

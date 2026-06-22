@@ -14,6 +14,8 @@ class GroundingOutput:
     pred_anchor: Optional[torch.Tensor] = None
     pred_bbox: Optional[torch.Tensor] = None
     heatmap: Optional[torch.Tensor] = None
+    bbox_raw: Optional[torch.Tensor] = None
+    moe_entropy: Optional[torch.Tensor] = None
 
 
 class BaseAdapter:
@@ -70,7 +72,7 @@ class SMGeoAdapter(BaseAdapter):
     def forward(self, batch: Dict[str, Any], device: torch.device) -> GroundingOutput:
         target = batch["target_pixel_values"].to(device, non_blocking=True)
         search = batch["search_pixel_values"].to(device, non_blocking=True)
-        heatmap_logits, bbox_raw, _ = self.model(target, search)
+        heatmap_logits, bbox_raw, moe_entropy = self.model(target, search)
         pred_bbox = decode_anchor_free(
             heatmap_logits,
             bbox_raw,
@@ -80,6 +82,9 @@ class SMGeoAdapter(BaseAdapter):
             device=target.device,
             image_wh=(search.shape[-1], search.shape[-2]),
             pred_bbox=pred_bbox,
+            heatmap=heatmap_logits,
+            bbox_raw=bbox_raw,
+            moe_entropy=moe_entropy,
         )
 
 

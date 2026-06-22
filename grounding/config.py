@@ -39,6 +39,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "heatmap_loss_type": ["mse", "cross_entropy"],
         "heatmap_bbox_center_edge_value": 0.2,
         "heatmap_bbox_center_log_scale": 9.0,
+        "smgeo_heatmap_sigma": 1.5,
+        "moe_entropy_weight": 0.0,
     },
     "eval": {
         "batch_size": 8,

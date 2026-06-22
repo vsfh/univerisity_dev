@@ -10,5 +10,10 @@ model:
 train:
   batch_size: 24
 
+loss:
+  bbox_weight: 5.0
+  smgeo_heatmap_sigma: 1.5
+  moe_entropy_weight: 0.01
+
 eval:
   output_dir: eval_results/grounding/smgeo
