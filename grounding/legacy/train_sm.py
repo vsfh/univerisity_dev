@@ -84,7 +84,7 @@ class DummyTokenizer:
 
 
 class PatchEmbed(nn.Module):
-    def __init__(self, in_channels=4, embed_dim=64, patch_size=8):
+    def __init__(self, in_channels=3, embed_dim=64, patch_size=8):
         super().__init__()
         self.in_channels = int(in_channels)
         self.proj = nn.Conv2d(
@@ -96,13 +96,6 @@ class PatchEmbed(nn.Module):
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
-        if x.shape[1] == 3 and self.in_channels == 4:
-            h, w = x.shape[-2:]
-            y = torch.linspace(-1.0, 1.0, h, device=x.device, dtype=x.dtype).view(1, 1, h, 1)
-            x_grid = torch.linspace(-1.0, 1.0, w, device=x.device, dtype=x.dtype).view(1, 1, 1, w)
-            extra = torch.exp(-0.5 * (x_grid.square() + y.square()) / (0.35 ** 2))
-            extra = extra.expand(x.shape[0], 1, h, w)
-            x = torch.cat([x, extra], dim=1)
         if x.shape[1] != self.in_channels:
             raise ValueError(f"PatchEmbed expected {self.in_channels} channels, got {x.shape[1]}.")
         x = self.proj(x)
@@ -115,7 +108,7 @@ class PatchEmbed(nn.Module):
 class PatchEmbeds(nn.Module):
     def __init__(self, embed_dim: int, patch_size: int):
         super().__init__()
-        shared = PatchEmbed(4, embed_dim, patch_size=patch_size)
+        shared = PatchEmbed(3, embed_dim, patch_size=patch_size)
         self.query = shared
         self.sat = shared
 
@@ -478,6 +471,13 @@ def load_smgeo_pretrained(model: nn.Module, checkpoint_path: str) -> Dict[str, i
             skipped_missing += 1
             continue
         if tuple(value.shape) != tuple(model_state[clean_key].shape):
+            if clean_key == "backbone.patch_embeds.query.proj.weight":
+                fallback = state_dict.get("backbone.patch_embeds.sat.proj.weight")
+                if fallback is None:
+                    fallback = state_dict.get("module.backbone.patch_embeds.sat.proj.weight")
+                if fallback is not None and tuple(fallback.shape) == tuple(model_state[clean_key].shape):
+                    compatible_state[clean_key] = fallback
+                    continue
             skipped_shape += 1
             continue
         compatible_state[clean_key] = value
