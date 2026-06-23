@@ -75,7 +75,7 @@ class Config:
     NUM_WORKERS_VAL = 4
     NUM_WORKERS_EVAL = 8
     PIN_MEMORY = True
-    PERSISTENT_WORKERS = True
+    PERSISTENT_WORKERS = False
     PREFETCH_FACTOR = 4
     DROP_LAST_TRAIN = True
 
@@ -90,7 +90,10 @@ class Config:
     OPTIMIZE_OBJECTIVE = "combined"  # combined | img_text_only | bbox_only
     USE_HEATMAP_LOSS = True
     HEATMAP_LOSS_WEIGHT = 0.2
-    HEATMAP_LOSS_TYPE = ["mse", "cross_entropy"]  # mse | cross_entropy | weighted_bce
+    HEATMAP_LOSS_TYPE = ["mse", "cross_entropy", "focal"]  # mse | cross_entropy | weighted_bce | focal
+    HEATMAP_FOCAL_GAMMA = 2.0
+    HEATMAP_FOCAL_ALPHA = 0.25
+    HEATMAP_FOCAL_BETA = 0.75
     HEATMAP_TARGET_MODE = "bbox_center"  # center | bbox_aware | bbox_center
     HEATMAP_SIGMA = 1.5
     HEATMAP_RADIUS = 4.5
@@ -419,6 +422,8 @@ def parse_heatmap_loss_types(loss_type: Any) -> List[str]:
         "ce": "cross_entropy",
         "spatial_ce": "cross_entropy",
         "spatial_cross_entropy": "cross_entropy",
+        "smgeo": "focal",
+        "focal_loss": "focal",
     }
     for item in loss_types:
         item = str(item).strip().lower()
@@ -476,9 +481,27 @@ def heatmap_loss_fn(
             loss = loss + (bce_loss * weight).mean()
             continue
 
+        if loss_type == "focal":
+            pred_sigmoid = torch.sigmoid(heatmap_logits.float()).clamp(1e-4, 1.0 - 1e-4)
+            soft_target = heatmap_target.float()
+            gamma = float(Config.HEATMAP_FOCAL_GAMMA)
+
+            pos_loss = (
+                -torch.log(pred_sigmoid)
+                * (1.0 - pred_sigmoid).pow(gamma)
+                * soft_target
+            ).mean()
+            neg_loss = (
+                -torch.log(1.0 - pred_sigmoid)
+                * pred_sigmoid.pow(gamma)
+                * (1.0 - soft_target)
+            ).mean()
+            loss = loss + pos_loss + neg_loss
+            continue
+
         raise ValueError(
             f"Invalid HEATMAP_LOSS_TYPE={Config.HEATMAP_LOSS_TYPE}. "
-            "Choose from 'mse', 'cross_entropy', 'spatial_ce', or 'weighted_bce'."
+            "Choose from 'mse', 'cross_entropy', 'spatial_ce', 'weighted_bce', or 'focal'."
         )
 
     if return_target:
@@ -914,7 +937,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
-        mixed_precision="no",
+        mixed_precision="fp16" if Config.USE_AMP else "no",
         gradient_accumulation_steps=Config.GRAD_ACCUMULATION_STEPS,
         step_scheduler_with_optimizer=False,
         kwargs_handlers=[ddp_kwargs],
@@ -926,9 +949,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 
     exp_name = save_path.split("/")[-1] if save_path else "default_exp"
     writer = SummaryWriter(f"runs/{exp_name}") if accelerator.is_main_process else None
-    scaler = torch.amp.GradScaler(
-        "cuda", enabled=Config.USE_AMP and accelerator.device.type == "cuda"
-    )
 
     clearml_task = None
     clearml_logger = None
@@ -1028,9 +1048,9 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     soft_label = 0.01
     max_iou = 0
     min_info = 1000
-    amp_enabled = Config.USE_AMP and accelerator.device.type == "cuda"
 
     for epoch in range(Config.NUM_EPOCHS):
+        train_dataset.text_cycle_step = epoch
         model.train()
         total_loss = 0
         total_bbox_loss = 0
@@ -1074,7 +1094,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 target_bbox = batch["bbox"].to(accelerator.device, non_blocking=True)
                 geo = build_geo_features(batch, accelerator.device)
 
-                with torch.amp.autocast("cuda", enabled=amp_enabled):
+                with accelerator.autocast():
                     outputs = model(
                         target_pixel_values,
                         search_pixel_values,
@@ -1203,13 +1223,12 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                         retrieval_weight = 0.0
                         loss = retrieval_weight * image_retrieval_loss + bbox_weight * bbox_loss
 
-                optimizer.zero_grad(set_to_none=True)
-                scaler.scale(loss).backward()
-                if Config.GRAD_CLIP_NORM is not None and Config.GRAD_CLIP_NORM > 0:
-                    scaler.unscale_(optimizer)
-                    accelerator.clip_grad_norm_(trainable_params, Config.GRAD_CLIP_NORM)
-                scaler.step(optimizer)
-                scaler.update()
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    if Config.GRAD_CLIP_NORM is not None and Config.GRAD_CLIP_NORM > 0:
+                        accelerator.clip_grad_norm_(trainable_params, Config.GRAD_CLIP_NORM)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
 
             total_loss += loss.item()
             total_bbox_loss += bbox_loss.item()

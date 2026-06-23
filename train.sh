@@ -14,11 +14,13 @@ shift
 
 cd /media/data1/feihong/univerisity_dev
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0,1
 
 accelerate launch \
+    --multi_gpu \
+    --num_processes 2 \
     --mixed_precision fp16 \
-    --gradient_accumulation_steps 4 \
+    --gradient_accumulation_steps 1 \
     unified_siglip_supp.py \
     --config "$CONFIG_PATH" \
     "$@"

@@ -88,6 +88,11 @@ for CONFIG_INDEX in "${!CONFIGS[@]}"; do
         "${TRAIN_ARGS[@]}"
     if [ "$?" -ne 0 ]; then
         TRAIN_STATUS="failed"
+        EVAL_STATUS="skipped"
+        printf '{"config_index":%s,"config":"%s","gpus":"%s","num_gpus":%s,"train_status":"%s","eval_status":"%s"}\n' \
+            "$CONFIG_INDEX" "$CONFIG_PATH" "$GPUS_CSV" "$NUM_GPUS" "$TRAIN_STATUS" "$EVAL_STATUS" >> "$SUMMARY_PATH"
+        echo "Training failed; skip eval for this config: ${CONFIG_PATH}"
+        continue
     fi
 
     CUDA_VISIBLE_DEVICES="$FIRST_GPU" python grounding/eval.py \

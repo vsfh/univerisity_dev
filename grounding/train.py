@@ -7,8 +7,10 @@ from typing import Any, Dict
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
+from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
@@ -21,6 +23,7 @@ if str(ROOT) not in sys.path:
 from bbox.yolo_utils import get_tensor_anchors
 from dataset import ShiftedSatelliteDroneDataset
 from grounding.config import load_config
+from grounding.letterbox import black_fill_from_processor, letterbox_satellite_batch
 from grounding.losses import compute_grounding_loss
 from grounding.registry import build_model_and_adapter
 
@@ -127,12 +130,77 @@ def _save_checkpoint(model: torch.nn.Module, save_dir: str, name: str) -> str:
     return path
 
 
+def _normalize_for_writer(images: torch.Tensor) -> torch.Tensor:
+    images = images.detach().float().cpu()
+    images = images[:, :3]
+    image_min = images.amin(dim=(1, 2, 3), keepdim=True)
+    image_max = images.amax(dim=(1, 2, 3), keepdim=True)
+    return ((images - image_min) / (image_max - image_min).clamp_min(1e-6)).clamp(0.0, 1.0)
+
+
+def _draw_bbox(image: torch.Tensor, bbox: torch.Tensor, color: tuple[float, float, float]) -> torch.Tensor:
+    _, height, width = image.shape
+    x1, y1, x2, y2 = bbox.detach().float().cpu().tolist()
+    x1 = max(0, min(width - 1, int(round(x1))))
+    x2 = max(0, min(width - 1, int(round(x2))))
+    y1 = max(0, min(height - 1, int(round(y1))))
+    y2 = max(0, min(height - 1, int(round(y2))))
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    color_tensor = image.new_tensor(color).view(3, 1, 1)
+    thickness = max(2, min(height, width) // 160)
+    image[:, y1 : min(y1 + thickness, height), x1 : x2 + 1] = color_tensor
+    image[:, max(y2 - thickness + 1, 0) : y2 + 1, x1 : x2 + 1] = color_tensor
+    image[:, y1 : y2 + 1, x1 : min(x1 + thickness, width)] = color_tensor
+    image[:, y1 : y2 + 1, max(x2 - thickness + 1, 0) : x2 + 1] = color_tensor
+    return image
+
+
+def _prediction_visualizations(
+    batch: Dict[str, Any],
+    pred_bbox: torch.Tensor,
+    max_cases: int = 4,
+) -> torch.Tensor:
+    query = _normalize_for_writer(batch["target_pixel_values"][:max_cases])
+    search = _normalize_for_writer(batch["search_pixel_values"][:max_cases])
+    target_bbox = batch["bbox"][:max_cases].detach().float().cpu()
+    pred_bbox = pred_bbox[:max_cases].detach().float().cpu()
+
+    case_count = min(query.shape[0], search.shape[0], target_bbox.shape[0], pred_bbox.shape[0])
+    query = query[:case_count]
+    search = search[:case_count]
+    target_bbox = target_bbox[:case_count]
+    pred_bbox = pred_bbox[:case_count]
+
+    sat_h, sat_w = int(search.shape[-2]), int(search.shape[-1])
+    query_w = max(1, int(round(query.shape[-1] * sat_h / max(float(query.shape[-2]), 1.0))))
+    query = F.interpolate(query, size=(sat_h, query_w), mode="bilinear", align_corners=False)
+
+    images = []
+    for idx in range(case_count):
+        sat = search[idx].clone()
+        sat = _draw_bbox(sat, target_bbox[idx], (0.0, 1.0, 0.0))
+        sat = _draw_bbox(sat, pred_bbox[idx], (1.0, 0.0, 0.0))
+        canvas = torch.zeros((3, sat_h, query_w + sat_w), dtype=sat.dtype)
+        canvas[:, :, :query_w] = query[idx]
+        canvas[:, :, query_w:] = sat
+        images.append(canvas)
+    if not images:
+        return torch.empty((0, 3, sat_h, query_w + sat_w))
+    return torch.stack(images, dim=0)
+
+
 def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dict[str, Any]:
     if dry_run:
+        os.makedirs(cfg["save_dir"], exist_ok=True)
         return {"status": "dry_run", "save_dir": cfg["save_dir"], "config_path": cfg["config_path"]}
 
     device = _device_from_config(cfg)
     distributed = _init_distributed()
+    if _is_rank_zero(distributed):
+        os.makedirs(cfg["save_dir"], exist_ok=True)
     if distributed["enabled"] and device.type == "cuda":
         device = torch.device(f"cuda:{int(distributed['local_rank'])}")
     model, adapter = build_model_and_adapter(cfg)
@@ -147,6 +215,7 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
         adapter.model = model
     anchors_full = get_tensor_anchors(str(device))
     loader, sampler = _build_loader(cfg, "train", distributed)
+    letterbox_fill = black_fill_from_processor(loader.dataset.processor_sat)
     optimizer = AdamW(
         model.parameters(),
         lr=float(cfg["train"]["lr"]),
@@ -156,6 +225,9 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     grad_accumulation_steps = max(1, int(cfg["train"]["grad_accumulation_steps"]))
     grad_clip_norm = float(cfg["train"]["grad_clip_norm"])
+    writer = None
+    if _is_rank_zero(distributed):
+        writer = SummaryWriter(os.path.join("runs", "grounding", str(cfg["exp_name"])))
 
     global_step = 0
     try:
@@ -169,7 +241,16 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
                 desc=f"Epoch {epoch + 1}/{cfg['train']['epochs']}",
                 disable=not _is_rank_zero(distributed),
             )
+            epoch_totals = {
+                "total": 0.0,
+                "bbox": 0.0,
+                "geo": 0.0,
+                "cls": 0.0,
+                "heatmap": 0.0,
+            }
+            epoch_count = 0
             for batch_idx, batch in enumerate(progress):
+                batch, _ = letterbox_satellite_batch(batch, letterbox_fill)
                 with torch.amp.autocast("cuda", enabled=amp_enabled):
                     output = adapter.forward(batch, device)
                     losses = compute_grounding_loss(output, batch, anchors_full, cfg)
@@ -188,6 +269,13 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
 
                 global_step += 1
                 if _is_rank_zero(distributed):
+                    batch_n = int(batch["bbox"].shape[0])
+                    epoch_count += batch_n
+                    epoch_totals["total"] += float(losses.total.detach().item()) * batch_n
+                    epoch_totals["bbox"] += float(losses.bbox.detach().item()) * batch_n
+                    epoch_totals["geo"] += float(losses.geo.detach().item()) * batch_n
+                    epoch_totals["cls"] += float(losses.cls.detach().item()) * batch_n
+                    epoch_totals["heatmap"] += float(losses.heatmap.detach().item()) * batch_n
                     progress.set_postfix(
                         {
                             "loss": f"{losses.total.item():.4f}",
@@ -195,6 +283,18 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
                             "heatmap": f"{losses.heatmap.item():.4f}",
                         }
                     )
+                    if writer is not None:
+                        writer.add_scalar("Loss/train_step", losses.total.item(), global_step)
+                        writer.add_scalar("Loss/bbox_step", losses.bbox.item(), global_step)
+                        writer.add_scalar("Loss/geo_step", losses.geo.item(), global_step)
+                        writer.add_scalar("Loss/cls_step", losses.cls.item(), global_step)
+                        writer.add_scalar("Loss/heatmap_step", losses.heatmap.item(), global_step)
+                        if batch_idx == 0:
+                            with torch.no_grad():
+                                pred_bbox = adapter.decode(output, batch, anchors_full)
+                            images = _prediction_visualizations(batch, pred_bbox)
+                            if images.numel() > 0:
+                                writer.add_images("Train/predictions", images, epoch)
                 if should_stop:
                     if _is_rank_zero(distributed):
                         checkpoint = _save_checkpoint(model, cfg["save_dir"], "last.pth")
@@ -202,6 +302,12 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
                     return {"status": "max_steps", "steps": global_step}
 
             if _is_rank_zero(distributed):
+                if writer is not None and epoch_count > 0:
+                    writer.add_scalar("Loss/train_epoch", epoch_totals["total"] / epoch_count, epoch)
+                    writer.add_scalar("Loss/bbox_epoch", epoch_totals["bbox"] / epoch_count, epoch)
+                    writer.add_scalar("Loss/geo_epoch", epoch_totals["geo"] / epoch_count, epoch)
+                    writer.add_scalar("Loss/cls_epoch", epoch_totals["cls"] / epoch_count, epoch)
+                    writer.add_scalar("Loss/heatmap_epoch", epoch_totals["heatmap"] / epoch_count, epoch)
                 _save_checkpoint(model, cfg["save_dir"], "last.pth")
 
         if _is_rank_zero(distributed):
@@ -209,6 +315,8 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
             return {"status": "ok", "checkpoint": checkpoint, "steps": global_step}
         return {"status": "ok", "steps": global_step}
     finally:
+        if writer is not None:
+            writer.close()
         _cleanup_distributed(distributed)
 
 

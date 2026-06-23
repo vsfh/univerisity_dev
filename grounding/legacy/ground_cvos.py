@@ -338,8 +338,9 @@ class SampleGeoLite(nn.Module):
         super(SampleGeoLite, self).__init__()
 
         model_name = "convnext_base.fb_in22k_ft_in1k_384"
-        self.query_model = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
-        self.reference_model = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        base_model = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        self.query_model = base_model
+        self.reference_model = base_model
 
         self.cross_attention = SpatialTransformer(
             in_channels=emb_size, n_heads=12, d_head=64, depth=1, context_dim=emb_size
@@ -405,28 +406,37 @@ class LPNGeoLite(nn.Module):
         )
         self.geo_conditioner = GeoConditioner(emb_size)
 
+        hidden_dim = emb_size // 2
         self.fcn_out = nn.Sequential(
             nn.ConvTranspose2d(
                 in_channels=emb_size,
-                out_channels=emb_size // 2,
+                out_channels=hidden_dim,
                 kernel_size=4,
                 stride=2,
                 padding=1,
             ),
+            nn.BatchNorm2d(hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Conv2d(emb_size // 2, 9 * 5, kernel_size=1),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, 9 * 5, kernel_size=1),
         )
 
         self.coodrs_out = nn.Sequential(
             nn.ConvTranspose2d(
                 in_channels=emb_size,
-                out_channels=emb_size // 2,
+                out_channels=hidden_dim,
                 kernel_size=4,
                 stride=2,
                 padding=1,
             ),
+            nn.BatchNorm2d(hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Conv2d(emb_size // 2, 1, kernel_size=1),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, 1, kernel_size=1),
         )
 
     def forward(self, query_imgs, reference_imgs, geo=None):
@@ -539,7 +549,7 @@ class SiglipLite(nn.Module):
         return outbox, outbox
     
 class DetGeoLite(nn.Module):
-    """DetGeo based on original DetGeo architecture with ResNet-18 and Darknet."""
+    """DetGeo-style model using a shared ResNet-18 query/reference feature space."""
 
     def __init__(
         self,
@@ -550,11 +560,9 @@ class DetGeoLite(nn.Module):
     ):
         super(DetGeoLite, self).__init__()
 
-        self.query_resnet = MyResnet()
-
-        self.reference_darknet = Darknet(config_path=config_path, img_size=IMG_SIZE[0])
-        if os.path.exists(weights_path):
-            self.reference_darknet.load_weights(weights_path)
+        shared_resnet = MyResnet()
+        self.query_resnet = shared_resnet
+        self.reference_resnet = shared_resnet
 
         self.combine_clickptns_conv = ConvBatchNormReLU(
             4, 3, 1, 1, 0, 1, leaky=True, instance=use_instnorm
@@ -602,8 +610,7 @@ class DetGeoLite(nn.Module):
 
         query_fvisu = self.query_resnet(query_imgs)
 
-        reference_raw_fvisu = self.reference_darknet(reference_imgs)
-        reference_fvisu = reference_raw_fvisu[1]
+        reference_fvisu = self.reference_resnet(reference_imgs)
 
         query_fvisu = self.query_mapping_visu(query_fvisu)
         reference_fvisu = self.reference_mapping_visu(reference_fvisu)
@@ -634,8 +641,7 @@ class DetGeoLite(nn.Module):
 
         query_fvisu = self.query_resnet(query_imgs)
 
-        reference_raw_fvisu = self.reference_darknet(reference_imgs)
-        reference_fvisu = reference_raw_fvisu[1]
+        reference_fvisu = self.reference_resnet(reference_imgs)
 
         query_fvisu = self.query_mapping_visu(query_fvisu)
         reference_fvisu = self.reference_mapping_visu(reference_fvisu)

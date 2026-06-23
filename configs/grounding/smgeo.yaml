@@ -3,6 +3,9 @@ save_dir: /media/data1/feihong/ckpt/ground_sm
 
 model:
   type: smgeo
+  checkpoint: /media/data1/feihong/ckpt/SMGeo.pth
+  num_experts: 6
+  top_k: 2
   use_angle: true
   use_heatmap: false
   use_text: false
@@ -11,9 +14,10 @@ train:
   batch_size: 24
 
 loss:
-  bbox_weight: 5.0
-  smgeo_heatmap_sigma: 1.5
-  moe_entropy_weight: 0.01
+  heatmap_weight: 0.7
+  bbox_weight: 0.3
+  smgeo_heatmap_sigma: 2.0
+  moe_entropy_weight: 0.005
 
 eval:
   output_dir: eval_results/grounding/smgeo

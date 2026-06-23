@@ -115,8 +115,9 @@ class PatchEmbed(nn.Module):
 class PatchEmbeds(nn.Module):
     def __init__(self, embed_dim: int, patch_size: int):
         super().__init__()
-        self.query = PatchEmbed(4, embed_dim, patch_size=patch_size)
-        self.sat = PatchEmbed(3, embed_dim, patch_size=patch_size)
+        shared = PatchEmbed(4, embed_dim, patch_size=patch_size)
+        self.query = shared
+        self.sat = shared
 
 
 def window_partition(x, window_size: int):
@@ -534,42 +535,16 @@ def anchor_free_loss(
     gt_bbox,
     image_wh: Tuple[int, int],
     heatmap_sigma: float = HEATMAP_SIGMA,
-    focal_alpha: float = 2.0,
-    focal_beta: float = 4.0,
 ):
-    B, _, feat_h, feat_w = heatmap_logits.shape
-    heatmap_target = build_heatmap_target(
+    from grounding.losses import smgeo_anchor_free_loss
+
+    return smgeo_anchor_free_loss(
+        heatmap_logits,
+        bbox_raw,
         gt_bbox,
-        feature_hw=(feat_h, feat_w),
-        image_wh=image_wh,
-        sigma=heatmap_sigma,
+        image_wh,
+        heatmap_sigma=heatmap_sigma,
     )
-    bbox_target, gi, gj = build_bbox_target(gt_bbox, (feat_h, feat_w), image_wh)
-    batch_idx = torch.arange(B, device=gt_bbox.device)
-
-    pred_prob = torch.sigmoid(heatmap_logits)
-    heatmap_target = heatmap_target.clone()
-    heatmap_target[batch_idx, 0, gj, gi] = 1.0
-    pos_mask = heatmap_target.eq(1.0)
-    neg_mask = heatmap_target.lt(1.0)
-    pos_loss = -torch.log(pred_prob.clamp_min(1e-6)) * (1.0 - pred_prob).pow(focal_alpha)
-    neg_loss = (
-        -torch.log((1.0 - pred_prob).clamp_min(1e-6))
-        * pred_prob.pow(focal_alpha)
-        * (1.0 - heatmap_target).pow(focal_beta)
-    )
-    heatmap_loss = (pos_loss[pos_mask].sum() + neg_loss[neg_mask].sum()) / pos_mask.sum().clamp_min(1)
-
-    selected_bbox = bbox_raw[batch_idx, :, gj, gi]
-    selected_bbox = torch.cat(
-        [
-            selected_bbox[:, :2].sigmoid(),
-            selected_bbox[:, 2:4].sigmoid(),
-        ],
-        dim=1,
-    )
-    bbox_loss = F.l1_loss(selected_bbox, bbox_target)
-    return heatmap_loss, bbox_loss
 
 
 def decode_anchor_free(heatmap_logits, bbox_raw, image_wh: Tuple[int, int]):
@@ -582,12 +557,13 @@ def decode_anchor_free(heatmap_logits, bbox_raw, image_wh: Tuple[int, int]):
     batch_idx = torch.arange(B, device=heatmap_logits.device)
     selected_bbox = bbox_raw[batch_idx, :, gj, gi]
 
-    offsets = selected_bbox[:, :2].sigmoid()
-    sizes = selected_bbox[:, 2:4].sigmoid()
+    offsets = selected_bbox[:, :2]
+    widths = selected_bbox[:, 2].clamp(1e-2, float(feat_w))
+    heights = selected_bbox[:, 3].clamp(1e-2, float(feat_h))
     cx = (gi.to(selected_bbox.dtype) + offsets[:, 0]) / float(feat_w) * image_w
     cy = (gj.to(selected_bbox.dtype) + offsets[:, 1]) / float(feat_h) * image_h
-    bw = sizes[:, 0] * image_w
-    bh = sizes[:, 1] * image_h
+    bw = widths / float(feat_w) * image_w
+    bh = heights / float(feat_h) * image_h
 
     x1 = (cx - 0.5 * bw).clamp(0.0, image_w)
     y1 = (cy - 0.5 * bh).clamp(0.0, image_h)

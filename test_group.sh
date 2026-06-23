@@ -48,7 +48,7 @@ echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================"
 python test_unify.py \
     --model-types encoder_test \
-    --checkpoint "/media/data1/feihong/ckpt/model_bbox_only/${CHECKPOINT_NAME}" \
+    --checkpoint "/media/data1/feihong/ckpt/model_test_geo_input_ids/${CHECKPOINT_NAME}" \
     --encoder-heat-use-angle \
     --no-encoder-heat-use-text \
     "${COMMON_ARGS[@]}" \

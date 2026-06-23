@@ -5,11 +5,21 @@ import torch.nn as nn
 
 from grounding.adapters import BaseAdapter, DirectBboxAdapter, LegacyAnchorAdapter, SMGeoAdapter, SiglipTupleAdapter
 
+DEFAULT_SAMPLE4GEO_CHECKPOINT = "/media/data1/feihong/ckpt/Sample4Geo.pth"
+DEFAULT_SMGEO_CHECKPOINT = "/media/data1/feihong/ckpt/SMGeo.pth"
+
 
 @dataclass
 class ModelEntry:
     builder: Callable[[Dict[str, Any]], nn.Module]
     adapter_cls: Type[BaseAdapter]
+
+
+def _model_bool(model_cfg: Dict[str, Any], key: str, default: bool) -> bool:
+    value = model_cfg.get(key, default)
+    if isinstance(value, str):
+        return value.lower() not in {"0", "false", "no", "off"}
+    return bool(value)
 
 
 def _build_siglip2_heat(cfg: Dict[str, Any]) -> nn.Module:
@@ -46,25 +56,43 @@ def _build_siglip_ground(cfg: Dict[str, Any]) -> nn.Module:
 def _build_lpn(cfg: Dict[str, Any]) -> nn.Module:
     from grounding.legacy.ground_cvos import LPNGeoLite
 
-    return LPNGeoLite(pretrained=False)
+    model_cfg = cfg.get("model", {})
+    return LPNGeoLite(pretrained=_model_bool(model_cfg, "pretrained", True))
 
 
 def _build_sample4geo(cfg: Dict[str, Any]) -> nn.Module:
-    from grounding.legacy.ground_cvos import SampleGeoLite
+    from grounding.legacy.ground_cvos import SampleGeoLite, load_sample4geo_backbone
 
-    return SampleGeoLite(pretrained=False)
+    model_cfg = cfg.get("model", {})
+    checkpoint = model_cfg.get("checkpoint", DEFAULT_SAMPLE4GEO_CHECKPOINT)
+    model = SampleGeoLite(pretrained=False if checkpoint else _model_bool(model_cfg, "pretrained", True))
+    if checkpoint:
+        load_info = load_sample4geo_backbone(model, str(checkpoint))
+        print(f"Loaded Sample4Geo checkpoint from {checkpoint}: {load_info}")
+    return model
 
 
 def _build_smgeo(cfg: Dict[str, Any]) -> nn.Module:
-    from grounding.legacy.train_sm import SMGeoLite
+    from grounding.legacy.train_sm import SMGeoLite, load_smgeo_pretrained
 
-    return SMGeoLite()
+    model_cfg = cfg.get("model", {})
+    model = SMGeoLite(
+        num_experts=int(model_cfg.get("num_experts", 6)),
+        top_k=int(model_cfg.get("top_k", 2)),
+    )
+    checkpoint = model_cfg.get("checkpoint", DEFAULT_SMGEO_CHECKPOINT)
+    if checkpoint:
+        load_info = load_smgeo_pretrained(model, str(checkpoint))
+        print(f"Loaded SMGeo checkpoint from {checkpoint}: {load_info}")
+    return model
 
 
 def _build_ocg(cfg: Dict[str, Any]) -> nn.Module:
     from grounding.legacy.train_ocg import OCGNetLite
 
-    return OCGNetLite()
+    model_cfg = cfg.get("model", {})
+    pretrained = _model_bool(model_cfg, "pretrained_backbone", _model_bool(model_cfg, "pretrained", True))
+    return OCGNetLite(pretrained_backbone=pretrained)
 
 
 def _build_trogeolite(cfg: Dict[str, Any]) -> nn.Module:

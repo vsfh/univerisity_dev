@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 from bbox.yolo_utils import get_tensor_anchors
 from dataset import ShiftedSatelliteDroneDataset
 from grounding.config import load_config
+from grounding.letterbox import black_fill_from_processor, crop_letterbox_bbox, letterbox_satellite_batch
 from grounding.losses import compute_iou_metrics
 from grounding.registry import build_model_and_adapter
 
@@ -67,7 +68,7 @@ def _load_checkpoint(model: torch.nn.Module, path: str) -> None:
     state = torch.load(path, map_location="cpu")
     if isinstance(state, dict) and "model_state_dict" in state:
         state = state["model_state_dict"]
-    model.load_state_dict(state, strict=False)
+    model.load_state_dict(state, strict=True)
 
 
 def _average_metrics(total: Dict[str, float], count: int) -> Dict[str, float]:
@@ -97,6 +98,7 @@ def evaluate(cfg: Dict[str, Any], dry_run: bool = False, max_batches: int = 0) -
 
     _load_checkpoint(model, checkpoint)
     loader = _build_loader(cfg)
+    letterbox_fill = black_fill_from_processor(loader.dataset.processor_sat)
     model.eval()
     total = {
         "mean_iou": 0.0,
@@ -107,9 +109,12 @@ def evaluate(cfg: Dict[str, Any], dry_run: bool = False, max_batches: int = 0) -
     count = 0
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(loader, desc=f"Eval {cfg['exp_name']}")):
+            target_bbox = batch["bbox"].to(device)
+            batch, letterbox_meta = letterbox_satellite_batch(batch, letterbox_fill)
             output = adapter.forward(batch, device)
             pred_bbox = adapter.decode(output, batch, anchors_full)
-            target_bbox = batch["bbox"].to(pred_bbox.device)
+            pred_bbox = crop_letterbox_bbox(pred_bbox, letterbox_meta)
+            target_bbox = target_bbox.to(pred_bbox.device)
             metrics = compute_iou_metrics(pred_bbox, target_bbox)
             batch_n = int(target_bbox.shape[0])
             for key, value in metrics.items():

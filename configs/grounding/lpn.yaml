@@ -3,6 +3,7 @@ save_dir: /media/data1/feihong/ckpt/ground_lpn
 
 model:
   type: lpn
+  pretrained: true
   use_angle: true
   use_heatmap: false
   use_text: false

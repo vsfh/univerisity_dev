@@ -539,6 +539,7 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			"total": 0.0,
 		}
 		self._timing_count = 0
+		self.text_cycle_step = 0
 
 		self.train_satellite_root = Path(train_satellite_root)
 		self.test_satellite_root = Path(test_satellite_root)
@@ -707,10 +708,12 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		sample: Dict[str, Any],
 		rng: Optional[random.Random] = None,
 	) -> str:
+		del rng
 		text_options = sample.get("text_options")
 		if isinstance(text_options, list) and text_options:
-			chooser = rng if rng is not None else random
-			return chooser.choice(text_options)
+			order = (4, 3, 2, 1, 0)
+			valid_order = [idx for idx in order if idx < len(text_options)]
+			return text_options[valid_order[int(self.text_cycle_step) % len(valid_order)]]
 		text = sample.get("text")
 		if isinstance(text, str) and text:
 			return text

@@ -3,6 +3,7 @@ save_dir: /media/data1/feihong/ckpt/ground_ocg
 
 model:
   type: ocg
+  pretrained_backbone: true
   use_angle: true
   use_heatmap: false
   use_text: false

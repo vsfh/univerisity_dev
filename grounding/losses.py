@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -116,23 +117,49 @@ def build_smgeo_heatmap_target(
     image_wh: Tuple[int, int],
     sigma: float,
 ) -> torch.Tensor:
+    heatmap, _, _ = build_smgeo_anchor_free_targets(target_bbox, feature_hw, image_wh, sigma)
+    return heatmap
+
+
+def build_smgeo_anchor_free_targets(
+    target_bbox: torch.Tensor,
+    feature_hw: Tuple[int, int],
+    image_wh: Tuple[int, int],
+    sigma: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size = target_bbox.shape[0]
     feat_h, feat_w = int(feature_hw[0]), int(feature_hw[1])
     image_w, image_h = float(image_wh[0]), float(image_wh[1])
     center_x = ((target_bbox[:, 0] + target_bbox[:, 2]) * 0.5 / image_w) * feat_w
     center_y = ((target_bbox[:, 1] + target_bbox[:, 3]) * 0.5 / image_h) * feat_h
+    center_ix = center_x.floor().long().clamp(0, feat_w - 1)
+    center_iy = center_y.floor().long().clamp(0, feat_h - 1)
 
     grid_y = torch.arange(feat_h, device=target_bbox.device, dtype=target_bbox.dtype).view(1, feat_h, 1)
     grid_x = torch.arange(feat_w, device=target_bbox.device, dtype=target_bbox.dtype).view(1, 1, feat_w)
+    offset_x = grid_x - center_ix.to(dtype=target_bbox.dtype).view(batch_size, 1, 1)
+    offset_y = grid_y - center_iy.to(dtype=target_bbox.dtype).view(batch_size, 1, 1)
+    radius = max(0, int(math.ceil(float(sigma) * 2.0)))
+    mask = (offset_x.abs() <= radius) & (offset_y.abs() <= radius)
     heatmap = torch.exp(
         -0.5
         * (
-            (grid_x - center_x.view(batch_size, 1, 1)).square()
-            + (grid_y - center_y.view(batch_size, 1, 1)).square()
+            offset_x.square()
+            + offset_y.square()
         )
         / max(float(sigma) ** 2, 1e-6)
     )
-    return heatmap.unsqueeze(1).clamp(0.0, 1.0)
+    heatmap = heatmap.masked_fill(~mask, 0.0).unsqueeze(1).clamp(0.0, 1.0)
+
+    box_w = ((target_bbox[:, 2] - target_bbox[:, 0]).clamp_min(1.0) / image_w) * feat_w
+    box_h = ((target_bbox[:, 3] - target_bbox[:, 1]).clamp_min(1.0) / image_h) * feat_h
+    bbox_target = torch.zeros((batch_size, 4, feat_h, feat_w), device=target_bbox.device, dtype=target_bbox.dtype)
+    bbox_target[:, 0] = center_x.view(batch_size, 1, 1) - grid_x
+    bbox_target[:, 1] = center_y.view(batch_size, 1, 1) - grid_y
+    bbox_target[:, 2] = box_w.view(batch_size, 1, 1)
+    bbox_target[:, 3] = box_h.view(batch_size, 1, 1)
+    bbox_target = bbox_target * mask.unsqueeze(1).to(dtype=target_bbox.dtype)
+    return heatmap, bbox_target, mask.unsqueeze(1).to(dtype=target_bbox.dtype)
 
 
 def build_smgeo_bbox_target(
@@ -160,41 +187,56 @@ def smgeo_anchor_free_loss(
     target_bbox: torch.Tensor,
     image_wh: Tuple[int, int],
     heatmap_sigma: float = 1.5,
-    focal_alpha: float = 2.0,
-    focal_beta: float = 4.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    batch_size, _, feat_h, feat_w = heatmap_logits.shape
-    heatmap_target = build_smgeo_heatmap_target(
+    _, _, feat_h, feat_w = heatmap_logits.shape
+    heatmap_target, bbox_target, mask = build_smgeo_anchor_free_targets(
         target_bbox,
         feature_hw=(feat_h, feat_w),
         image_wh=image_wh,
         sigma=heatmap_sigma,
     )
-    bbox_target, gi, gj = build_smgeo_bbox_target(target_bbox, (feat_h, feat_w), image_wh)
-    batch_idx = torch.arange(batch_size, device=target_bbox.device)
 
-    pred_prob = torch.sigmoid(heatmap_logits)
-    heatmap_target = heatmap_target.clone()
-    heatmap_target[batch_idx, 0, gj, gi] = 1.0
+    pred_prob = torch.sigmoid(heatmap_logits).clamp(1e-4, 1.0 - 1e-4)
     pos_mask = heatmap_target.eq(1.0)
     neg_mask = heatmap_target.lt(1.0)
-    pos_loss = -torch.log(pred_prob.clamp_min(1e-6)) * (1.0 - pred_prob).pow(focal_alpha)
-    neg_loss = (
-        -torch.log((1.0 - pred_prob).clamp_min(1e-6))
-        * pred_prob.pow(focal_alpha)
-        * (1.0 - heatmap_target).pow(focal_beta)
-    )
-    heatmap_loss = (pos_loss[pos_mask].sum() + neg_loss[neg_mask].sum()) / pos_mask.sum().clamp_min(1)
+    gamma = 2.0
+    alpha = 0.25
+    beta = 0.75
 
-    selected_bbox = bbox_raw[batch_idx, :, gj, gi]
-    selected_bbox = torch.cat(
-        [
-            selected_bbox[:, :2].sigmoid(),
-            selected_bbox[:, 2:4].sigmoid(),
-        ],
-        dim=1,
-    )
-    bbox_loss = F.l1_loss(selected_bbox, bbox_target)
+    if pos_mask.any():
+        pos_loss = -torch.log(pred_prob[pos_mask]) * (1.0 - pred_prob[pos_mask]).pow(gamma) * alpha
+        pos_loss = pos_loss.mean()
+    else:
+        pos_loss = heatmap_logits.new_zeros(())
+    if neg_mask.any():
+        neg_loss = -torch.log(1.0 - pred_prob[neg_mask]) * pred_prob[neg_mask].pow(gamma) * beta
+        neg_loss = neg_loss.mean()
+    else:
+        neg_loss = heatmap_logits.new_zeros(())
+    heatmap_loss = torch.clamp(pos_loss + neg_loss, 0.0, 10.0) * 2.0
+
+    center_mask = mask.expand_as(bbox_raw[:, :2])
+    wh_mask = mask.expand_as(bbox_raw[:, 2:])
+    if center_mask.sum() > 0:
+        center_loss = F.l1_loss(
+            bbox_raw[:, :2] * center_mask,
+            bbox_target[:, :2] * center_mask,
+            reduction="sum",
+        ) / (center_mask.sum() + 1e-4)
+        center_loss = torch.clamp(center_loss, 0.0, 5.0)
+    else:
+        center_loss = heatmap_logits.new_zeros(())
+    if wh_mask.sum() > 0:
+        wh_loss = F.l1_loss(
+            bbox_raw[:, 2:] * wh_mask,
+            bbox_target[:, 2:] * wh_mask,
+            reduction="sum",
+        ) / (wh_mask.sum() + 1e-4)
+        wh_loss = torch.clamp(wh_loss, 0.0, 5.0)
+    else:
+        wh_loss = heatmap_logits.new_zeros(())
+
+    bbox_loss = (0.7 * center_loss + 0.3 * wh_loss) * 3.0
     return heatmap_loss, bbox_loss
 
 
@@ -227,8 +269,8 @@ def compute_grounding_loss(output: Any, batch: Dict[str, Any], anchors_full: tor
         moe_entropy = output.moe_entropy
         moe_loss = heatmap_loss.new_zeros(()) if moe_entropy is None else -moe_entropy.to(heatmap_loss.device).mean()
         total = (
-            heatmap_loss
-            + float(cfg["loss"]["bbox_weight"]) * bbox_loss
+            float(cfg["loss"].get("heatmap_weight", 0.7)) * heatmap_loss
+            + float(cfg["loss"].get("bbox_weight", 0.3)) * bbox_loss
             + float(cfg["loss"].get("moe_entropy_weight", 0.0)) * moe_loss
         )
         zero = bbox_loss.new_zeros(())
@@ -251,7 +293,14 @@ def compute_grounding_loss(output: Any, batch: Dict[str, Any], anchors_full: tor
     )
     grid_wh = (pred_anchor.shape[4], pred_anchor.shape[3])
     new_gt_bbox, best_anchor_gi_gj = build_target(target_bbox, anchors_full, image_wh, grid_wh)
-    loss_geo, loss_cls = yolo_loss(pred_anchor, new_gt_bbox, anchors_full, best_anchor_gi_gj, image_wh)
+    loss_geo, loss_cls = yolo_loss(
+        pred_anchor,
+        new_gt_bbox,
+        anchors_full,
+        best_anchor_gi_gj,
+        image_wh,
+        confidence_loss_type=str(cfg["loss"].get("anchor_confidence_loss_type", "balanced_bce")),
+    )
     bbox_loss = loss_geo + loss_cls
     heatmap_loss = pred_anchor.new_zeros(())
     if output.heatmap is not None and cfg["model"]["use_heatmap"]:

@@ -135,7 +135,9 @@ class QueryEncoder(nn.Module):
         self.layer3 = resnet.layer3
         self.layer4 = resnet.layer4
 
-    def forward(self, query_imgs, click_maps):
+    def forward(self, query_imgs, click_maps=None):
+        if click_maps is None:
+            click_maps = query_imgs.new_zeros((query_imgs.shape[0], 1, query_imgs.shape[-2], query_imgs.shape[-1]))
         x = torch.cat([query_imgs, click_maps], dim=1)
         x = self.conv1(x)
         x = self.bn1(x)
@@ -409,8 +411,9 @@ class OCGNetLite(nn.Module):
         pretrained_backbone: bool = False,
     ):
         super().__init__()
-        self.query_encoder = QueryEncoder(pretrained=pretrained_backbone)
-        self.reference_encoder = ReferenceEncoder(pretrained=pretrained_backbone)
+        shared_encoder = QueryEncoder(pretrained=pretrained_backbone)
+        self.query_encoder = shared_encoder
+        self.reference_encoder = shared_encoder
         self.gkt = GaussianKnowledgeTransfer(channels)
         self.cross_attention = CrossViewAttention(channels, num_heads=num_heads)
         self.fusion = CrossViewFusion(channels)

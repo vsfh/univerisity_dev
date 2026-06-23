@@ -34,6 +34,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "loss": {
         "bbox_weight": 1.0,
+        "anchor_confidence_loss_type": "balanced_bce",
         "heatmap_weight": 0.2,
         "heatmap_confidence_weight": 0.5,
         "heatmap_loss_type": ["mse", "cross_entropy"],
