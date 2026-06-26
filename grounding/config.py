@@ -23,13 +23,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "drone_size": {"height": 256, "width": 256},
     },
     "train": {
-        "epochs": 20,
+        "epochs": 35,
         "batch_size": 32,
         "grad_accumulation_steps": 2,
-        "lr": 5.0e-5,
-        "weight_decay": 1.0e-4,
+        "lr": 2.0e-4,
+        "weight_decay": 5.0e-5,
         "amp": True,
-        "grad_clip_norm": 1.0,
+        "grad_clip_norm": 5.0,
         "device": "cuda:1",
     },
     "loss": {
