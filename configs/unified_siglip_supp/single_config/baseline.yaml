@@ -1,4 +1,4 @@
-exp_name: model_test_geo_input_ids
+exp_name: baseline
 save_root: /media/data1/feihong/ckpt
 end_num: 0.1
 use_ap: true

@@ -1,4 +1,4 @@
-exp_name: model_test_geo_input_ids
+exp_name: baseline_wo_input_ids
 save_root: /media/data1/feihong/ckpt
 end_num: 0.1
 use_ap: true
@@ -18,13 +18,13 @@ config:
   LORA_DROPOUT: 0.05
   OPTIMIZE_OBJECTIVE: combined
   USE_ANGLE_INPUT: true
-  USE_TEXT_INPUT: true
+  USE_TEXT_INPUT: false
   USE_HEATMAP_LOSS: true
   HEATMAP_LOSS_WEIGHT: 0.2
   HEATMAP_CONFIDENCE_WEIGHT: 0.5
   USE_REFINE_LOSS: false
   USE_TEXT_ANCHOR_LOSS: false
-  TEXT_ANCHOR_LOSS_WEIGHT: 0.5
+  TEXT_ANCHOR_LOSS_WEIGHT: 0
   TEXT_POOLER_ALIGN_START_WEIGHT: 0.05
   TEXT_POOLER_ALIGN_END_WEIGHT: 0.005
   TEXT_POOLER_ALIGN_DECAY_EPOCHS: 10

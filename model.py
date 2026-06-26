@@ -425,9 +425,10 @@ class Encoder_heat(nn.Module):
             angle,
             detach_anchor=detach_anchor,
         )
-        heatmap = self._spatial_softmax(heatmap_logits)
+        # heatmap = self._spatial_softmax(heatmap_logits)
+        heatmap = heatmap_logits
 
-        heat_gate = heatmap * heatmap.shape[-2] * heatmap.shape[-1] / 2
+        heat_gate = heatmap
         guided_sat_features = self.heat_fuse(
             torch.cat([sat_features_2d, heat_gate], dim=1)
         )
@@ -447,7 +448,8 @@ class Encoder_heat(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
-            heatmap_out = self._spatial_softmax(heatmap_logits)
+            # heatmap_out = self._spatial_softmax(heatmap_logits)
+            heatmap_out = heatmap_logits
         return pred_anchor, heatmap_out
 
     def forward(
@@ -640,7 +642,7 @@ class Encoder_test(Encoder_heat):
             anchor_feats,
             sat_features_2d,
             angle,
-            detach_anchor=True,
+            detach_anchor=False,
         )
         aux_outputs = {}
         if self.use_text_grounding_path:

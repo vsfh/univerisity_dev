@@ -4,15 +4,44 @@ set -euo pipefail
 cd /media/data1/feihong/univerisity_dev
 
 CONFIGS=(
-    # Encoder_heat without geo input.
-    # "configs/unified_siglip_supp/single_config/model_heat_no_geo.yaml"
-    # Encoder_heat without input_ids.
-    # "configs/unified_siglip_supp/single_config/model_heat_no_input_ids.yaml"
-    # Encoder_test with text pooler alignment; text grounding path is disabled by default.
-    "configs/unified_siglip_supp/single_config/model_test_geo_input_ids.yaml"
+    "configs/unified_siglip_supp/single_config/baseline_wo_input_ids.yaml"
+    "configs/unified_siglip_supp/single_config/baseline.yaml"
 )
 
-for CONFIG_PATH in "${CONFIGS[@]}"; do
+MODEL_TYPES=(
+    "encoder_test"
+    "encoder_test"
+)
+
+CHECKPOINT_DIRS=(
+    "/media/data1/feihong/ckpt/baseline_wo_input_ids"
+    "/media/data1/feihong/ckpt/baseline"
+)
+
+TEXT_FLAGS=(
+    "--no-encoder-heat-use-text"
+    "--encoder-heat-use-text"
+)
+
+CHECKPOINT_NAME="${CHECKPOINT_NAME:-last.pth}"
+OUTPUT_DIR="${OUTPUT_DIR:-/media/data1/feihong/univerisity_dev/eval_results/test_unify}"
+COMMON_TEST_ARGS=(
+    --output-dir "${OUTPUT_DIR}"
+    --batch-size "${BATCH_SIZE:-8}"
+    --num-workers "${NUM_WORKERS:-8}"
+    --lora-rank 8
+    --lora-alpha 16.0
+    --lora-dropout 0.05
+    --encoder-heat-text-score-weight "${TEXT_SCORE_WEIGHT:-0.0}"
+    --encoder-heat-text-rerank-topk "${TEXT_RERANK_TOPK:-50}"
+)
+
+for IDX in "${!CONFIGS[@]}"; do
+    CONFIG_PATH="${CONFIGS[$IDX]}"
+    MODEL_TYPE="${MODEL_TYPES[$IDX]}"
+    CHECKPOINT_PATH="${CHECKPOINT_DIRS[$IDX]}/${CHECKPOINT_NAME}"
+    TEXT_FLAG="${TEXT_FLAGS[$IDX]}"
+
     echo "============================================================"
     echo "Running unified_siglip_supp experiment: ${CONFIG_PATH}"
     echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -24,16 +53,27 @@ for CONFIG_PATH in "${CONFIGS[@]}"; do
     echo "Finished experiment: ${CONFIG_PATH}"
     echo "Finished at: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "============================================================"
+
+    echo "============================================================"
+    echo "Testing ${MODEL_TYPE}: ${CHECKPOINT_PATH}"
+    echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "============================================================"
+
+    python test_unify.py \
+        --model-types "${MODEL_TYPE}" \
+        --checkpoint "${CHECKPOINT_PATH}" \
+        --encoder-heat-use-angle \
+        "${TEXT_FLAG}" \
+        "${COMMON_TEST_ARGS[@]}" \
+        "$@"
+
+    echo "============================================================"
+    echo "Finished test: ${MODEL_TYPE}"
+    echo "Finished at: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "============================================================"
 done
 
 echo "============================================================"
-echo "Running test_group.sh after training"
-echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
-echo "============================================================"
-
-bash test_group.sh
-
-echo "============================================================"
-echo "Finished test_group.sh"
+echo "Finished all train_group experiments and test_unify evaluations"
 echo "Finished at: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================"

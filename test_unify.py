@@ -122,8 +122,8 @@ def add_heatmap_to_confidence(
             align_corners=False,
         )
 
-    heatmap_logits = heatmap_logits.detach().to(dtype=pred_anchor.dtype)
-    heat_confidence = float(confidence_weight) * heatmap_logits.unsqueeze(1)
+    heatmap_confidence = torch.sigmoid(heatmap_logits.detach()).to(dtype=pred_anchor.dtype)
+    heat_confidence = float(confidence_weight) * heatmap_confidence.unsqueeze(1)
     return torch.cat(
         [
             pred_anchor[:, :, :4, :, :],

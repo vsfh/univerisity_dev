@@ -90,7 +90,7 @@ class Config:
     OPTIMIZE_OBJECTIVE = "combined"  # combined | img_text_only | bbox_only
     USE_HEATMAP_LOSS = True
     HEATMAP_LOSS_WEIGHT = 0.2
-    HEATMAP_LOSS_TYPE = ["mse", "cross_entropy", "focal"]  # mse | cross_entropy | weighted_bce | focal
+    HEATMAP_LOSS_TYPE = [ "focal"]  # mse | cross_entropy | weighted_bce | focal
     HEATMAP_FOCAL_GAMMA = 2.0
     HEATMAP_FOCAL_ALPHA = 0.25
     HEATMAP_FOCAL_BETA = 0.75
@@ -448,10 +448,10 @@ def heatmap_loss_fn(
         sigma=Config.HEATMAP_SIGMA,
         radius=Config.HEATMAP_RADIUS,
     )
-    pred = heatmap_logits.float().flatten(1)
-    target = heatmap_target.float().flatten(1)
-    target_prob = target / target.sum(dim=1, keepdim=True).clamp_min(1e-6)
-    pred_prob = pred / pred.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    target_prob = heatmap_logits.float().flatten(1).clamp_min(1e-6)
+    pred_prob = heatmap_target.float().flatten(1)
+    # target_prob = target / target.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    # pred_prob = pred / pred.sum(dim=1, keepdim=True).clamp_min(1e-6)
 
     loss = heatmap_logits.new_zeros(())
     for loss_type in parse_heatmap_loss_types(Config.HEATMAP_LOSS_TYPE):
@@ -482,21 +482,21 @@ def heatmap_loss_fn(
             continue
 
         if loss_type == "focal":
-            pred_sigmoid = torch.sigmoid(heatmap_logits.float()).clamp(1e-4, 1.0 - 1e-4)
-            soft_target = heatmap_target.float()
+            pred_sigmoid = torch.sigmoid(heatmap_logits.float().flatten(1)).clamp(1e-4, 1.0 - 1e-4)
+            soft_target = heatmap_target.float().flatten(1)
             gamma = float(Config.HEATMAP_FOCAL_GAMMA)
 
             pos_loss = (
                 -torch.log(pred_sigmoid)
                 * (1.0 - pred_sigmoid).pow(gamma)
                 * soft_target
-            ).mean()
+            ).sum(1) / soft_target.sum(1).clamp_min(1e-6)
             neg_loss = (
                 -torch.log(1.0 - pred_sigmoid)
                 * pred_sigmoid.pow(gamma)
                 * (1.0 - soft_target)
-            ).mean()
-            loss = loss + pos_loss + neg_loss
+            ).sum(1) / (1.0 - soft_target).sum(1).clamp_min(1e-6)
+            loss = loss + (pos_loss * 15 + neg_loss * 45).mean()
             continue
 
         raise ValueError(
@@ -567,7 +567,7 @@ def add_heatmap_to_confidence(
             align_corners=False,
         )
 
-    heatmap_logits = heatmap_logits.detach().to(dtype=pred_anchor.dtype)
+    heatmap_logits = torch.sigmoid(heatmap_logits.detach()).to(dtype=pred_anchor.dtype)
     heat_confidence = Config.HEATMAP_CONFIDENCE_WEIGHT * heatmap_logits.unsqueeze(1)
     return torch.cat(
         [

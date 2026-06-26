@@ -32,6 +32,7 @@ DEFAULT_TIMING_LOG_INTERVAL = 200
 DEFAULT_MODEL_NAME = "google/siglip2-base-patch16-224"
 DEFAULT_CACHE_DIR = "/media/data1/feihong/hf_cache"
 TEXT_DESCRIPTION_FILE = "qwen_6_19_description.json"
+TEXT_CYCLE_ORDER = (5, 4, 3, 2, 1)
 
 TRAIN_HEIGHT_TO_BOX_SIZE = {
 	150: 330//2,
@@ -711,9 +712,8 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		del rng
 		text_options = sample.get("text_options")
 		if isinstance(text_options, list) and text_options:
-			order = (4, 3, 2, 1, 0)
-			valid_order = [idx for idx in order if idx < len(text_options)]
-			return text_options[valid_order[int(self.text_cycle_step) % len(valid_order)]]
+			order = [idx - 1 for idx in TEXT_CYCLE_ORDER if idx <= len(text_options)]
+			return text_options[order[int(self.text_cycle_step) % len(order)]]
 		text = sample.get("text")
 		if isinstance(text, str) and text:
 			return text
