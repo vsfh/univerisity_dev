@@ -14,7 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-from transformers import AutoImageProcessor, AutoTokenizer
+from transformers import AutoTokenizer
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -23,8 +23,8 @@ if str(ROOT) not in sys.path:
 from bbox.yolo_utils import get_tensor_anchors
 from dataset import ShiftedSatelliteDroneDataset
 from grounding.config import load_config
-from grounding.letterbox import black_fill_from_processor, letterbox_satellite_batch
 from grounding.losses import compute_grounding_loss
+from grounding.processors import build_grounding_image_processors
 from grounding.registry import build_model_and_adapter
 
 
@@ -79,12 +79,7 @@ def _build_loader(
 ) -> tuple[DataLoader, DistributedSampler | None]:
     model_name = cfg["model"]["model_name"]
     cache_dir = cfg["model"]["cache_dir"]
-    processor = AutoImageProcessor.from_pretrained(model_name, cache_dir=cache_dir)
-    processor_sat = AutoImageProcessor.from_pretrained(
-        model_name,
-        cache_dir=cache_dir,
-        size=cfg["data"]["sat_size"],
-    )
+    processor, processor_sat = build_grounding_image_processors(cfg)
     tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
     dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
@@ -215,7 +210,6 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
         adapter.model = model
     anchors_full = get_tensor_anchors(str(device))
     loader, sampler = _build_loader(cfg, "train", distributed)
-    letterbox_fill = black_fill_from_processor(loader.dataset.processor_sat)
     optimizer = AdamW(
         model.parameters(),
         lr=float(cfg["train"]["lr"]),
@@ -250,7 +244,6 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
             }
             epoch_count = 0
             for batch_idx, batch in enumerate(progress):
-                batch, _ = letterbox_satellite_batch(batch, letterbox_fill)
                 with torch.amp.autocast("cuda", enabled=amp_enabled):
                     output = adapter.forward(batch, device)
                     losses = compute_grounding_loss(output, batch, anchors_full, cfg)

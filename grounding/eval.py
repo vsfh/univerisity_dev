@@ -8,7 +8,7 @@ from typing import Any, Dict
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoImageProcessor, AutoTokenizer
+from transformers import AutoTokenizer
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -17,8 +17,8 @@ if str(ROOT) not in sys.path:
 from bbox.yolo_utils import get_tensor_anchors
 from dataset import ShiftedSatelliteDroneDataset
 from grounding.config import load_config
-from grounding.letterbox import black_fill_from_processor, crop_letterbox_bbox, letterbox_satellite_batch
 from grounding.losses import compute_iou_metrics
+from grounding.processors import build_grounding_image_processors
 from grounding.registry import build_model_and_adapter
 
 
@@ -32,12 +32,7 @@ def _device_from_config(cfg: Dict[str, Any]) -> torch.device:
 def _build_loader(cfg: Dict[str, Any]) -> DataLoader:
     model_name = cfg["model"]["model_name"]
     cache_dir = cfg["model"]["cache_dir"]
-    processor = AutoImageProcessor.from_pretrained(model_name, cache_dir=cache_dir)
-    processor_sat = AutoImageProcessor.from_pretrained(
-        model_name,
-        cache_dir=cache_dir,
-        size=cfg["data"]["sat_size"],
-    )
+    processor, processor_sat = build_grounding_image_processors(cfg)
     tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
     dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
@@ -98,7 +93,6 @@ def evaluate(cfg: Dict[str, Any], dry_run: bool = False, max_batches: int = 0) -
 
     _load_checkpoint(model, checkpoint)
     loader = _build_loader(cfg)
-    letterbox_fill = black_fill_from_processor(loader.dataset.processor_sat)
     model.eval()
     total = {
         "mean_iou": 0.0,
@@ -110,10 +104,8 @@ def evaluate(cfg: Dict[str, Any], dry_run: bool = False, max_batches: int = 0) -
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(loader, desc=f"Eval {cfg['exp_name']}")):
             target_bbox = batch["bbox"].to(device)
-            batch, letterbox_meta = letterbox_satellite_batch(batch, letterbox_fill)
             output = adapter.forward(batch, device)
             pred_bbox = adapter.decode(output, batch, anchors_full)
-            pred_bbox = crop_letterbox_bbox(pred_bbox, letterbox_meta)
             target_bbox = target_bbox.to(pred_bbox.device)
             metrics = compute_iou_metrics(pred_bbox, target_bbox)
             batch_n = int(target_bbox.shape[0])
