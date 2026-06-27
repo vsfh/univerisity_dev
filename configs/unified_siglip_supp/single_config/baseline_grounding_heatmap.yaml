@@ -1,5 +1,5 @@
 exp_name: baseline_grounding_heatmap
-save_root: /media/data1/feihong/remote/ckpt
+save_root: /media/data1/feihong/ckpt
 end_num: 0.1
 use_ap: true
 

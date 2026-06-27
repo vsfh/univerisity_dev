@@ -37,14 +37,14 @@ from train_trans import (
 
 # --- Configuration ---
 MODEL_NAME = "google/siglip2-base-patch16-224"
-CACHE_DIR = "/media/data1/feihong/remote/hf_cache"
+CACHE_DIR = "/media/data1/feihong/hf_cache"
 DEFAULT_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-DEFAULT_OUTPUT_DIR = "/media/data1/feihong/remote/univerisity_dev/eval_results/test_unify"
-DEFAULT_INCLUDE_FILE = "/media/data1/feihong/remote/ckpt/include2.json"
-DEFAULT_ENCODER_HEAT_CONFIG_DIR = "/media/data1/feihong/remote/univerisity_dev/configs/unified_siglip_supp"
-DEFAULT_ENCODER_HEAT_CHECKPOINT = "/media/data1/feihong/remote/ckpt/model_full/last.pth"
-DEFAULT_UNIFY_CHECKPOINT = "/media/data1/feihong/remote/ckpt/unify_geo/last.pth"
-DEFAULT_TRANS_CHECKPOINT = "/media/data1/feihong/remote/ckpt/trans_geo/last.pth"
+DEFAULT_OUTPUT_DIR = "/media/data1/feihong/univerisity_dev/eval_results/test_unify"
+DEFAULT_INCLUDE_FILE = "/media/data1/feihong/ckpt/include2.json"
+DEFAULT_ENCODER_HEAT_CONFIG_DIR = "/media/data1/feihong/univerisity_dev/configs/unified_siglip_supp"
+DEFAULT_ENCODER_HEAT_CHECKPOINT = "/media/data1/feihong/ckpt/model_full/last.pth"
+DEFAULT_UNIFY_CHECKPOINT = "/media/data1/feihong/ckpt/unify_geo/last.pth"
+DEFAULT_TRANS_CHECKPOINT = "/media/data1/feihong/ckpt/trans_geo/last.pth"
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
 
@@ -193,7 +193,7 @@ def bool_from_config(config: Dict[str, Any], key: str, default: bool) -> bool:
 def resolve_encoder_heat_checkpoint(config_path: str, payload: Dict[str, Any], checkpoint_name: str) -> str:
     config_file = Path(config_path)
     exp_name = str(payload.get("exp_name") or payload.get("name") or config_file.stem)
-    save_root = str(payload.get("save_root", "/media/data1/feihong/remote/ckpt"))
+    save_root = str(payload.get("save_root", "/media/data1/feihong/ckpt"))
     save_dir = payload.get("save_dir")
 
     candidates: List[Path] = []
@@ -1035,6 +1035,7 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
 
     if model_type in {"encoder_heat", "encoder_test"}:
         encoder_cls = Encoder_test if model_type == "encoder_test" else Encoder_heat
+        encoder_eval_use_text = False
         bundle = extract_encoder_heat_features(
             checkpoint_path=checkpoint_path,
             device=device,
@@ -1045,7 +1046,7 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
             subset_heights=subset_heights,
             subset_angles=subset_angles,
             heatmap_confidence_weight=args.heatmap_confidence_weight,
-            use_text=args.encoder_heat_use_text,
+            use_text=encoder_eval_use_text,
             use_angle=args.encoder_heat_use_angle,
             use_ap=args.encoder_heat_use_ap,
             use_heatmap=args.encoder_heat_use_heatmap,
@@ -1099,8 +1100,8 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
         candidate_size=args.candidate_size,
         unify_score_mode=args.unify_score_mode,
         sampling_seed=args.seed,
-        encoder_heat_text_score_weight=args.encoder_heat_text_score_weight,
-        encoder_heat_text_rerank_topk=args.encoder_heat_text_rerank_topk,
+        encoder_heat_text_score_weight=0.0,
+        encoder_heat_text_rerank_topk=0,
     )
     records = scored.pop("query_records")
     per_subset, per_height, per_angle = group_summaries(records)
@@ -1113,13 +1114,13 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
         "candidate_size": args.candidate_size,
         "test_crop_ratio": float(args.test_crop_ratio),
         "seed": int(args.seed),
-        "encoder_use_text": bool(args.encoder_heat_use_text) if model_type in {"encoder_heat", "encoder_test"} else None,
+        "encoder_use_text": False if model_type in {"encoder_heat", "encoder_test"} else None,
         "encoder_use_angle": bool(args.encoder_heat_use_angle) if model_type in {"encoder_heat", "encoder_test"} else None,
         "encoder_heat_use_ap": bool(args.encoder_heat_use_ap) if model_type in {"encoder_heat", "encoder_test"} else None,
         "encoder_heat_use_heatmap": bool(args.encoder_heat_use_heatmap) if model_type in {"encoder_heat", "encoder_test"} else None,
         "heatmap_confidence_weight": float(args.heatmap_confidence_weight) if model_type in {"encoder_heat", "encoder_test"} else None,
-        "encoder_heat_text_score_weight": float(args.encoder_heat_text_score_weight) if model_type in {"encoder_heat", "encoder_test"} else None,
-        "encoder_heat_text_rerank_topk": int(args.encoder_heat_text_rerank_topk) if model_type in {"encoder_heat", "encoder_test"} else None,
+        "encoder_heat_text_score_weight": 0.0 if model_type in {"encoder_heat", "encoder_test"} else None,
+        "encoder_heat_text_rerank_topk": 0 if model_type in {"encoder_heat", "encoder_test"} else None,
         "lora": (
             {
                 "rank": int(args.lora_rank),
@@ -1244,8 +1245,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-file", type=str, default=DEFAULT_INCLUDE_FILE)
     parser.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--heatmap-confidence-weight", type=float, default=0.5)
-    parser.add_argument("--encoder-heat-text-score-weight", type=float, default=0.0)
-    parser.add_argument("--encoder-heat-text-rerank-topk", type=int, default=50)
+    parser.add_argument(
+        "--encoder-heat-text-score-weight",
+        type=float,
+        default=0.0,
+        help="Deprecated: text score is disabled during test.",
+    )
+    parser.add_argument(
+        "--encoder-heat-text-rerank-topk",
+        type=int,
+        default=50,
+        help="Deprecated: text score is disabled during test.",
+    )
     parser.add_argument(
         "--output-suffix",
         type=str,
@@ -1287,7 +1298,7 @@ def main() -> None:
                 f"\nEvaluating encoder_heat config={run['config_name']} "
                 f"checkpoint={run['checkpoint_path']}"
             )
-            args.encoder_heat_use_text = bool(run["use_text"])
+            args.encoder_heat_use_text = False
             args.encoder_heat_use_angle = bool(run["use_angle"])
             args.encoder_heat_use_ap = bool(run["use_ap"])
             args.encoder_heat_use_heatmap = bool(run["use_heatmap"])
@@ -1297,12 +1308,13 @@ def main() -> None:
             metrics["config_name"] = run["config_name"]
             metrics["exp_name"] = run["exp_name"]
             metrics["encoder_heat_settings"] = {
-                "use_text": bool(run["use_text"]),
+                "use_text": False,
+                "train_config_use_text": bool(run["use_text"]),
                 "use_angle": bool(run["use_angle"]),
                 "use_ap": bool(run["use_ap"]),
                 "use_heatmap": bool(run["use_heatmap"]),
                 "heatmap_confidence_weight": float(run["heatmap_confidence_weight"]),
-                "text_score_weight": float(args.encoder_heat_text_score_weight),
+                "text_score_weight": 0.0,
             }
             out_file = save_metrics(metrics, args.output_dir, name_suffix=str(run["config_name"]))
             print_summary(metrics, out_file)

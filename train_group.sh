@@ -1,13 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-cd /media/data1/feihong/univerisity_dev
+cd ../univerisity_dev
 
 CONFIGS=(
     "configs/unified_siglip_supp/single_config/baseline_grounding_full.yaml"
     "configs/unified_siglip_supp/single_config/baseline_grounding_head.yaml"
     "configs/unified_siglip_supp/single_config/baseline_grounding_only.yaml"
     "configs/unified_siglip_supp/single_config/baseline_grounding_heatmap.yaml"
+    # "configs/unified_siglip_supp/single_config/baseline_retrieval_only.yaml"
+    # "configs/unified_siglip_supp/single_config/baseline_retrieval_text.yaml"
+    
     # "configs/unified_siglip_supp/single_config/baseline_wo_input_ids.yaml"
     # "configs/unified_siglip_supp/single_config/baseline.yaml"
 )
@@ -17,13 +20,17 @@ MODEL_TYPES=(
     "encoder_test"
     "encoder_test"
     "encoder_test"
+    # "encoder_test"
+    # "encoder_test"
 )
 
 CHECKPOINT_DIRS=(
-    "/media/data1/feihong/remote/ckpt/baseline_grounding_full"
-    "/media/data1/feihong/remote/ckpt/baseline_grounding_head"
-    "/media/data1/feihong/remote/ckpt/baseline_grounding_only"
-    "/media/data1/feihong/remote/ckpt/baseline_grounding_heatmap"
+    "/media/data1/feihong/ckpt/baseline_grounding_full"
+    "/media/data1/feihong/ckpt/baseline_grounding_head"
+    "/media/data1/feihong/ckpt/baseline_grounding_only"
+    "/media/data1/feihong/ckpt/baseline_grounding_heatmap"
+    # "/media/data1/feihong/ckpt/baseline_retrieval_only"
+    # "/media/data1/feihong/ckpt/baseline_retrieval_text"
 )
 
 TEXT_FLAGS=(
@@ -31,6 +38,8 @@ TEXT_FLAGS=(
     "--no-encoder-heat-use-text"
     "--no-encoder-heat-use-text"
     "--no-encoder-heat-use-text"
+    # "--no-encoder-heat-use-text"
+    # "--encoder-heat-use-text"
 )
 
 HEATMAP_FLAGS=(
@@ -38,6 +47,8 @@ HEATMAP_FLAGS=(
     "--no-encoder-heat-use-heatmap"
     "--no-encoder-heat-use-heatmap"
     "--encoder-heat-use-heatmap"
+    # "--no-encoder-heat-use-heatmap"
+    # "--no-encoder-heat-use-heatmap"
 )
 
 ANGLE_FLAGS=(
@@ -45,10 +56,12 @@ ANGLE_FLAGS=(
     "--encoder-heat-use-angle"
     "--no-encoder-heat-use-angle"
     "--no-encoder-heat-use-angle"
+    # "--no-encoder-heat-use-angle"
+    # "--no-encoder-heat-use-angle"
 )
 
 CHECKPOINT_NAME="${CHECKPOINT_NAME:-last.pth}"
-OUTPUT_DIR="${OUTPUT_DIR:-/media/data1/feihong/univerisity_dev/eval_results/test_unify}"
+OUTPUT_DIR="${OUTPUT_DIR:-../univerisity_dev/eval_results/test_unify}"
 COMMON_TEST_ARGS=(
     --output-dir "${OUTPUT_DIR}"
     --batch-size "${BATCH_SIZE:-8}"
@@ -56,8 +69,6 @@ COMMON_TEST_ARGS=(
     --lora-rank 8
     --lora-alpha 16.0
     --lora-dropout 0.05
-    --encoder-heat-text-score-weight "${TEXT_SCORE_WEIGHT:-0.0}"
-    --encoder-heat-text-rerank-topk "${TEXT_RERANK_TOPK:-50}"
 )
 
 for IDX in "${!CONFIGS[@]}"; do

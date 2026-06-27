@@ -61,7 +61,7 @@ GROUNDING_RAMP_EPOCHS = 1
 RERANK_START_EPOCH = 1
 MEMORY_QUEUE_SIZE = 0
 BACKBONE_NAME = "swin_small_patch4_window7_224"
-PRETRAINED_CHECKPOINT = "/media/data1/feihong/remote/ckpt/pretrained/smgeo/swin_s_imagenet1k_v1.pth"
+PRETRAINED_CHECKPOINT = "/media/data1/feihong/ckpt/pretrained/smgeo/swin_s_imagenet1k_v1.pth"
 VAL_FRACTION = 0.25
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -1106,7 +1106,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/media/data1/feihong/remote/ckpt/unify_geo",
+        default="/media/data1/feihong/ckpt/unify_geo",
         help="Path to save model checkpoints",
     )
     args = parser.parse_args()

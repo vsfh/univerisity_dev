@@ -46,13 +46,13 @@ class AverageMeter:
 
 # --- Configuration ---
 MODEL_NAME = "google/siglip-base-patch16-224"
-CACHE_DIR = "/media/data1/feihong/remote/hf_cache"
-DRONE_VIEW_FOLDER = "/media/data1/feihong/remote/drone_view"
-IMAGE_FOLDER = "/media/data1/feihong/remote/image_1024"
-BBOX_FILE = "/media/data1/feihong/remote/univerisity_dev/runs/bbox_isaac.json"
-TRAIN_BBOX_FILE = "/media/data1/feihong/remote/univerisity_dev/runs/train.json"
-TEST_BBOX_FILE = "/media/data1/feihong/remote/univerisity_dev/runs/test.json"
-TEXT_FILE = "/media/data1/feihong/remote/drone_text_single_long.json"
+CACHE_DIR = "/media/data1/feihong/hf_cache"
+DRONE_VIEW_FOLDER = "/media/data1/feihong/drone_view"
+IMAGE_FOLDER = "/media/data1/feihong/image_1024"
+BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/bbox_isaac.json"
+TRAIN_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/train.json"
+TEST_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
+TEXT_FILE = "/media/data1/feihong/drone_text_single_long.json"
 
 SAT_ORIG_SIZE = (3840, 2160)
 UNIV_SAT_SIZE = (640, 640)
@@ -502,9 +502,9 @@ def main(save_path):
     anchors_full = get_tensor_anchors(DEVICE)
 
     print("Setting up dataset and dataloader...")
-    # Load training image pairs from /media/data1/feihong/remote/ckpt/train.txt
+    # Load training image pairs from /media/data1/feihong/ckpt/train.txt
     train_image_pairs = []
-    with open("/media/data1/feihong/remote/ckpt/train.txt", "r") as f:
+    with open("/media/data1/feihong/ckpt/train.txt", "r") as f:
         for line in f:
             query_path = line.strip()
             name = query_path.split("/")[-2]
@@ -512,7 +512,7 @@ def main(save_path):
             if os.path.exists(search_path):
                 train_image_pairs.append((query_path, search_path))
     test_image_pairs = []
-    with open("/media/data1/feihong/remote/ckpt/test.txt", "r") as f:
+    with open("/media/data1/feihong/ckpt/test.txt", "r") as f:
         for line in f:
             query_path = line.strip()
             name = query_path.split("/")[-2]

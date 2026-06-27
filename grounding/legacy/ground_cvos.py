@@ -37,7 +37,7 @@ from grounding.legacy.utils.utils import AverageMeter, eval_iou_acc
 from grounding.legacy.utils.checkpoint import save_checkpoint
 from grounding.legacy.model.darknet import *
 
-DATA_ROOT = "/media/data1/feihong/remote/CVOGL"
+DATA_ROOT = "/media/data1/feihong/CVOGL"
 DATA_NAME = "CVOGL_DroneAerial"
 IMG_SIZE = (768, 432)  # (width, height)
 BATCH_SIZE = 4
@@ -47,11 +47,11 @@ NUM_EPOCHS = 25
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 PRINT_FREQ = 50
-SAVE_DIR = "/media/data1/feihong/remote/ckpt/ground_cvos"
+SAVE_DIR = "/media/data1/feihong/ckpt/ground_cvos"
 
 MODEL_NAME = "google/siglip2-base-patch16-224"
 SIGLIP2_MODEL_NAME = MODEL_NAME
-CACHE_DIR = "/media/data1/feihong/remote/hf_cache"
+CACHE_DIR = "/media/data1/feihong/hf_cache"
 PROJECTION_DIM = 768
 
 
@@ -554,8 +554,8 @@ class DetGeoLite(nn.Module):
     def __init__(
         self,
         emb_size=512,
-        config_path="/media/data1/feihong/remote/ckpt/yolov3_rs.cfg",
-        weights_path="/media/data1/feihong/remote/ckpt/yolov3.weights",
+        config_path="/media/data1/feihong/ckpt/yolov3_rs.cfg",
+        weights_path="/media/data1/feihong/ckpt/yolov3.weights",
         use_instnorm=False,
     ):
         super(DetGeoLite, self).__init__()
@@ -1222,10 +1222,10 @@ def main(args):
 
 
 # --- GroundSmgeoDataset Configuration ---
-UNIV_IMAGE_FOLDER = "/media/data1/feihong/remote/image_1024"
-UNIV_BBOX_FILE = "/media/data1/feihong/remote/univerisity_dev/runs/bbox_isaac.json"
-UNIV_TRAIN_FILE = "/media/data1/feihong/remote/ckpt/train.txt"
-UNIV_TEST_FILE = "/media/data1/feihong/remote/ckpt/test.txt"
+UNIV_IMAGE_FOLDER = "/media/data1/feihong/image_1024"
+UNIV_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/bbox_isaac.json"
+UNIV_TRAIN_FILE = "/media/data1/feihong/ckpt/train.txt"
+UNIV_TEST_FILE = "/media/data1/feihong/ckpt/test.txt"
 UNIV_CROP_SIZE = (1024, 1024)
 UNIV_DRONE_SIZE = (1024, 1024)
 
@@ -1563,7 +1563,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/media/data1/feihong/remote/ckpt/ground_cvos",
+        default="/media/data1/feihong/ckpt/ground_cvos",
         help="Path to model checkpoint (for evaluation)",
     )
     parser.add_argument(
@@ -1601,7 +1601,7 @@ if __name__ == "__main__":
     # else:
     #     print("Please specify --train or --eval mode")
     #     print("Examples:")
-    #     print("  Train: python ground_cvos.py --train --data-root /media/data1/feihong/remote/CVOGL")
+    #     print("  Train: python ground_cvos.py --train --data-root /media/data1/feihong/CVOGL")
     #     print(
     #         "  Eval:  python ground_cvos.py --eval --checkpoint saved_models/default_model_best.pth.tar"
     #     )

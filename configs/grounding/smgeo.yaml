@@ -1,9 +1,9 @@
 exp_name: smgeo
-save_dir: /media/data1/feihong/remote/ckpt/ground_sm
+save_dir: /media/data1/feihong/ckpt/ground_sm
 
 model:
   type: smgeo
-  checkpoint: /media/data1/feihong/remote/ckpt/SMGeo.pth
+  checkpoint: /media/data1/feihong/ckpt/SMGeo.pth
   num_experts: 6
   top_k: 2
   use_angle: true

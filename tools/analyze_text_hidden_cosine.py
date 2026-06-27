@@ -20,7 +20,7 @@ from unified_siglip_supp import Config, apply_config_overrides, build_encoder, e
 
 # --- Configuration ---
 DEFAULT_CONFIG = "configs/unified_siglip_supp/end_num/model_end1.yaml"
-DEFAULT_CHECKPOINT = "/media/data1/feihong/remote/ckpt/model_1/last.pth"
+DEFAULT_CHECKPOINT = "/media/data1/feihong/ckpt/model_1/last.pth"
 DEFAULT_LIMIT = 128
 DEFAULT_BATCH_SIZE = 32
 

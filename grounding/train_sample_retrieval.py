@@ -47,12 +47,12 @@ LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 PRINT_FREQ = 50
 
-UNIV_IMAGE_FOLDER = "/media/data1/feihong/remote/image_1024"
-HEADING_FOLDER = "/media/data1/feihong/remote/range_250"
-TRAIN_BBOX_FILE = "/media/data1/feihong/remote/univerisity_dev/runs/train.json"
-TEST_BBOX_FILE = "/media/data1/feihong/remote/univerisity_dev/runs/test.json"
-TRAIN_FILE = "/media/data1/feihong/remote/ckpt/train.txt"
-TEST_FILE = "/media/data1/feihong/remote/ckpt/test.txt"
+UNIV_IMAGE_FOLDER = "/media/data1/feihong/image_1024"
+HEADING_FOLDER = "/media/data1/feihong/range_250"
+TRAIN_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/train.json"
+TEST_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
+TRAIN_FILE = "/media/data1/feihong/ckpt/train.txt"
+TEST_FILE = "/media/data1/feihong/ckpt/test.txt"
 # UNIV_CROP_SIZE = (640, 640)
 UNIV_DRONE_SIZE = (256, 256)
 DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
@@ -378,7 +378,7 @@ def eval_model(run=False, checkpoint_path=None):
                 res_satellite[sample_name] = feat1[i].cpu().numpy()
                 res_drone[sample_name] = feat2[i].cpu().numpy()
 
-        SATELLITE_FOLDER = "/media/data1/feihong/remote/asian_univ"
+        SATELLITE_FOLDER = "/media/data1/feihong/asian_univ"
         satellite_files = sorted(
             [f for f in os.listdir(SATELLITE_FOLDER) if f.endswith(".png")]
         )
@@ -411,10 +411,10 @@ def eval_model(run=False, checkpoint_path=None):
         print("Evaluation feature extraction complete.")
     else:
         drone_res = np.load(
-            "/media/data1/feihong/remote/univerisity_dev/grounding_cvos/eval_search_fsra.npz"
+            "/media/data1/feihong/univerisity_dev/grounding_cvos/eval_search_fsra.npz"
         )
         search_res = np.load(
-            "/media/data1/feihong/remote/univerisity_dev/grounding_cvos/eval_drone_fsra.npz"
+            "/media/data1/feihong/univerisity_dev/grounding_cvos/eval_drone_fsra.npz"
         )
 
         distances = load_distances()
@@ -596,7 +596,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/media/data1/feihong/remote/ckpt/retrieval_sample4geo",
+        default="/media/data1/feihong/ckpt/retrieval_sample4geo",
         help="Path to save model checkpoints",
     )
     args = parser.parse_args()
@@ -605,5 +605,5 @@ if __name__ == "__main__":
     os.makedirs(args.checkpoint, exist_ok=True)
 
     main(args)
-    # eval_model(run=True, checkpoint_path="/media/data1/feihong/remote/ckpt/retrieval_sample4geo/best.pth")
+    # eval_model(run=True, checkpoint_path="/media/data1/feihong/ckpt/retrieval_sample4geo/best.pth")
     # eval_model(run=False)

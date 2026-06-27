@@ -1,24 +1,31 @@
-exp_name: model_heat_no_geo
+exp_name: baseline_retrieval_only
 save_root: /media/data1/feihong/ckpt
 end_num: 0.1
 use_ap: true
 
 config:
   NUM_EPOCHS: 20
-  BATCH_SIZE: 16
+  BATCH_SIZE: 32
   GRAD_ACCUMULATION_STEPS: 2
   LEARNING_RATE: 5.0e-5
   GRAD_CLIP_NORM: 1.0
   MODEL_NAME: google/siglip2-base-patch16-224
   USE_AMP: true
   ENABLE_TF32: true
-  ENCODER_TYPE: heat
+  ENCODER_TYPE: test
   LORA_RANK: 8
   LORA_ALPHA: 16.0
   LORA_DROPOUT: 0.05
-  OPTIMIZE_OBJECTIVE: combined
+  OPTIMIZE_OBJECTIVE: img_text_only
   USE_ANGLE_INPUT: false
   USE_TEXT_INPUT: false
-  USE_HEATMAP_LOSS: true
+  USE_HEATMAP_LOSS: false
   HEATMAP_LOSS_WEIGHT: 0.2
   HEATMAP_CONFIDENCE_WEIGHT: 0.5
+  USE_REFINE_LOSS: false
+  USE_TEXT_ANCHOR_LOSS: false
+  TEXT_ANCHOR_LOSS_WEIGHT: 0.5
+  TEXT_POOLER_ALIGN_START_WEIGHT: 0.05
+  TEXT_POOLER_ALIGN_END_WEIGHT: 0.005
+  TEXT_POOLER_ALIGN_DECAY_EPOCHS: 10
+  TEXT_POOLER_ALIGN_STOP_EPOCH: 10

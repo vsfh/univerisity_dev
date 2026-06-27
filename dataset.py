@@ -12,14 +12,14 @@ from torch.utils.data import Dataset
 
 
 # --- Configuration ---
-TRAIN_SATELLITE_ROOT = "/media/data1/feihong/remote/image_2048"
-TEST_SATELLITE_ROOT = "/media/data1/feihong/remote/img_test_2"
-DRONE_IMAGE_ROOT = "/media/data1/feihong/remote/data/drone_img"
-BBOX_FILE = "/media/data1/feihong/remote/ckpt/bbox_test_2.json"
+TRAIN_SATELLITE_ROOT = "/media/data1/feihong/image_2048"
+TEST_SATELLITE_ROOT = "/media/data1/feihong/img_test_2"
+DRONE_IMAGE_ROOT = "/media/data1/feihong/drone_img"
+BBOX_FILE = "/media/data1/feihong/ckpt/bbox_test_2.json"
 TRAIN_MAX_SATELLITE_ID = 1065
-TRAIN_SPLIT_FILE = "/media/data1/feihong/remote/ckpt/train.txt"
-VAL_SPLIT_FILE = "/media/data1/feihong/remote/ckpt/val.txt"
-TEST_SPLIT_FILE = "/media/data1/feihong/remote/ckpt/test_2.txt"
+TRAIN_SPLIT_FILE = "/media/data1/feihong/ckpt/train.txt"
+VAL_SPLIT_FILE = "/media/data1/feihong/ckpt/val.txt"
+TEST_SPLIT_FILE = "/media/data1/feihong/ckpt/test_2.txt"
 VAL_SPLIT_COUNT = 20
 TEST_SPLIT_COUNT = 400
 MAX_TEXT_LENGTH = 64
@@ -30,7 +30,7 @@ DEFAULT_SUBSET_ANGLES = [0, 45, 90, 135, 180, 225, 270, 315]
 DEFAULT_ENABLE_TIMING_LOG = False
 DEFAULT_TIMING_LOG_INTERVAL = 200
 DEFAULT_MODEL_NAME = "google/siglip2-base-patch16-224"
-DEFAULT_CACHE_DIR = "/media/data1/feihong/remote/hf_cache"
+DEFAULT_CACHE_DIR = "/media/data1/feihong/hf_cache"
 TEXT_DESCRIPTION_FILE = "qwen_6_19_description.json"
 TEXT_CYCLE_ORDER = (5, 4, 3, 2, 1)
 

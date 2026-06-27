@@ -53,9 +53,9 @@ PRINT_FREQ = 50
 CLICK_SIGMA = 0.16
 DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
-DEFAULT_OFFICIAL_PRETRAIN = "/media/data1/feihong/remote/ckpt/OCGNet.pth.tar"
-DEFAULT_DARKNET_CFG = "/media/data1/feihong/remote/ckpt/yolov3_rs.cfg"
-DEFAULT_YOLO_WEIGHTS = "/media/data1/feihong/remote/ckpt/yolov3.weights"
+DEFAULT_OFFICIAL_PRETRAIN = "/media/data1/feihong/ckpt/OCGNet.pth.tar"
+DEFAULT_DARKNET_CFG = "/media/data1/feihong/ckpt/yolov3_rs.cfg"
+DEFAULT_YOLO_WEIGHTS = "/media/data1/feihong/ckpt/yolov3.weights"
 
 
 class TransformProcessorWrapper:
@@ -872,7 +872,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/media/data1/feihong/remote/ckpt/ground_ocg",
+        default="/media/data1/feihong/ckpt/ground_ocg",
         help="Path to save model checkpoints",
     )
     args = parser.parse_args()

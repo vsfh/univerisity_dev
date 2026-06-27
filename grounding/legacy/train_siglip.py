@@ -36,7 +36,7 @@ from model_ground import Encoder_ground as SiglipLite
 from dataset import ShiftedSatelliteDroneDataset
 
 MODEL_NAME = "google/siglip2-base-patch16-224"
-CACHE_DIR = "/media/data1/feihong/remote/hf_cache"
+CACHE_DIR = "/media/data1/feihong/hf_cache"
 IMG_SIZE = (768, 432)  # (width, height)
 BATCH_SIZE = 32
 GRAD_ACCUMULATION_STEPS = 2
@@ -57,10 +57,10 @@ LEARNING_RATE = 5e-5
 WEIGHT_DECAY = 1e-4
 PRINT_FREQ = 50
 
-UNIV_IMAGE_FOLDER = "/media/data1/feihong/remote/image_1024"
-UNIV_BBOX_FILE = "/media/data1/feihong/remote/univerisity_dev/runs/test.json"
-UNIV_TRAIN_FILE = "/media/data1/feihong/remote/ckpt/train.txt"
-UNIV_TEST_FILE = "/media/data1/feihong/remote/ckpt/test.txt"
+UNIV_IMAGE_FOLDER = "/media/data1/feihong/image_1024"
+UNIV_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
+UNIV_TRAIN_FILE = "/media/data1/feihong/ckpt/train.txt"
+UNIV_TEST_FILE = "/media/data1/feihong/ckpt/test.txt"
 UNIV_CROP_SIZE = (IMG_SIZE[1], IMG_SIZE[0])
 UNIV_DRONE_SIZE = (256, 256)
 # Keep satellite tensors in HxW format for the shared dataset pipeline.
@@ -675,7 +675,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/media/data1/feihong/remote/ckpt/ground_siglip",
+        default="/media/data1/feihong/ckpt/ground_siglip",
         help="Path to save model checkpoints",
     )
     parser.add_argument(

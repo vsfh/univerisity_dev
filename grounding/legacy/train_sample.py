@@ -41,10 +41,10 @@ LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 PRINT_FREQ = 50
 GRAD_CLIP_NORM = 100.0
-UNIV_IMAGE_FOLDER = "/media/data1/feihong/remote/image_1024"
-UNIV_BBOX_FILE = "/media/data1/feihong/remote/univerisity_dev/runs/test.json"
-UNIV_TRAIN_FILE = "/media/data1/feihong/remote/ckpt/train.txt"
-UNIV_TEST_FILE = "/media/data1/feihong/remote/ckpt/test.txt"
+UNIV_IMAGE_FOLDER = "/media/data1/feihong/image_1024"
+UNIV_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
+UNIV_TRAIN_FILE = "/media/data1/feihong/ckpt/train.txt"
+UNIV_TEST_FILE = "/media/data1/feihong/ckpt/test.txt"
 # UNIV_CROP_SIZE = (640, 640)
 UNIV_DRONE_SIZE = (256, 256)
 UNIV_SAT_SIZE = IMG_SIZE
@@ -625,7 +625,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/media/data1/feihong/remote/ckpt/ground_sample",
+        default="/media/data1/feihong/ckpt/ground_sample",
         help="Path to save model checkpoints",
     )
     parser.add_argument(
@@ -654,7 +654,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pretrained-checkpoint",
         type=str,
-        default="/media/data1/feihong/remote/ckpt/Sample4Geo.pth",
+        default="/media/data1/feihong/ckpt/Sample4Geo.pth",
         help="Official Sample4Geo checkpoint used to initialize query/reference ConvNeXt backbones during training",
     )
     parser.add_argument(

@@ -24,7 +24,7 @@ The CVOGL-Seg dataset is created based on the CVOGL dataset; please download [CV
 
 Our CVOGL-Seg dataset only provides the object segmentation mask; please download it from the [link](https://drive.google.com/file/d/1b3w0uY16uhkYI80d14pNMS2E4_ml7CAV/view?usp=sharing).
 
-Download CVOGL and CVOGL-Seg and place them in the same directory, such as "/media/data1/feihong/remote/".
+Download CVOGL and CVOGL-Seg and place them in the same directory, such as "/media/data1/feihong/".
 
 # Usage
 
@@ -37,7 +37,7 @@ bash run_train_droneaerial.sh
 ```
 
 ```python
-python train.py --emb_size 768 --img_size 1024 --max_epoch 25 --data_root /media/data1/feihong/remote/CVOGL --seg_root /media/data1/feihong/remote/CVOGL-Seg --data_name CVOGL_DroneAerial --beta 1.0 --savename model_droneaerial --gpu 0,1 --batch_size 12 --num_workers 24 --print_freq 50
+python train.py --emb_size 768 --img_size 1024 --max_epoch 25 --data_root /media/data1/feihong/CVOGL --seg_root /media/data1/feihong/CVOGL-Seg --data_name CVOGL_DroneAerial --beta 1.0 --savename model_droneaerial --gpu 0,1 --batch_size 12 --num_workers 24 --print_freq 50
 ```
 
 Train on the **Ground → Satellite** task.
@@ -47,7 +47,7 @@ bash run_train_svi.sh
 ```
 
 ```python
-python train.py --emb_size 768 --img_size 1024 --max_epoch 25 --data_root /media/data1/feihong/remote/CVOGL --seg_root /media/data1/feihong/remote/CVOGL-Seg --data_name CVOGL_SVI --beta 1.0 --savename model_svi --gpu 0,1 --batch_size 12 --num_workers 8 --print_freq 50
+python train.py --emb_size 768 --img_size 1024 --max_epoch 25 --data_root /media/data1/feihong/CVOGL --seg_root /media/data1/feihong/CVOGL-Seg --data_name CVOGL_SVI --beta 1.0 --savename model_svi --gpu 0,1 --batch_size 12 --num_workers 8 --print_freq 50
 ```
 
 ## Evaluation
@@ -59,9 +59,9 @@ bash run_test_droneaerial.sh
 ```
 
 ```python
-python train.py --val --pretrain saved_models/model_droneaerial_model_best.pth.tar --emb_size 768 --img_size 1024 --data_root /media/data1/feihong/remote/CVOGL --seg_root /media/data1/feihong/remote/CVOGL-Seg --data_name CVOGL_DroneAerial --savename test_model_droneaerial --gpu 0,1 --batch_size 12 --num_workers 16 --print_freq 50
+python train.py --val --pretrain saved_models/model_droneaerial_model_best.pth.tar --emb_size 768 --img_size 1024 --data_root /media/data1/feihong/CVOGL --seg_root /media/data1/feihong/CVOGL-Seg --data_name CVOGL_DroneAerial --savename test_model_droneaerial --gpu 0,1 --batch_size 12 --num_workers 16 --print_freq 50
 
-python train.py --test --pretrain saved_models/model_droneaerial_model_best.pth.tar --emb_size 768 --img_size 1024 --data_root /media/data1/feihong/remote/CVOGL --seg_root /media/data1/feihong/remote/CVOGL-Seg --data_name CVOGL_DroneAerial --savename test_model_droneaerial --gpu 0,1 --batch_size 12 --num_workers 16 --print_freq 50
+python train.py --test --pretrain saved_models/model_droneaerial_model_best.pth.tar --emb_size 768 --img_size 1024 --data_root /media/data1/feihong/CVOGL --seg_root /media/data1/feihong/CVOGL-Seg --data_name CVOGL_DroneAerial --savename test_model_droneaerial --gpu 0,1 --batch_size 12 --num_workers 16 --print_freq 50
 ```
 
 Evaluate on the **Ground → Satellite** task.
@@ -71,9 +71,9 @@ bash run_test_svi.sh
 ```
 
 ```python
-python train.py --val --pretrain saved_models/model_svi_model_best.pth.tar --emb_size 768 --img_size 1024 --data_root /media/data1/feihong/remote/CVOGL --seg_root /media/data1/feihong/remote/CVOGL-Seg --data_name CVOGL_SVI --savename test_model_svi --gpu 0,1 --batch_size 12 --num_workers 16 --print_freq 50
+python train.py --val --pretrain saved_models/model_svi_model_best.pth.tar --emb_size 768 --img_size 1024 --data_root /media/data1/feihong/CVOGL --seg_root /media/data1/feihong/CVOGL-Seg --data_name CVOGL_SVI --savename test_model_svi --gpu 0,1 --batch_size 12 --num_workers 16 --print_freq 50
 
-python train.py --test --pretrain saved_models/model_svi_model_best.pth.tar --emb_size 768 --img_size 1024 --data_root /media/data1/feihong/remote/CVOGL --seg_root /media/data1/feihong/remote/CVOGL-Seg --data_name CVOGL_SVI --savename test_model_svi --gpu 0,1 --batch_size 12 --num_workers 16 --print_freq 50
+python train.py --test --pretrain saved_models/model_svi_model_best.pth.tar --emb_size 768 --img_size 1024 --data_root /media/data1/feihong/CVOGL --seg_root /media/data1/feihong/CVOGL-Seg --data_name CVOGL_SVI --savename test_model_svi --gpu 0,1 --batch_size 12 --num_workers 16 --print_freq 50
 ```
 
 # SAM Prompt

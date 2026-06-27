@@ -1,5 +1,5 @@
 exp_name: model_wo_angle
-save_root: /media/data1/feihong/remote/ckpt
+save_root: /media/data1/feihong/ckpt
 end_num: 0.7
 use_ap: true
 

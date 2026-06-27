@@ -31,10 +31,10 @@ torch.backends.cudnn.benchmark = True
 # --- Configuration ---
 MODEL_NAME = "openai/clip-vit-base-patch32"
 # MODEL_NAME = "openai/clip-vit-large-patch14"
-CACHE_DIR = "/media/data1/feihong/remote/hf_cache"
-DRONE_VIEW_FOLDER = "/media/data1/feihong/remote/drone_view"
-IMAGE_FOLDER = "/media/data1/feihong/remote/image_1024"
-HEADING_FOLDER = "/media/data1/feihong/remote/range_250"
+CACHE_DIR = "/media/data1/feihong/hf_cache"
+DRONE_VIEW_FOLDER = "/media/data1/feihong/drone_view"
+IMAGE_FOLDER = "/media/data1/feihong/image_1024"
+HEADING_FOLDER = "/media/data1/feihong/range_250"
 
 NUM_EPOCHS = 4
 BATCH_SIZE = 8

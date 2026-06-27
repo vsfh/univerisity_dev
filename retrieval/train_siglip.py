@@ -31,10 +31,10 @@ torch.backends.cudnn.benchmark = True
 
 # --- Configuration ---
 MODEL_NAME = "google/siglip-base-patch16-224"
-CACHE_DIR = "/media/data1/feihong/remote/hf_cache"
-DRONE_VIEW_FOLDER = "/media/data1/feihong/remote/drone_view"
-IMAGE_FOLDER = "/media/data1/feihong/remote/image_1024"
-HEADING_FOLDER = "/media/data1/feihong/remote/range_250"
+CACHE_DIR = "/media/data1/feihong/hf_cache"
+DRONE_VIEW_FOLDER = "/media/data1/feihong/drone_view"
+IMAGE_FOLDER = "/media/data1/feihong/image_1024"
+HEADING_FOLDER = "/media/data1/feihong/range_250"
 
 NUM_EPOCHS = 4
 BATCH_SIZE = 8
@@ -568,7 +568,7 @@ def score_eval_from_saved(
     query_payload = torch.load(query_feat_path, map_location="cpu")
     gallery_payload = torch.load(gallery_feat_path, map_location="cpu")
 
-    include_file = "/media/data1/feihong/remote/ckpt/include.json"
+    include_file = "/media/data1/feihong/ckpt/include.json"
     include_map = {}
 
     def _norm_label(label):

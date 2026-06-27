@@ -26,7 +26,7 @@ if dataset_name == "CVOGL_SVI":
 else:
     query_featuremap_hw = [256, 256]
 
-root_dir = "/media/data1/feihong/remote/CVOGL"
+root_dir = "/media/data1/feihong/CVOGL"
 root_dir = os.path.join(root_dir, dataset_name)
 queryimg_dir = os.path.join(root_dir, "query")
 rsimg_dir = os.path.join(root_dir, "satellite")

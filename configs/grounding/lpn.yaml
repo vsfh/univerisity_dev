@@ -1,5 +1,5 @@
 exp_name: lpn
-save_dir: /media/data1/feihong/remote/ckpt/ground_lpn
+save_dir: /media/data1/feihong/ckpt/ground_lpn
 
 model:
   type: lpn

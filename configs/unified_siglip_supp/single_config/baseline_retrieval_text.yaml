@@ -1,11 +1,11 @@
-exp_name: model_test_geo_input_ids
+exp_name: baseline_retrieval_text
 save_root: /media/data1/feihong/ckpt
 end_num: 0.1
 use_ap: true
 
 config:
   NUM_EPOCHS: 20
-  BATCH_SIZE: 16
+  BATCH_SIZE: 32
   GRAD_ACCUMULATION_STEPS: 2
   LEARNING_RATE: 5.0e-5
   GRAD_CLIP_NORM: 1.0
@@ -16,10 +16,10 @@ config:
   LORA_RANK: 8
   LORA_ALPHA: 16.0
   LORA_DROPOUT: 0.05
-  OPTIMIZE_OBJECTIVE: combined
-  USE_ANGLE_INPUT: true
+  OPTIMIZE_OBJECTIVE: img_text_only
+  USE_ANGLE_INPUT: false
   USE_TEXT_INPUT: true
-  USE_HEATMAP_LOSS: true
+  USE_HEATMAP_LOSS: false
   HEATMAP_LOSS_WEIGHT: 0.2
   HEATMAP_CONFIDENCE_WEIGHT: 0.5
   USE_REFINE_LOSS: false

@@ -31,10 +31,10 @@ torch.backends.cudnn.benchmark = True
 # --- Configuration ---
 MODEL_NAME = "ViT-B-32"
 PRETRAINED = "openai"
-CACHE_DIR = "/media/data1/feihong/remote/hf_cache"
-DRONE_VIEW_FOLDER = "/media/data1/feihong/remote/drone_view"
-IMAGE_FOLDER = "/media/data1/feihong/remote/image_1024"
-HEADING_FOLDER = "/media/data1/feihong/remote/range_250"
+CACHE_DIR = "/media/data1/feihong/hf_cache"
+DRONE_VIEW_FOLDER = "/media/data1/feihong/drone_view"
+IMAGE_FOLDER = "/media/data1/feihong/image_1024"
+HEADING_FOLDER = "/media/data1/feihong/range_250"
 
 NUM_EPOCHS = 8
 BATCH_SIZE = 8
@@ -506,7 +506,7 @@ def eval(run=False):
 
     if run:
         img_to_text_dict = json.load(
-            open("/media/data1/feihong/remote/drone_text_single_long.json", "r")
+            open("/media/data1/feihong/drone_text_single_long.json", "r")
         )
         model, _, preprocess = open_clip.create_model_and_transforms(
             MODEL_NAME, pretrained=PRETRAINED, cache_dir=CACHE_DIR
@@ -523,11 +523,11 @@ def eval(run=False):
 
         print("Setting up dataset and dataloader for eval...")
         eval_list = []
-        with open("/media/data1/feihong/remote/ckpt/test.txt", "r") as f:
+        with open("/media/data1/feihong/ckpt/test.txt", "r") as f:
             for line in f:
                 # img_path = line.strip().replace('01.', '41.')
                 index = line.strip().split('/')[-2]
-                img_path = f'/media/data1/feihong/remote/range_250/{index}_range250_heading0.png'
+                img_path = f'/media/data1/feihong/range_250/{index}_range250_heading0.png'
                 eval_list.append(img_path)
 
         dataset = EvalDataset(eval_list, preprocess, tokenizer, img_to_text_dict)
@@ -576,7 +576,7 @@ def eval(run=False):
                     res_search[name] = grid_feats_np[i]
                     res_fused_query[name] = fused_feats_np[i]
 
-        SATELLITE_FOLDER = "/media/data1/feihong/remote/asian_univ"
+        SATELLITE_FOLDER = "/media/data1/feihong/asian_univ"
         satellite_files = sorted(
             [f for f in os.listdir(SATELLITE_FOLDER) if f.endswith(".png")]
         )
@@ -617,7 +617,7 @@ def eval(run=False):
         search_res = np.load("eval_search_openclip.npz")
         fused_query_res = np.load("eval_fused_query_openclip.npz")
 
-        distances = json.load(open("/media/data1/feihong/remote/ckpt/distances.json", "r"))
+        distances = json.load(open("/media/data1/feihong/ckpt/distances.json", "r"))
         test_num = 100
         test_list = [k for k in search_res.keys() if not 'new' in k]
         res = {}
@@ -671,8 +671,8 @@ def eval(run=False):
 
 
 def eval_denseuav(run=False):
-    DENSE_UAV_ROOT = "/media/data1/feihong/remote/DenseUAV"
-    TEST_DENSE_FILE = "/media/data1/feihong/remote/ckpt/test_dense.txt"
+    DENSE_UAV_ROOT = "/media/data1/feihong/DenseUAV"
+    TEST_DENSE_FILE = "/media/data1/feihong/ckpt/test_dense.txt"
 
     def calcu_cos(a, b):
         a_norm = a / np.linalg.norm(a)
@@ -681,7 +681,7 @@ def eval_denseuav(run=False):
 
     if run:
         img_to_text_dict = json.load(
-            open("/media/data1/feihong/remote/drone_text_single_long.json", "r")
+            open("/media/data1/feihong/drone_text_single_long.json", "r")
         )
         model, _, preprocess = open_clip.create_model_and_transforms(
             MODEL_NAME, pretrained=PRETRAINED, cache_dir=CACHE_DIR

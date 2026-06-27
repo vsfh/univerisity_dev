@@ -48,8 +48,8 @@ from bbox.yolo_utils import SpatialTransformer
 # --- Configuration ---
 class Config:
     MODEL_NAME = "Qwen/Qwen3-VL-4B-Instruct"
-    CACHE_DIR = "/media/data1/feihong/remote/hf_cache"
-    SAVE_ROOT = "/media/data1/feihong/remote/ckpt"
+    CACHE_DIR = "/media/data1/feihong/hf_cache"
+    SAVE_ROOT = "/media/data1/feihong/ckpt"
     EXP_NAME = "text_qwen3vl"
 
     TRAIN_SATELLITE_ROOT = TRAIN_SATELLITE_ROOT

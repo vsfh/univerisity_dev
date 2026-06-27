@@ -1,7 +1,7 @@
 #!/bin/bash
 set -uo pipefail
 
-cd /media/data1/feihong/remote/univerisity_dev
+cd /media/data1/feihong/univerisity_dev
 
 DRY_RUN=0
 GPUS_CSV="${CUDA_VISIBLE_DEVICES:-0}"

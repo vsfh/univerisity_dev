@@ -1,5 +1,5 @@
 exp_name: siglip_ground
-save_dir: /media/data1/feihong/remote/ckpt/ground_siglip
+save_dir: /media/data1/feihong/ckpt/ground_siglip
 
 model:
   type: siglip_ground
