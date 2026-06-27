@@ -46,15 +46,15 @@ class Config:
     CLEARML_PROJECT = "unified_siglip"
     CLEARML_TASK_NAME = None
     MODEL_NAME = "google/siglip2-base-patch16-224"
-    CACHE_DIR = "/media/data1/feihong/hf_cache"
-    DRONE_VIEW_FOLDER = "/media/data1/feihong/drone_view"
-    IMAGE_FOLDER = "/media/data1/feihong/image_1024"
-    HEADING_FOLDER = "/media/data1/feihong/range_250"
-    TEXT_FILE = "/media/data1/feihong/ckpt/drone_text_single_long.json"
+    CACHE_DIR = "/media/data1/feihong/remote/hf_cache"
+    DRONE_VIEW_FOLDER = "/media/data1/feihong/remote/drone_view"
+    IMAGE_FOLDER = "/media/data1/feihong/remote/image_1024"
+    HEADING_FOLDER = "/media/data1/feihong/remote/range_250"
+    TEXT_FILE = "/media/data1/feihong/remote/ckpt/drone_text_single_long.json"
     TEXT_JSON_NAME = "udes_siglip2_gemma4.json"
-    TRAIN_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/train.json"
-    TEST_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
-    SATELLITE_FOLDER = "/media/data1/feihong/asian_univ"
+    TRAIN_BBOX_FILE = "/media/data1/feihong/remote/univerisity_dev/runs/train.json"
+    TEST_BBOX_FILE = "/media/data1/feihong/remote/univerisity_dev/runs/test.json"
+    SATELLITE_FOLDER = "/media/data1/feihong/remote/asian_univ"
 
     SAT_ORIG_SIZE = (3840, 2160)
     UNIV_SAT_SIZE = {"height": 432, "width": 768}
@@ -651,6 +651,7 @@ def build_encoder(use_ap: bool, usesg: bool = True) -> nn.Module:
             proj_dim=Config.PROJECTION_DIM,
             usesg=usesg,
             useap=use_ap,
+            use_heatmap=Config.USE_HEATMAP_LOSS,
             lora_rank=Config.LORA_RANK,
             lora_alpha=Config.LORA_ALPHA,
             lora_dropout=Config.LORA_DROPOUT,
@@ -661,6 +662,7 @@ def build_encoder(use_ap: bool, usesg: bool = True) -> nn.Module:
             proj_dim=Config.PROJECTION_DIM,
             usesg=usesg,
             useap=use_ap,
+            use_heatmap=Config.USE_HEATMAP_LOSS,
             lora_rank=Config.LORA_RANK,
             lora_alpha=Config.LORA_ALPHA,
             lora_dropout=Config.LORA_DROPOUT,
@@ -906,7 +908,7 @@ def load_data_splits() -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], se
     train_ids = set()
     test_ids = set()
 
-    with open("/media/data1/feihong/ckpt/train.txt", "r") as f:
+    with open("/media/data1/feihong/remote/ckpt/train.txt", "r") as f:
         for line in f:
             query_path = line.strip()
             name = query_path.split("/")[-2]
@@ -914,7 +916,7 @@ def load_data_splits() -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], se
             train_image_pairs.append((query_path, search_path))
             train_ids.add(name)
 
-    with open("/media/data1/feihong/ckpt/test.txt", "r") as f:
+    with open("/media/data1/feihong/remote/ckpt/test.txt", "r") as f:
         for line in f:
             query_path = line.strip()
             name = query_path.split("/")[-2]
@@ -1116,6 +1118,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     pred_anchor = pred_anchor.view(
                         B, 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
                     )
+
                     pred_anchor = add_heatmap_to_confidence(pred_anchor, heatmap_logits)
 
                     new_gt_bbox, best_anchor_gi_gj = build_target(
@@ -1421,7 +1424,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-root",
         type=str,
-        default="/media/data1/feihong/ckpt",
+        default="/media/data1/feihong/remote/ckpt",
         help="Root directory for checkpoints when --save-dir is not set.",
     )
     parser.add_argument(

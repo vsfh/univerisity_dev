@@ -31,14 +31,14 @@ DEFAULT_GPU_MEMORY_RESERVE_GIB = 2.0
 DEFAULT_FREE_MEMORY_RESERVE_GIB = 3.0
 DEFAULT_CUDA_ALLOC_CONF = "expandable_segments:True"
 DEFAULT_HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "")
-DEFAULT_IMAGE_ROOT = "/media/data1/feihong/drone_img"
+DEFAULT_IMAGE_ROOT = "/media/data1/feihong/remote/data/drone_img"
 IMAGE_SIZE = (256, 256)
 HEIGHTS = (150, 200, 250, 300)
 CARDINAL_ANGLES = (0, 90, 180, 270)
 DEFAULT_OUTPUT_NAME = "qwen_6_25_description.json"
 DEFAULT_SUMMARY_NAME = "qwen_6_25_description_summary.json"
 DEFAULT_GENERATION_BATCH_SIZE = 4
-DEFAULT_MAX_CASES = 5
+DEFAULT_MAX_CASES = 0
 REQUIRED_LOCAL_FILES = (
     "config.json",
     "tokenizer_config.json",

@@ -79,7 +79,7 @@ def find_duplicate_images_in_current_root(
 
 
 def list_folders_with_internal_duplicate_images(
-	root_dir: str = "/media/data1/feihong/drone_img",
+	root_dir: str = "/media/data1/feihong/remote/data/drone_img",
 	image_suffixes: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".bmp", ".webp"),
 ) -> Dict[str, List[List[str]]]:
 	"""Scan all subfolders and return those that contain duplicate images."""
@@ -104,7 +104,7 @@ def list_folders_with_internal_duplicate_images(
 
 
 def list_folders_with_same_images(
-	root_dir: str = "/media/data1/feihong/drone_img",
+	root_dir: str = "/media/data1/feihong/remote/data/drone_img",
 	image_name_a: str = "300_135.png",
 	image_name_b: str = "300_225.png",
 ) -> List[str]:

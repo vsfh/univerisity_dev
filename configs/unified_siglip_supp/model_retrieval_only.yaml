@@ -1,5 +1,5 @@
 exp_name: model_retrieval_only
-save_root: /media/data1/feihong/ckpt
+save_root: /media/data1/feihong/remote/ckpt
 end_num: 0.5
 use_ap: true
 

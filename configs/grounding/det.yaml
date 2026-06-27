@@ -1,5 +1,5 @@
 exp_name: det
-save_dir: /media/data1/feihong/ckpt/ground_det
+save_dir: /media/data1/feihong/remote/ckpt/ground_det
 
 model:
   type: det

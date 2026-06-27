@@ -126,12 +126,12 @@ import yaml
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "exp_name": "grounding_exp",
-    "save_dir": "/media/data1/feihong/ckpt/grounding_exp",
+    "save_dir": "/media/data1/feihong/remote/ckpt/grounding_exp",
     "model": {
         "type": "siglip2_heat",
         "checkpoint": None,
         "model_name": "google/siglip2-base-patch16-224",
-        "cache_dir": "/media/data1/feihong/hf_cache",
+        "cache_dir": "/media/data1/feihong/remote/hf_cache",
         "use_angle": True,
         "use_heatmap": True,
         "use_text": False,
@@ -195,7 +195,7 @@ Use this shared shape, changing `exp_name`, `save_dir`, `model.type`, and model 
 
 ```yaml
 exp_name: siglip2_heat
-save_dir: /media/data1/feihong/ckpt/ground_siglip2_heat
+save_dir: /media/data1/feihong/remote/ckpt/ground_siglip2_heat
 
 model:
   type: siglip2_heat
@@ -211,7 +211,7 @@ eval:
 
 ```yaml
 exp_name: siglip2_test
-save_dir: /media/data1/feihong/ckpt/ground_siglip2_test
+save_dir: /media/data1/feihong/remote/ckpt/ground_siglip2_test
 
 model:
   type: siglip2_test
@@ -227,7 +227,7 @@ eval:
 
 ```yaml
 exp_name: siglip_ground
-save_dir: /media/data1/feihong/ckpt/ground_siglip
+save_dir: /media/data1/feihong/remote/ckpt/ground_siglip
 
 model:
   type: siglip_ground
@@ -243,7 +243,7 @@ eval:
 
 ```yaml
 exp_name: lpn
-save_dir: /media/data1/feihong/ckpt/ground_lpn
+save_dir: /media/data1/feihong/remote/ckpt/ground_lpn
 
 model:
   type: lpn
@@ -259,7 +259,7 @@ eval:
 
 ```yaml
 exp_name: sample4geo
-save_dir: /media/data1/feihong/ckpt/ground_sample
+save_dir: /media/data1/feihong/remote/ckpt/ground_sample
 
 model:
   type: sample4geo
@@ -275,7 +275,7 @@ eval:
 
 ```yaml
 exp_name: smgeo
-save_dir: /media/data1/feihong/ckpt/ground_sm
+save_dir: /media/data1/feihong/remote/ckpt/ground_sm
 
 model:
   type: smgeo
@@ -291,7 +291,7 @@ eval:
 
 ```yaml
 exp_name: ocg
-save_dir: /media/data1/feihong/ckpt/ground_ocg
+save_dir: /media/data1/feihong/remote/ckpt/ground_ocg
 
 model:
   type: ocg
@@ -307,7 +307,7 @@ eval:
 
 ```yaml
 exp_name: trogeolite
-save_dir: /media/data1/feihong/ckpt/ground_cvos
+save_dir: /media/data1/feihong/remote/ckpt/ground_cvos
 
 model:
   type: trogeolite
@@ -323,7 +323,7 @@ eval:
 
 ```yaml
 exp_name: det
-save_dir: /media/data1/feihong/ckpt/ground_det
+save_dir: /media/data1/feihong/remote/ckpt/ground_det
 
 model:
   type: det
@@ -1510,7 +1510,7 @@ Create `train_ground_group.sh`:
 #!/bin/bash
 set -uo pipefail
 
-cd /media/data1/feihong/univerisity_dev
+cd /media/data1/feihong/remote/univerisity_dev
 
 DRY_RUN=0
 EXTRA_ARGS=()
@@ -1847,7 +1847,7 @@ python grounding/eval.py --config configs/grounding/siglip2_heat.yaml --max-batc
 
 Expected:
 
-- train writes `/media/data1/feihong/ckpt/ground_siglip2_heat/last.pth`
+- train writes `/media/data1/feihong/remote/ckpt/ground_siglip2_heat/last.pth`
 - eval writes `eval_results/grounding/siglip2_heat/metrics.json`
 - metrics JSON contains `mean_iou`, `iou_at_0_5`, `iou_at_0_25`, `mean_center_distance`
 

@@ -57,7 +57,7 @@ Example:
 
 ```yaml
 exp_name: siglip2_heat
-save_dir: /media/data1/feihong/ckpt/ground_siglip2_heat
+save_dir: /media/data1/feihong/remote/ckpt/ground_siglip2_heat
 
 model:
   type: siglip2_heat

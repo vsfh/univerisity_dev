@@ -1,9 +1,9 @@
 exp_name: sample4geo
-save_dir: /media/data1/feihong/ckpt/ground_sample
+save_dir: /media/data1/feihong/remote/ckpt/ground_sample
 
 model:
   type: sample4geo
-  checkpoint: /media/data1/feihong/ckpt/Sample4Geo.pth
+  checkpoint: /media/data1/feihong/remote/ckpt/Sample4Geo.pth
   use_angle: true
   use_heatmap: false
   use_text: false

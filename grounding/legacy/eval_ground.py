@@ -30,20 +30,20 @@ from bbox.yolo_utils import bbox_iou, build_target, eval_iou_acc
 
 # --- Configuration ---
 MODEL_NAME_SIGLIP = "google/siglip2-base-patch16-224"
-CACHE_DIR = "/media/data1/feihong/hf_cache"
+CACHE_DIR = "/media/data1/feihong/remote/hf_cache"
 DEFAULT_SAT_SIZE = (432, 768)  # (H, W)
 DEFAULT_DRONE_SIZE = (256, 256)  # (H, W)
 DEFAULT_DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 BATCH_SIZE = 8
 DEFAULT_GROUNDING_RUNS = {
-    "det": "/media/data1/feihong/ckpt/ground_det/last.pth",
-    "lpn": "/media/data1/feihong/ckpt/ground_lpn/last.pth",
-    "sample4geo": "/media/data1/feihong/ckpt/ground_sample/last.pth",
-    "smgeo": "/media/data1/feihong/ckpt/ground_sm/last.pth",
-    "ocg": "/media/data1/feihong/ckpt/ground_ocg/last.pth",
-    "trogeolite": "/media/data1/feihong/ckpt/ground_cvos/last.pth",
-    "encoder_test": "/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth",
+    "det": "/media/data1/feihong/remote/ckpt/ground_det/last.pth",
+    "lpn": "/media/data1/feihong/remote/ckpt/ground_lpn/last.pth",
+    "sample4geo": "/media/data1/feihong/remote/ckpt/ground_sample/last.pth",
+    "smgeo": "/media/data1/feihong/remote/ckpt/ground_sm/last.pth",
+    "ocg": "/media/data1/feihong/remote/ckpt/ground_ocg/last.pth",
+    "trogeolite": "/media/data1/feihong/remote/ckpt/ground_cvos/last.pth",
+    "encoder_test": "/media/data1/feihong/remote/ckpt/model_test_geo_input_ids/last.pth",
 }
 
 
@@ -78,21 +78,21 @@ EVAL_CONFIG = {
     "subset_angles": [0, 45, 90, 135, 180, 225, 270, 315],
     # "subset_heights": [250, 300],
     # "subset_angles": [0, 45, 90, 135],
-    "output_dir": "/media/data1/feihong/univerisity_dev/eval_results",
-    "visualize_output_dir": "/media/data1/feihong/univerisity_dev/eval_results/visualizations",
+    "output_dir": "/media/data1/feihong/remote/univerisity_dev/eval_results",
+    "visualize_output_dir": "/media/data1/feihong/remote/univerisity_dev/eval_results/visualizations",
     "visualize_num_cases": 10,
     "heatmap_confidence_weight": 0.5,
     "models": {
-        "det": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_det/last.pth",},
-        "siglip": {"run": True, "checkpoint": "/media/data1/feihong/ckpt/ground_siglip/last.pth"},
-        # "encoder_abla": {"run": True, "checkpoint": '/media/data1/feihong/ckpt/0.1_full_model/best_iou.pth'},
-        # "encoder_heat": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/0.5_mix_model_heat/last.pth"},
-        "lpn": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_lpn/last.pth"},
-        "sample4geo": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_sample/last.pth"},
-        "smgeo": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_sm/last.pth"},
-        "ocg": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_ocg/last.pth"},
-        "trogeolite": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/ground_cvos/last.pth"},
-        "encoder_test": {"run": False, "checkpoint": "/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth"},
+        "det": {"run": False, "checkpoint": "/media/data1/feihong/remote/ckpt/ground_det/last.pth",},
+        "siglip": {"run": True, "checkpoint": "/media/data1/feihong/remote/ckpt/ground_siglip/last.pth"},
+        # "encoder_abla": {"run": True, "checkpoint": '/media/data1/feihong/remote/ckpt/0.1_full_model/best_iou.pth'},
+        # "encoder_heat": {"run": False, "checkpoint": "/media/data1/feihong/remote/ckpt/0.5_mix_model_heat/last.pth"},
+        "lpn": {"run": False, "checkpoint": "/media/data1/feihong/remote/ckpt/ground_lpn/last.pth"},
+        "sample4geo": {"run": False, "checkpoint": "/media/data1/feihong/remote/ckpt/ground_sample/last.pth"},
+        "smgeo": {"run": False, "checkpoint": "/media/data1/feihong/remote/ckpt/ground_sm/last.pth"},
+        "ocg": {"run": False, "checkpoint": "/media/data1/feihong/remote/ckpt/ground_ocg/last.pth"},
+        "trogeolite": {"run": False, "checkpoint": "/media/data1/feihong/remote/ckpt/ground_cvos/last.pth"},
+        "encoder_test": {"run": False, "checkpoint": "/media/data1/feihong/remote/ckpt/model_test_geo_input_ids/last.pth"},
     },
 }
 
@@ -1050,15 +1050,15 @@ def eval_encoder_text_angle_checkpoints(
     subset_heights: Optional[Sequence[int]] = None,
     subset_angles: Optional[Sequence[int]] = None,
     visualize_output_dir: str = "",
-    output_dir: str = "/media/data1/feihong/univerisity_dev/eval_results",
+    output_dir: str = "/media/data1/feihong/remote/univerisity_dev/eval_results",
     output_json_path: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Evaluate the same Encoder_text_angle model across multiple checkpoints."""
     checkpoint_paths = [
-        "/media/data1/feihong/ckpt/0.5_mix_model_heat_2/last.pth",
-		# "/media/data1/feihong/ckpt/0.5_mix_model_wo_angle/last.pth",
-		# "/media/data1/feihong/ckpt/0.5_mix_model_wo_text/last.pth",
-		# "/media/data1/feihong/ckpt/0.9999_mix_model_bbox_only/last.pth",
+        "/media/data1/feihong/remote/ckpt/0.5_mix_model_heat_2/last.pth",
+		# "/media/data1/feihong/remote/ckpt/0.5_mix_model_wo_angle/last.pth",
+		# "/media/data1/feihong/remote/ckpt/0.5_mix_model_wo_text/last.pth",
+		# "/media/data1/feihong/remote/ckpt/0.9999_mix_model_bbox_only/last.pth",
     ]
     if not checkpoint_paths:
         raise ValueError("checkpoint_paths must not be empty.")
@@ -1152,7 +1152,7 @@ def main():
             subset_heights=EVAL_CONFIG.get("subset_heights"),
             subset_angles=EVAL_CONFIG.get("subset_angles"),
             visualize_output_dir=str(EVAL_CONFIG.get("visualize_output_dir", "")),
-            output_dir=str(EVAL_CONFIG.get("output_dir", "/media/data1/feihong/univerisity_dev/eval_results")),
+            output_dir=str(EVAL_CONFIG.get("output_dir", "/media/data1/feihong/remote/univerisity_dev/eval_results")),
             heatmap_confidence_weight=float(EVAL_CONFIG.get("heatmap_confidence_weight", 0.5)),
             visualize_num_cases=int(EVAL_CONFIG.get("visualize_num_cases", 10)),
         )
@@ -1194,7 +1194,7 @@ def main_with_drone_name_filter(drone_name_filter_path: str):
             subset_heights=EVAL_CONFIG.get("subset_heights"),
             subset_angles=EVAL_CONFIG.get("subset_angles"),
             visualize_output_dir=str(EVAL_CONFIG.get("visualize_output_dir", "")),
-            output_dir=str(EVAL_CONFIG.get("output_dir", "/media/data1/feihong/univerisity_dev/eval_results")),
+            output_dir=str(EVAL_CONFIG.get("output_dir", "/media/data1/feihong/remote/univerisity_dev/eval_results")),
             heatmap_confidence_weight=float(EVAL_CONFIG.get("heatmap_confidence_weight", 0.5)),
             drone_name_filter_path=str(drone_name_filter_path),
             visualize_num_cases=int(EVAL_CONFIG.get("visualize_num_cases", 10)),
@@ -1312,7 +1312,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default=str(EVAL_CONFIG.get("output_dir", "/media/data1/feihong/univerisity_dev/eval_results")),
+        default=str(EVAL_CONFIG.get("output_dir", "/media/data1/feihong/remote/univerisity_dev/eval_results")),
     )
     parser.add_argument("--visualize-output-dir", type=str, default=str(EVAL_CONFIG.get("visualize_output_dir", "")))
     parser.add_argument(
@@ -1343,5 +1343,5 @@ if __name__ == "__main__":
     else:
         _run_cli(cli_args)
     # main_with_drone_name_filter(
-    #     "/media/data1/feihong/univerisity_dev/eval_results/retrieval_xxx/eval_retrieval_xxx_top1_success_drone_names.txt"
+    #     "/media/data1/feihong/remote/univerisity_dev/eval_results/retrieval_xxx/eval_retrieval_xxx_top1_success_drone_names.txt"
     # )

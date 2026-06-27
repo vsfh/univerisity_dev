@@ -1,5 +1,5 @@
 exp_name: model_3
-save_root: /media/data1/feihong/ckpt
+save_root: /media/data1/feihong/remote/ckpt
 end_num: 0.1
 use_ap: true
 

@@ -163,12 +163,12 @@ def update_name(root, new_name):
         name_elem.text = new_name
 
 def generate_satellite(input_folder):
-    KML_TEMPLATE_PATH = "/media/data1/feihong/kml_1024/0008.kml"
-    KML_TEMPLATE_PATH = "/media/data1/feihong/ckpt/0008.kml"
-    OUTPUT_DIR = '/media/data1/feihong/new_univ_kml'
+    KML_TEMPLATE_PATH = "/media/data1/feihong/remote/kml_1024/0008.kml"
+    KML_TEMPLATE_PATH = "/media/data1/feihong/remote/ckpt/0008.kml"
+    OUTPUT_DIR = '/media/data1/feihong/remote/new_univ_kml'
     OUTPUT_DIR = input_folder
-    UNIV_DATA_PATH= '/media/data1/feihong/univerisity_dev/asian_200_libraries_free.txt'
-    UNIV_DATA_PATH= '/media/data1/feihong/univerisity_dev/runs/university_targets_clean_third.txt'
+    UNIV_DATA_PATH= '/media/data1/feihong/remote/univerisity_dev/asian_200_libraries_free.txt'
+    UNIV_DATA_PATH= '/media/data1/feihong/remote/univerisity_dev/runs/university_targets_clean_third.txt'
     # Read template KML
     tree, root = parse_kml(KML_TEMPLATE_PATH)
     # Extract original LookAt values to preserve
@@ -211,11 +211,11 @@ def generate_satellite(input_folder):
 
 if __name__ == "__main__":
     import sys
-    input_folder = '/media/data1/feihong/kml_1024'
-    # input_folder = '/media/data1/feihong/new_kml'
-    output_folder = '/media/data1/feihong/kml_drone_3_range_4_heading'
-    output_folder = '/media/data1/feihong/new_kml_drone'
-    output_folder = '/media/data1/feihong/kml_drone_1024'
+    input_folder = '/media/data1/feihong/remote/kml_1024'
+    # input_folder = '/media/data1/feihong/remote/new_kml'
+    output_folder = '/media/data1/feihong/remote/kml_drone_3_range_4_heading'
+    output_folder = '/media/data1/feihong/remote/new_kml_drone'
+    output_folder = '/media/data1/feihong/remote/kml_drone_1024'
     # generate_satellite(input_folder)
 
     generate_drone(input_folder, output_folder)

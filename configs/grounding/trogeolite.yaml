@@ -1,5 +1,5 @@
 exp_name: trogeolite
-save_dir: /media/data1/feihong/ckpt/ground_cvos
+save_dir: /media/data1/feihong/remote/ckpt/ground_cvos
 
 model:
   type: trogeolite

@@ -7,12 +7,12 @@ import yaml
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "exp_name": "grounding_exp",
-    "save_dir": "/media/data1/feihong/ckpt/grounding_exp",
+    "save_dir": "/media/data1/feihong/remote/ckpt/grounding_exp",
     "model": {
         "type": "siglip2_heat",
         "checkpoint": None,
         "model_name": "google/siglip2-base-patch16-224",
-        "cache_dir": "/media/data1/feihong/hf_cache",
+        "cache_dir": "/media/data1/feihong/remote/hf_cache",
         "use_angle": True,
         "use_heatmap": True,
         "use_text": False,

@@ -1,10 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-cd /media/data1/feihong/univerisity_dev
+cd /media/data1/feihong/remote/univerisity_dev
 
-CHECKPOINT="${CHECKPOINT:-/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/media/data1/feihong/univerisity_dev/eval_results/test_unify/model_test_geo_input_ids_para}"
+CHECKPOINT="${CHECKPOINT:-/media/data1/feihong/remote/ckpt/model_test_geo_input_ids/last.pth}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/media/data1/feihong/remote/univerisity_dev/eval_results/test_unify/model_test_geo_input_ids_para}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 

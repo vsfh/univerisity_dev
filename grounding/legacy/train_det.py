@@ -44,10 +44,10 @@ WEIGHT_DECAY = 1e-4
 GRAD_CLIP_NORM = 10.0
 PRINT_FREQ = 50
 
-UNIV_IMAGE_FOLDER = "/media/data1/feihong/image_1024"
-UNIV_BBOX_FILE = "/media/data1/feihong/univerisity_dev/runs/test.json"
-UNIV_TRAIN_FILE = "/media/data1/feihong/ckpt/train.txt"
-UNIV_TEST_FILE = "/media/data1/feihong/ckpt/test.txt"
+UNIV_IMAGE_FOLDER = "/media/data1/feihong/remote/image_1024"
+UNIV_BBOX_FILE = "/media/data1/feihong/remote/univerisity_dev/runs/test.json"
+UNIV_TRAIN_FILE = "/media/data1/feihong/remote/ckpt/train.txt"
+UNIV_TEST_FILE = "/media/data1/feihong/remote/ckpt/test.txt"
 UNIV_CROP_SIZE = (IMG_SIZE[1], IMG_SIZE[0])
 UNIV_DRONE_SIZE = (256, 256)
 # Keep satellite tensors in HxW format for the shared dataset pipeline.
@@ -539,7 +539,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/media/data1/feihong/ckpt/ground_det",
+        default="/media/data1/feihong/remote/ckpt/ground_det",
         help="Path to save model checkpoints",
     )
     parser.add_argument(

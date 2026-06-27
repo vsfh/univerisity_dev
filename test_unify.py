@@ -37,14 +37,14 @@ from train_trans import (
 
 # --- Configuration ---
 MODEL_NAME = "google/siglip2-base-patch16-224"
-CACHE_DIR = "/media/data1/feihong/hf_cache"
+CACHE_DIR = "/media/data1/feihong/remote/hf_cache"
 DEFAULT_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-DEFAULT_OUTPUT_DIR = "/media/data1/feihong/univerisity_dev/eval_results/test_unify"
-DEFAULT_INCLUDE_FILE = "/media/data1/feihong/ckpt/include2.json"
-DEFAULT_ENCODER_HEAT_CONFIG_DIR = "/media/data1/feihong/univerisity_dev/configs/unified_siglip_supp"
-DEFAULT_ENCODER_HEAT_CHECKPOINT = "/media/data1/feihong/ckpt/model_full/last.pth"
-DEFAULT_UNIFY_CHECKPOINT = "/media/data1/feihong/ckpt/unify_geo/last.pth"
-DEFAULT_TRANS_CHECKPOINT = "/media/data1/feihong/ckpt/trans_geo/last.pth"
+DEFAULT_OUTPUT_DIR = "/media/data1/feihong/remote/univerisity_dev/eval_results/test_unify"
+DEFAULT_INCLUDE_FILE = "/media/data1/feihong/remote/ckpt/include2.json"
+DEFAULT_ENCODER_HEAT_CONFIG_DIR = "/media/data1/feihong/remote/univerisity_dev/configs/unified_siglip_supp"
+DEFAULT_ENCODER_HEAT_CHECKPOINT = "/media/data1/feihong/remote/ckpt/model_full/last.pth"
+DEFAULT_UNIFY_CHECKPOINT = "/media/data1/feihong/remote/ckpt/unify_geo/last.pth"
+DEFAULT_TRANS_CHECKPOINT = "/media/data1/feihong/remote/ckpt/trans_geo/last.pth"
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 
 
@@ -193,7 +193,7 @@ def bool_from_config(config: Dict[str, Any], key: str, default: bool) -> bool:
 def resolve_encoder_heat_checkpoint(config_path: str, payload: Dict[str, Any], checkpoint_name: str) -> str:
     config_file = Path(config_path)
     exp_name = str(payload.get("exp_name") or payload.get("name") or config_file.stem)
-    save_root = str(payload.get("save_root", "/media/data1/feihong/ckpt"))
+    save_root = str(payload.get("save_root", "/media/data1/feihong/remote/ckpt"))
     save_dir = payload.get("save_dir")
 
     candidates: List[Path] = []
@@ -249,6 +249,7 @@ def discover_encoder_heat_runs(config_dir: str, checkpoint_name: str) -> List[Di
                 "use_text": bool_from_config(config, "USE_TEXT_INPUT", True),
                 "use_angle": bool_from_config(config, "USE_ANGLE_INPUT", True),
                 "use_ap": bool(payload.get("use_ap", True)),
+                "use_heatmap": bool_from_config(config, "USE_HEATMAP_LOSS", True),
                 "heatmap_confidence_weight": float(
                     config.get("HEATMAP_CONFIDENCE_WEIGHT", 0.5)
                 ),
@@ -380,6 +381,7 @@ def extract_encoder_heat_features(
     use_text: bool = True,
     use_angle: bool = True,
     use_ap: bool = True,
+    use_heatmap: bool = True,
     encoder_cls: type = Encoder_heat,
     desc: str = "encoder_heat",
     lora_rank: int = 8,
@@ -391,6 +393,7 @@ def extract_encoder_heat_features(
         proj_dim=768,
         usesg=True,
         useap=use_ap,
+        use_heatmap=use_heatmap,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
@@ -485,8 +488,8 @@ def extract_encoder_heat_features(
             )
             pred_anchor = add_heatmap_to_confidence(
                 pred_anchor,
-                heatmap_logits,
-                confidence_weight=heatmap_confidence_weight,
+                heatmap_logits if use_heatmap else None,
+                confidence_weight=heatmap_confidence_weight if use_heatmap else 0.0,
             )
             image_wh = (int(sat_size[1]), int(sat_size[0]))
             grid_wh = (int(pred_anchor.shape[-1]), int(pred_anchor.shape[-2]))
@@ -1031,9 +1034,6 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
     subset_angles = args.subset_angles if args.subset_angles else None
 
     if model_type in {"encoder_heat", "encoder_test"}:
-        if model_type == "encoder_test":
-            if not args.encoder_heat_use_angle:
-                raise ValueError("encoder_test requires --encoder-heat-use-angle.")
         encoder_cls = Encoder_test if model_type == "encoder_test" else Encoder_heat
         bundle = extract_encoder_heat_features(
             checkpoint_path=checkpoint_path,
@@ -1048,6 +1048,7 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
             use_text=args.encoder_heat_use_text,
             use_angle=args.encoder_heat_use_angle,
             use_ap=args.encoder_heat_use_ap,
+            use_heatmap=args.encoder_heat_use_heatmap,
             encoder_cls=encoder_cls,
             desc=model_type,
             lora_rank=args.lora_rank,
@@ -1115,6 +1116,7 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
         "encoder_use_text": bool(args.encoder_heat_use_text) if model_type in {"encoder_heat", "encoder_test"} else None,
         "encoder_use_angle": bool(args.encoder_heat_use_angle) if model_type in {"encoder_heat", "encoder_test"} else None,
         "encoder_heat_use_ap": bool(args.encoder_heat_use_ap) if model_type in {"encoder_heat", "encoder_test"} else None,
+        "encoder_heat_use_heatmap": bool(args.encoder_heat_use_heatmap) if model_type in {"encoder_heat", "encoder_test"} else None,
         "heatmap_confidence_weight": float(args.heatmap_confidence_weight) if model_type in {"encoder_heat", "encoder_test"} else None,
         "encoder_heat_text_score_weight": float(args.encoder_heat_text_score_weight) if model_type in {"encoder_heat", "encoder_test"} else None,
         "encoder_heat_text_rerank_topk": int(args.encoder_heat_text_rerank_topk) if model_type in {"encoder_heat", "encoder_test"} else None,
@@ -1217,6 +1219,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-encoder-heat-use-angle", dest="encoder_heat_use_angle", action="store_false")
     parser.add_argument("--encoder-heat-use-ap", action="store_true", default=True)
     parser.add_argument("--no-encoder-heat-use-ap", dest="encoder_heat_use_ap", action="store_false")
+    parser.add_argument("--encoder-heat-use-heatmap", action="store_true", default=True)
+    parser.add_argument("--no-encoder-heat-use-heatmap", dest="encoder_heat_use_heatmap", action="store_false")
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
@@ -1286,6 +1290,7 @@ def main() -> None:
             args.encoder_heat_use_text = bool(run["use_text"])
             args.encoder_heat_use_angle = bool(run["use_angle"])
             args.encoder_heat_use_ap = bool(run["use_ap"])
+            args.encoder_heat_use_heatmap = bool(run["use_heatmap"])
             args.heatmap_confidence_weight = float(run["heatmap_confidence_weight"])
             metrics = evaluate_model("encoder_heat", str(run["checkpoint_path"]), args)
             metrics["config_path"] = run["config_path"]
@@ -1295,6 +1300,7 @@ def main() -> None:
                 "use_text": bool(run["use_text"]),
                 "use_angle": bool(run["use_angle"]),
                 "use_ap": bool(run["use_ap"]),
+                "use_heatmap": bool(run["use_heatmap"]),
                 "heatmap_confidence_weight": float(run["heatmap_confidence_weight"]),
                 "text_score_weight": float(args.encoder_heat_text_score_weight),
             }

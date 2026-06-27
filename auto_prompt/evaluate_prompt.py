@@ -29,12 +29,12 @@ DEFAULT_DESCRIPTION_DIR = AUTO_PROMPT_DIR / "generated_descriptions"
 DEFAULT_QUERY_RECORD_DIR = AUTO_PROMPT_DIR / "query_records"
 
 DEFAULT_MODEL_NAME = "google/siglip2-base-patch16-224"
-DEFAULT_CACHE_DIR = "/media/data1/feihong/hf_cache"
-DEFAULT_CHECKPOINT = "/media/data1/feihong/ckpt/model_test_geo_input_ids/last.pth"
-DEFAULT_INCLUDE_FILE = "/media/data1/feihong/ckpt/include2.json"
-DEFAULT_TEST_SPLIT_FILE = "/media/data1/feihong/ckpt/test_2.txt"
-DEFAULT_TEST_SATELLITE_ROOT = "/media/data1/feihong/img_test_2"
-DEFAULT_DRONE_IMAGE_ROOT = "/media/data1/feihong/drone_img"
+DEFAULT_CACHE_DIR = "/media/data1/feihong/remote/hf_cache"
+DEFAULT_CHECKPOINT = "/media/data1/feihong/remote/ckpt/model_test_geo_input_ids/last.pth"
+DEFAULT_INCLUDE_FILE = "/media/data1/feihong/remote/ckpt/include2.json"
+DEFAULT_TEST_SPLIT_FILE = "/media/data1/feihong/remote/ckpt/test_2.txt"
+DEFAULT_TEST_SATELLITE_ROOT = "/media/data1/feihong/remote/img_test_2"
+DEFAULT_DRONE_IMAGE_ROOT = "/media/data1/feihong/remote/data/drone_img"
 DEFAULT_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 DEFAULT_SAT_SIZE = (432, 768)
 DEFAULT_SUBSET_HEIGHTS = [150, 200, 250, 300]
@@ -780,7 +780,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subset-angles", type=int, nargs="*", default=DEFAULT_SUBSET_ANGLES)
     parser.add_argument("--candidate-size", type=int, default=50)
     parser.add_argument("--include-file", type=str, default=DEFAULT_INCLUDE_FILE)
-    parser.add_argument("--bbox-file", type=str, default="/media/data1/feihong/ckpt/bbox_test_2.json")
+    parser.add_argument("--bbox-file", type=str, default="/media/data1/feihong/remote/ckpt/bbox_test_2.json")
     parser.add_argument("--test-split-file", type=str, default=DEFAULT_TEST_SPLIT_FILE)
     parser.add_argument("--test-satellite-root", type=str, default=DEFAULT_TEST_SATELLITE_ROOT)
     parser.add_argument("--drone-image-root", type=str, default=DEFAULT_DRONE_IMAGE_ROOT)

@@ -5,8 +5,8 @@ import torch.nn as nn
 
 from grounding.adapters import BaseAdapter, DirectBboxAdapter, LegacyAnchorAdapter, SMGeoAdapter, SiglipTupleAdapter
 
-DEFAULT_SAMPLE4GEO_CHECKPOINT = "/media/data1/feihong/ckpt/Sample4Geo.pth"
-DEFAULT_SMGEO_CHECKPOINT = "/media/data1/feihong/ckpt/SMGeo.pth"
+DEFAULT_SAMPLE4GEO_CHECKPOINT = "/media/data1/feihong/remote/ckpt/Sample4Geo.pth"
+DEFAULT_SMGEO_CHECKPOINT = "/media/data1/feihong/remote/ckpt/SMGeo.pth"
 
 
 @dataclass

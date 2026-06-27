@@ -11,7 +11,7 @@ from bbox.yolo_utils import SpatialTransformer
 # --- Configuration ---
 MODEL_NAME = "google/siglip2-base-patch16-224"
 SIGLIP2_MODEL_NAME = MODEL_NAME
-CACHE_DIR = "/media/data1/feihong/hf_cache"
+CACHE_DIR = "/media/data1/feihong/remote/hf_cache"
 PROJECTION_DIM = 768
 
 
@@ -161,6 +161,7 @@ class Encoder_heat(nn.Module):
         heat_channels: int = 128,
         heat_kernel_size: int = 9,
         heat_softmax_temperature: float = 1.0,
+        use_heatmap: bool = True,
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.05,
@@ -180,6 +181,7 @@ class Encoder_heat(nn.Module):
             raise ValueError(f"proj_dim={proj_dim} must match vision hidden size {self.feature_dim}.")
 
         self.usesg = usesg
+        self.use_heatmap = bool(use_heatmap)
         self.heat_kernel_size = int(heat_kernel_size)
         self.heat_softmax_temperature = float(heat_softmax_temperature)
 
@@ -417,18 +419,26 @@ class Encoder_heat(nn.Module):
         sat_features_2d: torch.Tensor,
         angle: Optional[torch.Tensor],
         detach_anchor: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         anchor_context = self._anchor_context(anchor_feats, angle, detach_anchor=detach_anchor)
-        heatmap_logits = self._dynamic_heatmap(
-            anchor_feats,
-            sat_features_2d,
-            angle,
-            detach_anchor=detach_anchor,
-        )
-        # heatmap = self._spatial_softmax(heatmap_logits)
-        heatmap = heatmap_logits
+        heatmap_logits = None
+        if self.use_heatmap:
+            heatmap_logits = self._dynamic_heatmap(
+                anchor_feats,
+                sat_features_2d,
+                angle,
+                detach_anchor=detach_anchor,
+            )
+            # heatmap = self._spatial_softmax(heatmap_logits)
+            heat_gate = heatmap_logits
+        else:
+            heat_gate = sat_features_2d.new_zeros(
+                sat_features_2d.shape[0],
+                1,
+                sat_features_2d.shape[2],
+                sat_features_2d.shape[3],
+            )
 
-        heat_gate = heatmap
         guided_sat_features = self.heat_fuse(
             torch.cat([sat_features_2d, heat_gate], dim=1)
         )
@@ -440,7 +450,10 @@ class Encoder_heat(nn.Module):
         )
         pred_anchor = self.bbox_fcn_out(fused_features)
 
-        heatmap_out = heatmap
+        if heatmap_logits is None:
+            return pred_anchor, None
+
+        heatmap_out = heatmap_logits
         if heatmap_out.shape[-2:] != pred_anchor.shape[-2:]:
             heatmap_logits = F.interpolate(
                 heatmap_logits,
@@ -537,6 +550,7 @@ class Encoder_test(Encoder_heat):
         heat_channels: int = 128,
         heat_kernel_size: int = 9,
         heat_softmax_temperature: float = 1.0,
+        use_heatmap: bool = True,
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.05,
@@ -550,6 +564,7 @@ class Encoder_test(Encoder_heat):
             heat_channels=heat_channels,
             heat_kernel_size=heat_kernel_size,
             heat_softmax_temperature=heat_softmax_temperature,
+            use_heatmap=use_heatmap,
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
@@ -642,20 +657,9 @@ class Encoder_test(Encoder_heat):
             anchor_feats,
             sat_features_2d,
             angle,
-            detach_anchor=False,
+            detach_anchor=True,
         )
         aux_outputs = {}
-        if self.use_text_grounding_path:
-            if text_hidden is None:
-                raise ValueError("Text grounding path requires input_ids.")
-            text_pred_anchor, text_heatmap_out = self._bbox_forward_from_anchor_feats(
-                text_hidden,
-                sat_features_2d,
-                angle,
-                detach_anchor=False,
-            )
-            aux_outputs["text_pred_anchor"] = text_pred_anchor
-            aux_outputs["text_heatmap"] = text_heatmap_out
 
         return (
             pred_anchor,

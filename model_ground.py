@@ -11,7 +11,7 @@ from bbox.yolo_utils import SpatialTransformer
 # --- Configuration ---
 MODEL_NAME = "google/siglip2-base-patch16-224"
 SIGLIP2_MODEL_NAME = MODEL_NAME
-CACHE_DIR = "/media/data1/feihong/hf_cache"
+CACHE_DIR = "/media/data1/feihong/remote/hf_cache"
 PROJECTION_DIM = 768
 
 

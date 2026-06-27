@@ -1,5 +1,5 @@
 exp_name: ocg
-save_dir: /media/data1/feihong/ckpt/ground_ocg
+save_dir: /media/data1/feihong/remote/ckpt/ground_ocg
 
 model:
   type: ocg

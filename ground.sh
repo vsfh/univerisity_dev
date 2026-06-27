@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-cd /media/data1/feihong/univerisity_dev
+cd /media/data1/feihong/remote/univerisity_dev
 
 CONFIG_PATH="${1:-configs/grounding/siglip2_heat.yaml}"
 

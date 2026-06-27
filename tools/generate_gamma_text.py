@@ -13,8 +13,8 @@ from transformers import AutoConfig, AutoModelForMultimodalLM, AutoProcessor, Au
 # --- Configuration ---
 GEMMA_MODEL_NAME = "google/gemma-4-31B-it"
 SIGLIP2_MODEL_NAME = "google/siglip2-base-patch16-224"
-CACHE_DIR = "/media/data1/feihong/hf_cache"
-DEFAULT_IMAGE_ROOT = "/media/data1/feihong/drone_img"
+CACHE_DIR = "/media/data1/feihong/remote/hf_cache"
+DEFAULT_IMAGE_ROOT = "/media/data1/feihong/remote/data/drone_img"
 DEFAULT_OUTPUT_NAME = "udes_siglip2_gemma4.json"
 DEFAULT_SUMMARY_NAME = "gemma4_siglip2_text_summary.json"
 IMAGE_SIZE = (256, 256)

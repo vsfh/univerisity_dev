@@ -8,7 +8,7 @@ import json
 
 
 def draw_shifted_bbox_heatmap(
-    bbox_json_path="/media/data1/feihong/ckpt/shifted_bboxes.json",
+    bbox_json_path="/media/data1/feihong/remote/ckpt/shifted_bboxes.json",
     output_path="runs/shifted_bbox_heatmap.png",
     image_width=3170,
     image_height=1962,
@@ -78,7 +78,7 @@ def draw_shifted_bbox_heatmap(
 
 def distance_visualize():
     # --- 1. Load distances.json ---
-    with open("/media/data1/feihong/ckpt/distances.json", "r") as f:
+    with open("/media/data1/feihong/remote/ckpt/distances.json", "r") as f:
         data = json.load(f)
     
     # --- 2. Build n*n matrix ---
