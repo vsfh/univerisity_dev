@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from transformers import AutoModel
 
 from bbox.yolo_utils import SpatialTransformer
+from hf_cache_utils import from_pretrained_prefer_local
 
 
 # --- Configuration ---
@@ -171,7 +172,7 @@ class Encoder_heat(nn.Module):
         if "siglip2" not in model_name.lower():
             raise ValueError(f"Encoder_heat now requires a SigLIP2 checkpoint, got {model_name}.")
 
-        model = AutoModel.from_pretrained(model_name, cache_dir=CACHE_DIR)
+        model = from_pretrained_prefer_local(AutoModel, model_name, CACHE_DIR)
         self.vision_model = model.vision_model
         self.text_model = model.text_model
 

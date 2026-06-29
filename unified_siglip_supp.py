@@ -34,6 +34,7 @@ from bbox.yolo_utils import (
     eval_iou_acc,
 )
 from dataset import ShiftedSatelliteDroneDataset
+from hf_cache_utils import from_pretrained_prefer_local
 
 cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -756,6 +757,59 @@ def info_nce_loss(
     return F.cross_entropy(sim_matrix, positive_indices)
 
 
+def build_retrieval_soft_targets(
+    local_indices: torch.Tensor,
+    satellite_ids: Optional[torch.Tensor] = None,
+    num_locations: int = 9,
+    primary_label: float = 0.92,
+    secondary_mass: float = 0.08,
+) -> torch.Tensor:
+    if local_indices.ndim != 1:
+        raise ValueError(f"Expected local_indices shape (B,), got {tuple(local_indices.shape)}.")
+    if num_locations <= 0:
+        raise ValueError(f"num_locations must be positive, got {num_locations}.")
+
+    device = local_indices.device
+    batch_size = int(local_indices.shape[0])
+    local_indices = local_indices.long()
+    if torch.any((local_indices < 0) | (local_indices >= num_locations)):
+        raise ValueError(
+            f"local_indices must be in [0, {num_locations}), got {local_indices.tolist()}."
+        )
+
+    if satellite_ids is None:
+        same_satellite = torch.eye(batch_size, device=device, dtype=torch.bool)
+    else:
+        satellite_ids = satellite_ids.to(device=device).view(-1)
+        if satellite_ids.shape[0] != batch_size:
+            raise ValueError(
+                f"satellite_ids length must match batch size {batch_size}, got {satellite_ids.shape[0]}."
+            )
+        same_satellite = satellite_ids[:, None].eq(satellite_ids[None, :])
+
+    targets = torch.zeros(
+        batch_size,
+        batch_size * num_locations,
+        device=device,
+        dtype=torch.float32,
+    )
+    same_satellite_cols = (
+        same_satellite[:, :, None]
+        .expand(batch_size, batch_size, num_locations)
+        .reshape(batch_size, batch_size * num_locations)
+    )
+    targets[same_satellite_cols] = 1.0
+
+    rows = torch.arange(batch_size, device=device)
+    primary_cols = rows * num_locations + local_indices
+    targets[rows, primary_cols] = 0.0
+
+    secondary_counts = targets.sum(dim=1, keepdim=True).clamp_min(1.0)
+    targets = targets / secondary_counts * float(secondary_mass)
+    targets[rows, primary_cols] = float(primary_label)
+    return targets
+
+
 # --- Validation ---
 def validate(
     loader: DataLoader,
@@ -850,18 +904,14 @@ def validate(
             iou = refined_iou.mean()
 
         candidate_feats = grid_feats.reshape(-1, Config.PROJECTION_DIM)
-        positive_indices = torch.zeros(B, B * 9, device=accelerator.device)
-        
-        batch_offsets = torch.arange(B, device=accelerator.device) * 9
-        row_indices_broad = torch.arange(B, device=accelerator.device).unsqueeze(1)
-        col_offsets = torch.arange(9, device=accelerator.device).unsqueeze(0)
-
-        same_image_cols = batch_offsets.unsqueeze(1) + col_offsets
-        positive_indices[row_indices_broad, same_image_cols] = 0.5
-
-        global_positive_indices = local_indices + batch_offsets
-        row_indices_flat = torch.arange(B, device=accelerator.device)
-        positive_indices[row_indices_flat, global_positive_indices] = 0.95
+        satellite_ids = batch.get("satellite_id")
+        if satellite_ids is not None:
+            satellite_ids = satellite_ids.to(accelerator.device, non_blocking=True)
+        positive_indices = build_retrieval_soft_targets(
+            local_indices,
+            satellite_ids=satellite_ids,
+            num_locations=grid_feats.shape[1],
+        )
 
         if useap:
             if isinstance(fused_feats, torch.Tensor):
@@ -982,15 +1032,18 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
 
     accelerator.print("Loading models and processor...")
     model_name = effective_model_name()
-    processor = AutoImageProcessor.from_pretrained(
-        model_name, cache_dir=Config.CACHE_DIR
-    )
-    processor_sat = AutoImageProcessor.from_pretrained(
+    processor = from_pretrained_prefer_local(
+        AutoImageProcessor,
         model_name,
-        cache_dir=Config.CACHE_DIR,
+        Config.CACHE_DIR,
+    )
+    processor_sat = from_pretrained_prefer_local(
+        AutoImageProcessor,
+        model_name,
+        Config.CACHE_DIR,
         size=Config.UNIV_SAT_SIZE,
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = from_pretrained_prefer_local(AutoTokenizer, model_name, Config.CACHE_DIR)
 
     model = build_encoder(use_ap, usesg=Config.OPTIMIZE_OBJECTIVE != "bbox_only")
     # model = Encoder_dino()
@@ -1047,7 +1100,6 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     )
 
     accelerator.print(f"Starting training for {Config.NUM_EPOCHS} epochs...")
-    soft_label = 0.01
     max_iou = 0
     min_info = 1000
 
@@ -1093,6 +1145,11 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                 local_indices = batch["index"].to(
                     accelerator.device, non_blocking=True
                 )
+                satellite_ids = batch.get("satellite_id")
+                if satellite_ids is not None:
+                    satellite_ids = satellite_ids.to(
+                        accelerator.device, non_blocking=True
+                    )
                 target_bbox = batch["bbox"].to(accelerator.device, non_blocking=True)
                 geo = build_geo_features(batch, accelerator.device)
 
@@ -1163,21 +1220,11 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                         )
 
                     candidate_feats = grid_feats.reshape(-1, Config.PROJECTION_DIM)
-                    positive_indices = torch.zeros(B, B * 9, device=accelerator.device)
-
-                    batch_offsets = torch.arange(B, device=accelerator.device) * 9
-                    row_indices_broad = torch.arange(
-                        B, device=accelerator.device
-                    ).unsqueeze(1)
-                    col_offsets = torch.arange(9, device=accelerator.device).unsqueeze(0)
-
-                    same_image_cols = batch_offsets.unsqueeze(1) + col_offsets
-                    positive_indices[row_indices_broad, same_image_cols] = soft_label
-
-                    global_positive_indices = local_indices + batch_offsets
-                    row_indices_flat = torch.arange(B, device=accelerator.device)
-                    positive_indices[row_indices_flat, global_positive_indices] = 0.92
-
+                    positive_indices = build_retrieval_soft_targets(
+                        local_indices,
+                        satellite_ids=satellite_ids,
+                        num_locations=grid_feats.shape[1],
+                    )
 
                     image_retrieval_loss = info_nce_loss(
                         anchor_feats, candidate_feats, positive_indices

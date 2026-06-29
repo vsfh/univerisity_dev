@@ -4,7 +4,7 @@ set -euo pipefail
 cd ../univerisity_dev
 
 CONFIGS=(
-    "configs/unified_siglip_supp/single_config/baseline_grounding_full.yaml"
+    # "configs/unified_siglip_supp/single_config/baseline_grounding_full.yaml"
     "configs/unified_siglip_supp/single_config/baseline_grounding_head.yaml"
     "configs/unified_siglip_supp/single_config/baseline_grounding_only.yaml"
     "configs/unified_siglip_supp/single_config/baseline_grounding_heatmap.yaml"
@@ -16,7 +16,7 @@ CONFIGS=(
 )
 
 MODEL_TYPES=(
-    "encoder_test"
+    # "encoder_test"
     "encoder_test"
     "encoder_test"
     "encoder_test"
@@ -25,7 +25,7 @@ MODEL_TYPES=(
 )
 
 CHECKPOINT_DIRS=(
-    "/media/data1/feihong/ckpt/baseline_grounding_full"
+    # "/media/data1/feihong/ckpt/baseline_grounding_full"
     "/media/data1/feihong/ckpt/baseline_grounding_head"
     "/media/data1/feihong/ckpt/baseline_grounding_only"
     "/media/data1/feihong/ckpt/baseline_grounding_heatmap"
@@ -34,7 +34,7 @@ CHECKPOINT_DIRS=(
 )
 
 TEXT_FLAGS=(
-    "--no-encoder-heat-use-text"
+    # "--no-encoder-heat-use-text"
     "--no-encoder-heat-use-text"
     "--no-encoder-heat-use-text"
     "--no-encoder-heat-use-text"
@@ -43,7 +43,7 @@ TEXT_FLAGS=(
 )
 
 HEATMAP_FLAGS=(
-    "--encoder-heat-use-heatmap"
+    # "--encoder-heat-use-heatmap"
     "--no-encoder-heat-use-heatmap"
     "--no-encoder-heat-use-heatmap"
     "--encoder-heat-use-heatmap"
@@ -52,7 +52,7 @@ HEATMAP_FLAGS=(
 )
 
 ANGLE_FLAGS=(
-    "--encoder-heat-use-angle"
+    # "--encoder-heat-use-angle"
     "--encoder-heat-use-angle"
     "--no-encoder-heat-use-angle"
     "--no-encoder-heat-use-angle"

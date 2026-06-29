@@ -861,6 +861,7 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			"input_ids": input_ids,
 			"attention_mask": attention_mask,
 			"index": index,
+			"satellite_id": torch.tensor(sample["satellite_id"], dtype=torch.long),
 			"bbox": torch.tensor(resized_bbox, dtype=torch.float32),
 			"height": torch.tensor(sample["height"], dtype=torch.long),
 			"angle": torch.tensor(sample["angle"], dtype=torch.long),

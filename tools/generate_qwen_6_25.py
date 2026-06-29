@@ -32,11 +32,12 @@ DEFAULT_FREE_MEMORY_RESERVE_GIB = 3.0
 DEFAULT_CUDA_ALLOC_CONF = "expandable_segments:True"
 DEFAULT_HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "")
 DEFAULT_IMAGE_ROOT = "/media/data1/feihong/drone_img"
+# DEFAULT_IMAGE_ROOT = "/media/data1/feihong/caption_test"
 IMAGE_SIZE = (256, 256)
 HEIGHTS = (150, 200, 250, 300)
 CARDINAL_ANGLES = (0, 90, 180, 270)
-DEFAULT_OUTPUT_NAME = "qwen_6_25_description.json"
-DEFAULT_SUMMARY_NAME = "qwen_6_25_description_summary.json"
+DEFAULT_OUTPUT_NAME = "qwen_6_28_description.json"
+DEFAULT_SUMMARY_NAME = "qwen_6_28_description_summary.json"
 DEFAULT_GENERATION_BATCH_SIZE = 4
 DEFAULT_MAX_CASES = 0
 REQUIRED_LOCAL_FILES = (
@@ -44,79 +45,64 @@ REQUIRED_LOCAL_FILES = (
     "tokenizer_config.json",
 )
 HEIGHT_PROMPT = (
-    "You are a remote-sensing image description expert writing for a SigLIP2 "
-    "text encoder and satellite-map search. The four drone images show the "
-    "same target area at one flight height. Treat them as evidence for one "
-    "unified place, not as four separate views. Output exactly 5 English "
-    "retrieval segments describing the same stable, satellite-visible objects "
-    "and layout of that unified place. The five segments must reuse the same "
-    "core evidence but vary word order, word choice, phrase order, and sentence "
-    "structure. They must read like compact overhead retrieval prompts, not "
-    "reports, checklists, captions, or per-image comparisons.\n\n"
+    '''
+    You are captioning a drone-view (aerial/oblique) image of a region or building 
+    complex. Your goal is to produce ONE brief, highly discriminative caption that 
+    would let someone pick these four exact images out of a set of similar aerial region shots.
 
-    "Each segment must contain three to six short, balanced clauses joined by exactly "
-    "one semicolon. Each whole segment should use about 64 SigLIP2-style text "
-    "tokens. Across the five segments, shuffle the sequence of details: "
-    "sometimes start from the central target, sometimes from surrounding roads, "
-    "buildings, open ground, tree belts, courts, water, paved areas, or "
-    "land-cover context. Use fresh but common vocabulary and natural synonyms. "
-    "Avoid rare, poetic, or overly technical words.\n\n"
+    Write 1–2 sentences (max ~48 words). Prioritize details that are SPECIFIC to these four 
+    image over generic ones. Focus on:
 
-    "Describe only concrete, map-verifiable features that help locate the "
-    "target: building footprint, roof color and shape, facade or pavement color "
-    "when visible, road color and geometry, intersections, courtyards, paved "
-    "surfaces, walls or fences, tree belts, grass fields, sports courts, water, "
-    "plazas, open ground, stable shadows, and adjacent land cover. Prefer "
-    "measurable or visually grounded wording such as rectangular, long, narrow, "
-    "square, light gray, red roof, dark asphalt, grass field, tree-lined edge, "
-    "north side, beside a road, inside a courtyard, adjacent to open ground, "
-    "between, along, surrounded by, northwest, northeast, southwest, or "
-    "southeast.\n\n"
+    1. WHAT — the dominant structure(s): building type/shape (e.g. Gothic tower, 
+    domed hall, glass block, row of townhouses), distinctive roof form, and any 
+    standout features (spire, courtyard, clock tower, dome).
+    2. COLOR & MATERIAL — roof and façade colors/materials (e.g. grey slate roofs, 
+    red-brick walls, tan stone, copper green). Be precise; color is a key 
+    differentiator.
+    3. WHERE — spatial layout and relative position: where the main building sits in 
+    the frame (center/upper-left/etc.), how structures, lawns, paths, and trees 
+    are arranged around it (e.g. "tower flanked by red-brick wings, open green 
+    quad to the right").
 
-    "Use directional and relative layout cues naturally because the first image "
-    "is north-facing and the top of the satellite map is north. You may use "
-    "north, south, east, west, center, northwest, northeast, southwest, "
-    "southeast, near, between, along, adjacent to, and surrounded by. Do not "
-    "mention the source view, camera orientation, or image angle in the final "
-    "output.\n\n"
+    Rules:
+    - Lead with the single most distinctive element.
+    - Use concrete, countable details (number of wings, courtyards, towers) when visible.
+    - Avoid vague filler ("a nice building", "an aerial view of a campus").
+    - Don't guess names of specific institutions unless clearly labeled.
+    - Don't describe sky, image quality, or watermark.
 
-    "Favor stable evidence that clearly exists in satellite imagery. Ignore "
-    "transient or time-dependent details such as pedestrians, moving vehicles, "
-    "temporary parked vehicles, weather, lighting, seasonal color changes, "
-    "construction materials, banners, or objects that may disappear. Mention a "
-    "detail only if it forms a large, permanent, map-visible structure. If the "
-    "four views disagree, silently discard conflicting, weak, or unstable cues "
-    "and keep only shared stable evidence.\n\n"
+    Output: just the captions, no preamble. Then generate extra 4 captions
+    describing the same place. The 4 captions must reuse the same core evidence
+    but vary word order, word choice, phrase order, and sentence structure. The 
+    total 5 captions separated by ||.
+    '''
+    # '''
+    # You are captioning ONE campus/building complex shown across FOUR drone-view (aerial/oblique) images. The four images are the SAME location captured by a drone from different angles and heights — treat them together as one scene and combine the distinctive details visible across all of them.
 
-    "Do not label an area as a parking lot unless it is clearly a substantial "
-    "paved parking area with stable layout cues such as marked bays, drive "
-    "aisles, or a large open paved vehicle area. If there are no vehicles, very "
-    "few vehicles, or only a tiny paved patch, describe it conservatively as a "
-    "paved area, small paved yard, access area, or open hard-surface space.\n\n"
+    # GOAL: produce FIVE brief, highly discriminative captions. Each caption alone should let someone pick THIS location out of a set of similar aerial campus shots. All five describe the same place but must NOT be near-duplicates: vary which distinctive feature or vantage each one leads with, while staying accurate.
 
-    "Use concrete color words when visible, such as gray, white, red, blue, "
-    "green, tan, black, light, dark, brick, asphalt, concrete, grass, or bare "
-    "earth. Avoid vague adjectives such as complex, distinctive, prominent, "
-    "notable, interesting, dense, sparse, modern, old, busy, quiet, ordinary, "
-    "unusual, or beautiful unless directly tied to visible geometry, color, "
-    "size, or layout.\n\n"
+    # LENGTH: each caption ≤ 64 tokens (roughly 40–48 words), 1–2 sentences. Use the budget to pack SPECIFIC details, not filler.
 
-    "Do not invent place names, school names, city names, coordinates, "
-    "functions, or facts not visible from the images. Do not write separate "
-    "sentences for separate views. Do not mention or use forbidden wording such "
-    "as north-facing image, east-facing image, south-facing image, west-facing "
-    "image, this view, that view, angle 0, angle 90, angle 180, angle 270, "
-    "photo, image, aerial view of, drone view of, overhead view of, satellite "
-    "view of, or top-down view of.\n\n"
+    # FOCUS ON:
+    # 1. WHAT — dominant structure(s): building type/shape (Gothic tower, domed hall, glass block, row of townhouses), distinctive roof form, standout features (spire, courtyard, clock tower, dome).
+    # 2. COLOR & MATERIAL — roof and façade colors/materials (grey slate roofs, red-brick walls, tan stone, copper-green). Be precise; color is a key differentiator.
+    # 3. WHERE — spatial layout and relative position: how buildings, lawns, paths, and trees are arranged (tower flanked by red-brick wings, open green quad to one side, U-shaped block around central courtyard).
 
-    "Every segment should help a retrieval model distinguish this target from "
-    "nearby map locations. If a phrase cannot be checked from satellite imagery "
-    "or does not help locate the target, omit it.\n\n"
+    # STYLE / TOKEN ECONOMY:
+    # - Write compact, telegraphic captions. Drop articles ("a"/"the") whenever a single item is meant — e.g. "Gothic tower flanked by red-brick wings", NOT "A Gothic tower flanked by the red-brick wings".
+    # - Cut filler; keep concrete nouns, colors, counts, and spatial relations.
+    # - Use countable details (number of wings, courtyards, towers, floors) when visible.
 
-    "Output exactly one line containing exactly 5 English retrieval segments "
-    "separated by ||. Do not output Chinese, markdown, numbering, bullet points, "
-    "headings, explanations, or comma-separated phrase lists."
+    # RULES:
+    # - Lead each caption with a single most distinctive element.
+    # - Only describe features actually visible in at least one of the four images; do not invent details and do not merge in features from other campuses.
+    # - Prefer stable spatial relations (X beside Y, X around a central courtyard) over absolute frame position (upper-left), since position shifts across angles — use absolute position only if consistent across views.
+    # - Avoid vague filler ("a nice building", "an aerial view of a campus").
+    # - Don't guess institution names unless clearly labeled in the image.
+    # - Don't describe sky, lighting, image quality, or watermark.
 
+    # OUTPUT: exactly five captions, numbered 1–5, no preamble.
+    # '''
     )
 
 
@@ -152,7 +138,7 @@ def _configure_visible_gpus(gpu_ids: str) -> Optional[List[int]]:
     if parsed is None:
         return None
     # os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(item) for item in parsed)
-    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     print(f"Using CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
     return parsed
 
@@ -872,7 +858,7 @@ def main() -> None:
     parser.add_argument("--image_height", type=int, default=IMAGE_SIZE[1])
     parser.add_argument("--image_field", choices=["pil", "url", "image"], default="image")
     parser.add_argument("--prompt", type=str, default=HEIGHT_PROMPT)
-    parser.add_argument("--max_new_tokens", type=int, default=600)
+    parser.add_argument("--max_new_tokens", type=int, default=340)
     parser.add_argument(
         "--generation_batch_size",
         type=int,
@@ -899,7 +885,7 @@ def main() -> None:
         "--skip_existing",
         "--skip-existing",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
             "Skip a case when its output JSON already exists. Enabled by default; "
             "use --no-skip-existing to regenerate and overwrite."
@@ -983,7 +969,7 @@ def main() -> None:
             sample_dir
             for sample_dir in shard_sample_dirs
             if _load_completed_result(sample_dir, output_name, args.skip_existing) is None
-        ]
+        ][::-1]
         num_skipped_existing = len(shard_sample_dirs) - len(sample_dirs)
         if num_skipped_existing > 0:
             print(

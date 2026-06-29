@@ -16,6 +16,7 @@ from transformers import AutoImageProcessor, AutoTokenizer
 
 from bbox.yolo_utils import bbox_iou, build_target, eval_iou_acc
 from dataset import DEFAULT_SUBSET_ANGLES, DEFAULT_SUBSET_HEIGHTS, ShiftedSatelliteDroneDataset
+from hf_cache_utils import from_pretrained_prefer_local
 from model import Encoder_heat, Encoder_test
 from train_uni import (
     BACKBONE_NAME as UNIFY_BACKBONE_NAME,
@@ -271,13 +272,18 @@ def create_encoder_loader(
     subset_angles: Optional[Sequence[int]],
     model_name: str,
 ) -> DataLoader:
-    processor = AutoImageProcessor.from_pretrained(model_name, cache_dir=CACHE_DIR)
-    processor_sat = AutoImageProcessor.from_pretrained(
+    processor = from_pretrained_prefer_local(
+        AutoImageProcessor,
         model_name,
-        cache_dir=CACHE_DIR,
+        CACHE_DIR,
+    )
+    processor_sat = from_pretrained_prefer_local(
+        AutoImageProcessor,
+        model_name,
+        CACHE_DIR,
         size={"height": int(sat_size[0]), "width": int(sat_size[1])},
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=CACHE_DIR)
+    tokenizer = from_pretrained_prefer_local(AutoTokenizer, model_name, CACHE_DIR)
     dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
         processor_sat=processor_sat,
