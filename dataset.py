@@ -31,7 +31,7 @@ DEFAULT_ENABLE_TIMING_LOG = False
 DEFAULT_TIMING_LOG_INTERVAL = 200
 DEFAULT_MODEL_NAME = "google/siglip2-base-patch16-224"
 DEFAULT_CACHE_DIR = "/media/data1/feihong/hf_cache"
-TEXT_DESCRIPTION_FILE = "qwen_6_19_description.json"
+TEXT_DESCRIPTION_FILE = "qwen_6_28_description.json"
 TEXT_CYCLE_ORDER = (5, 4, 3, 2, 1)
 
 TRAIN_HEIGHT_TO_BOX_SIZE = {
@@ -861,7 +861,6 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			"input_ids": input_ids,
 			"attention_mask": attention_mask,
 			"index": index,
-			"satellite_id": torch.tensor(sample["satellite_id"], dtype=torch.long),
 			"bbox": torch.tensor(resized_bbox, dtype=torch.float32),
 			"height": torch.tensor(sample["height"], dtype=torch.long),
 			"angle": torch.tensor(sample["angle"], dtype=torch.long),
