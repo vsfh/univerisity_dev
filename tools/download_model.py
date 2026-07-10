@@ -537,6 +537,129 @@ def download_qwen_3_6_35b_a3b(
                 os.environ["HF_HUB_DISABLE_XET"] = previous_disable_xet
 
 
+def download_internvl3_5_1b_hf(
+    cache_dir=custom_cache_path,
+    use_china_mirror=True,
+    mirror_endpoint="https://hf-mirror.com",
+    revision=None,
+    verify_load=False,
+    disable_xet=True,
+    max_workers=1,
+    download_timeout=60,
+    direct_fallback=True,
+):
+    """
+    Download OpenGVLab/InternVL3_5-1B-HF into the local Hugging Face cache.
+    """
+    model_id = "OpenGVLab/InternVL3_5-1B-HF"
+    os.makedirs(cache_dir, exist_ok=True)
+
+    os.environ["HF_HOME"] = cache_dir
+    os.environ["HUGGINGFACE_HUB_CACHE"] = cache_dir
+    os.environ["TRANSFORMERS_CACHE"] = cache_dir
+
+    previous_endpoint = os.environ.get("HF_ENDPOINT")
+    previous_disable_xet = os.environ.get("HF_HUB_DISABLE_XET")
+    previous_download_timeout = os.environ.get("HF_HUB_DOWNLOAD_TIMEOUT")
+
+    os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = str(int(download_timeout))
+    if disable_xet:
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+    if use_china_mirror:
+        os.environ["HF_ENDPOINT"] = mirror_endpoint.rstrip("/")
+
+    from huggingface_hub import snapshot_download
+
+    try:
+        print(f"Downloading {model_id} to cache: {cache_dir}")
+        if use_china_mirror:
+            print(f"Using HF mirror endpoint: {os.environ['HF_ENDPOINT']}")
+        if disable_xet:
+            print("HF Xet transport disabled: HF_HUB_DISABLE_XET=1")
+        print(f"HF Hub download timeout: {os.environ['HF_HUB_DOWNLOAD_TIMEOUT']}s")
+        print(f"Snapshot max_workers: {int(max_workers)}")
+
+        try:
+            snapshot_dir = snapshot_download(
+                repo_id=model_id,
+                cache_dir=cache_dir,
+                revision=revision,
+                resume_download=True,
+                max_workers=int(max_workers),
+            )
+        except Exception as exc:
+            if not direct_fallback:
+                raise
+            print(f"snapshot_download failed: {exc}")
+            print("Trying direct resumable fallback for InternVL files...")
+            snapshot_dir = _download_repo_files_direct(
+                cache_dir=cache_dir,
+                model_id=model_id,
+                endpoint=os.environ.get("HF_ENDPOINT", "https://huggingface.co"),
+                revision=revision or "main",
+                timeout=int(download_timeout),
+            )
+
+        result = {
+            "model_id": model_id,
+            "cache_dir": cache_dir,
+            "snapshot_dir": snapshot_dir,
+            "hf_endpoint": os.environ.get("HF_ENDPOINT", "https://huggingface.co"),
+        }
+
+        if verify_load:
+            from transformers import AutoProcessor
+
+            try:
+                from transformers import AutoModelForImageTextToText
+            except ImportError:
+                AutoModelForImageTextToText = None
+
+            try:
+                from transformers import AutoModelForMultimodalLM
+            except ImportError:
+                AutoModelForMultimodalLM = None
+
+            model_cls = AutoModelForImageTextToText or AutoModelForMultimodalLM
+            if model_cls is None:
+                raise ImportError(
+                    "This Transformers install has neither AutoModelForImageTextToText "
+                    "nor AutoModelForMultimodalLM."
+                )
+
+            _ = AutoProcessor.from_pretrained(
+                model_id,
+                cache_dir=cache_dir,
+                trust_remote_code=True,
+            )
+            _ = model_cls.from_pretrained(
+                model_id,
+                cache_dir=cache_dir,
+                dtype="auto",
+                device_map="auto",
+                trust_remote_code=True,
+            )
+            result["verify_load"] = True
+
+        print(f"Download completed: {snapshot_dir}")
+        return result
+    finally:
+        if use_china_mirror:
+            if previous_endpoint is None:
+                os.environ.pop("HF_ENDPOINT", None)
+            else:
+                os.environ["HF_ENDPOINT"] = previous_endpoint
+        if previous_download_timeout is None:
+            os.environ.pop("HF_HUB_DOWNLOAD_TIMEOUT", None)
+        else:
+            os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = previous_download_timeout
+        if disable_xet:
+            if previous_disable_xet is None:
+                os.environ.pop("HF_HUB_DISABLE_XET", None)
+            else:
+                os.environ["HF_HUB_DISABLE_XET"] = previous_disable_xet
+
+
 def _gemma_cache_root(cache_dir):
     return Path(cache_dir) / "models--google--gemma-4-31B-it"
 
@@ -911,7 +1034,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download pretrained models into the local HF cache.")
     parser.add_argument(
         "--model",
-        choices=["c_radio_v4_h", "gemma_4_31b_it", "qwen_3_6_35b_a3b_fp8"],
+        choices=[
+            "c_radio_v4_h",
+            "gemma_4_31b_it",
+            "qwen_3_6_35b_a3b_fp8",
+            "internvl3_5_1b_hf",
+        ],
         default="c_radio_v4_h",
     )
     parser.add_argument("--cache_dir", type=str, default=custom_cache_path)
@@ -947,6 +1075,18 @@ if __name__ == "__main__":
         )
     elif args.model == "qwen_3_6_35b_a3b_fp8":
         download_qwen_3_6_35b_a3b_fp8(
+            cache_dir=args.cache_dir,
+            use_china_mirror=not args.no_mirror,
+            mirror_endpoint=args.mirror_endpoint,
+            revision=args.revision,
+            verify_load=args.verify_load,
+            disable_xet=not args.enable_xet,
+            max_workers=args.max_workers,
+            download_timeout=args.download_timeout,
+            direct_fallback=not args.no_direct_fallback,
+        )
+    elif args.model == "internvl3_5_1b_hf":
+        download_internvl3_5_1b_hf(
             cache_dir=args.cache_dir,
             use_china_mirror=not args.no_mirror,
             mirror_endpoint=args.mirror_endpoint,

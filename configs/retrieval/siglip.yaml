@@ -1,0 +1,15 @@
+exp_name: retrieval_siglip
+save_dir: /media/data1/feihong/ckpt/retrieval_siglip
+
+model:
+  type: siglip
+  model_name: google/siglip-base-patch16-224
+  proj_dim: 768
+
+train:
+  batch_size: 32
+  lr: 1.0e-5
+  amp: true
+
+eval:
+  output_dir: eval_results/retrieval/siglip

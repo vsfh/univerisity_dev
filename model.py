@@ -631,8 +631,9 @@ class Encoder_test(Encoder_heat):
         if anchor_feats.ndim != 3 or anchor_feats.shape[0] != batch_size or anchor_feats.shape[2] != self.feature_dim:
             raise ValueError(f"Unexpected anchor feature shape: {tuple(anchor_feats.shape)}.")
 
-        anchor_pooler = self.attnPooling(anchor_feats, 1)[:, 0, :]
-        anchor_pooler = F.normalize(anchor_pooler, p=2, dim=1)
+        # anchor_pooler = self.attnPooling(anchor_feats, 1)[:, 0, :]
+        # anchor_pooler = F.normalize(anchor_pooler, p=2, dim=1)
+        anchor_pooler = anchor_output.pooler_output
         text_hidden = None
         text_pooler = None
         if input_ids is not None:

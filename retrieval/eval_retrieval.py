@@ -76,7 +76,27 @@ def _load_encoder_classes():
 		raise ImportError(f"Unable to load model module from: {model_path}")
 	module = importlib.util.module_from_spec(spec)
 	spec.loader.exec_module(module)
-	return module.Encoder_abla, module.Encoder_text_angle, module.Encoder_heat
+	return (
+		getattr(module, "Encoder_abla", None),
+		getattr(module, "Encoder_text_angle", None),
+		getattr(module, "Encoder_heat", None),
+	)
+
+
+_ENCODER_CLASSES = None
+
+
+def _get_encoder_classes():
+	global _ENCODER_CLASSES
+	if _ENCODER_CLASSES is None:
+		_ENCODER_CLASSES = _load_encoder_classes()
+	return _ENCODER_CLASSES
+
+
+def _require_encoder_class(encoder_cls, class_name: str, model_type: str):
+	if encoder_cls is None:
+		raise AttributeError(f"model.py does not export {class_name} required by {model_type}.")
+	return encoder_cls
 
 
 def _load_sample_retrieval_classes():
@@ -97,7 +117,6 @@ def _load_sample_retrieval_classes():
 	)
 
 
-EncoderAbla, EncoderDino, EncoderHeat = _load_encoder_classes()
 (
 	SampleRetrievalModel,
 	SampleRetrievalProcessor,
@@ -668,6 +687,8 @@ def _build_model_and_io(model_type: str, device: str):
 		return model, processor, processor_sat, tokenizer
 
 	if model_type == "encoder_abla":
+		EncoderAbla, _, _ = _get_encoder_classes()
+		EncoderAbla = _require_encoder_class(EncoderAbla, "Encoder_abla", model_type)
 		processor = AutoImageProcessor.from_pretrained(
 			SIGLIP_MODEL_NAME,
 			cache_dir=SIGLIP_CACHE_DIR,
@@ -688,6 +709,8 @@ def _build_model_and_io(model_type: str, device: str):
 		return model, processor, processor_sat, tokenizer
 
 	if model_type == "encoder_dino":
+		_, EncoderDino, _ = _get_encoder_classes()
+		EncoderDino = _require_encoder_class(EncoderDino, "Encoder_text_angle", model_type)
 		processor = AutoImageProcessor.from_pretrained(
 			SIGLIP_MODEL_NAME,
 			cache_dir=SIGLIP_CACHE_DIR,
@@ -707,6 +730,8 @@ def _build_model_and_io(model_type: str, device: str):
 		return model, processor, processor_sat, tokenizer
 
 	if model_type == "encoder_heat":
+		_, _, EncoderHeat = _get_encoder_classes()
+		EncoderHeat = _require_encoder_class(EncoderHeat, "Encoder_heat", model_type)
 		processor = AutoImageProcessor.from_pretrained(
 			SIGLIP_MODEL_NAME,
 			cache_dir=SIGLIP_CACHE_DIR,

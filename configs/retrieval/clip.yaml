@@ -1,0 +1,15 @@
+exp_name: retrieval_clip
+save_dir: /media/data1/feihong/ckpt/retrieval_clip
+
+model:
+  type: clip
+  model_name: openai/clip-vit-base-patch16
+  proj_dim: 768
+
+train:
+  batch_size: 32
+  lr: 1.0e-5
+  amp: true
+
+eval:
+  output_dir: eval_results/retrieval/clip

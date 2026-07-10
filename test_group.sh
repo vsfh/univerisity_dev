@@ -3,58 +3,91 @@ set -euo pipefail
 
 cd /media/data1/feihong/univerisity_dev
 
+CONFIG_PATH="${1:-configs/unified_siglip_supp/single_config/baseline_sat.yaml}"
+shift || true
+
 CHECKPOINT_NAME="${CHECKPOINT_NAME:-last.pth}"
 OUTPUT_DIR="${OUTPUT_DIR:-/media/data1/feihong/univerisity_dev/eval_results/test_unify}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
+MODEL_TYPE="${MODEL_TYPE:-encoder_test}"
+
+read -r EXP_NAME SAVE_ROOT USE_ANGLE USE_HEATMAP < <(
+python - "$CONFIG_PATH" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f) or {}
+config = cfg.get("config", {}) or {}
+print(
+    cfg.get("exp_name"),
+    cfg.get("save_root", "/media/data1/feihong/ckpt"),
+    int(bool(config.get("USE_ANGLE_INPUT", True))),
+    int(bool(config.get("USE_HEATMAP_LOSS", True))),
+)
+PY
+)
+
+if [ -z "${EXP_NAME}" ] || [ "${EXP_NAME}" = "None" ]; then
+    echo "Cannot find exp_name in ${CONFIG_PATH}" >&2
+    exit 1
+fi
+
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-${SAVE_ROOT}/${EXP_NAME}/${CHECKPOINT_NAME}}"
+ANGLE_FLAG="--no-encoder-heat-use-angle"
+HEATMAP_FLAG="--no-encoder-heat-use-heatmap"
+if [ "${USE_ANGLE}" = "1" ]; then
+    ANGLE_FLAG="--encoder-heat-use-angle"
+fi
+if [ "${USE_HEATMAP}" = "1" ]; then
+    HEATMAP_FLAG="--encoder-heat-use-heatmap"
+fi
+
 COMMON_ARGS=(
+    --model-types "${MODEL_TYPE}"
+    --checkpoint "${CHECKPOINT_PATH}"
     --output-dir "${OUTPUT_DIR}"
-    --batch-size "${BATCH_SIZE:-8}"
-    --num-workers "${NUM_WORKERS:-8}"
+    --batch-size "${BATCH_SIZE}"
+    --num-workers "${NUM_WORKERS}"
     --lora-rank 8
     --lora-alpha 16.0
     --lora-dropout 0.05
-    --encoder-heat-text-score-weight "${TEXT_SCORE_WEIGHT:-0.0}"
-    --encoder-heat-text-rerank-topk "${TEXT_RERANK_TOPK:-50}"
+    --no-encoder-heat-use-text
+    "${ANGLE_FLAG}"
+    "${HEATMAP_FLAG}"
 )
 
-# echo "============================================================"
-# echo "Testing Encoder_heat without geo input"
-# echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
-# echo "============================================================"
-# python test_unify.py \
-#     --model-types encoder_heat \
-#     --checkpoint "/media/data1/feihong/ckpt/model_heat_no_geo/${CHECKPOINT_NAME}" \
-#     --no-encoder-heat-use-angle \
-#     --no-encoder-heat-use-text \
-#     "${COMMON_ARGS[@]}" \
-#     "$@"
-
-# echo "============================================================"
-# echo "Testing Encoder_heat without input_ids"
-# echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
-# echo "============================================================"
-# python test_unify.py \
-#     --model-types encoder_heat \
-#     --checkpoint "/media/data1/feihong/ckpt/model_heat_no_input_ids/${CHECKPOINT_NAME}" \
-#     --encoder-heat-use-angle \
-#     --no-encoder-heat-use-text \
-#     "${COMMON_ARGS[@]}" \
-#     "$@"
-# --checkpoint "/media/data1/feihong/ckpt/model_test_geo_input_ids/${CHECKPOINT_NAME}" \
-
+CANDIDATE_SIZES=(200 400 600)
+TEST_CROP_RATIOS=(0.8 0.6 0.4)
 
 echo "============================================================"
-echo "Testing Encoder_test with geo and input_ids"
+echo "Config: ${CONFIG_PATH}"
+echo "Checkpoint: ${CHECKPOINT_PATH}"
 echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================"
-python test_unify.py \
-    --model-types encoder_heat \
-    --checkpoint "/media/data1/feihong/ckpt/model_heat_no_input_ids/${CHECKPOINT_NAME}" \
-    --encoder-heat-use-angle \
-    --no-encoder-heat-use-text \
-    "${COMMON_ARGS[@]}" \
-    "$@"
+
+for candidate_size in "${CANDIDATE_SIZES[@]}"; do
+    echo "Testing candidate_size=${candidate_size}, test_crop_ratio=1.0"
+    python test_unify.py \
+        "${COMMON_ARGS[@]}" \
+        --candidate-size "${candidate_size}" \
+        --test-crop-ratio 1.0 \
+        --output-suffix "${EXP_NAME}_candidate_sweep_candidate_${candidate_size}_crop_1.0" \
+        "$@"
+done
+
+for test_crop_ratio in "${TEST_CROP_RATIOS[@]}"; do
+    echo "Testing candidate_size=100, test_crop_ratio=${test_crop_ratio}"
+    python test_unify.py \
+        "${COMMON_ARGS[@]}" \
+        --candidate-size 100 \
+        --test-crop-ratio "${test_crop_ratio}" \
+        --output-suffix "${EXP_NAME}_crop_sweep_candidate_100_crop_${test_crop_ratio}" \
+        "$@"
+done
 
 echo "============================================================"
-echo "Finished all test_group evaluations"
+echo "Finished test_group sweep"
 echo "Finished at: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================"

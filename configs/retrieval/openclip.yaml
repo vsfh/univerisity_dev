@@ -1,0 +1,16 @@
+exp_name: retrieval_openclip
+save_dir: /media/data1/feihong/ckpt/retrieval_openclip
+
+model:
+  type: openclip
+  model_name: ViT-B-16
+  pretrained: laion2b_s34b_b88k
+  proj_dim: 768
+
+train:
+  batch_size: 32
+  lr: 1.0e-5
+  amp: true
+
+eval:
+  output_dir: eval_results/retrieval/openclip

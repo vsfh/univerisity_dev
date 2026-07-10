@@ -89,6 +89,8 @@ class Config:
     LORA_ALPHA = 16.0
     LORA_DROPOUT = 0.05
     OPTIMIZE_OBJECTIVE = "combined"  # combined | img_text_only | bbox_only
+    GROUNDING_START_EPOCH = 0
+    GROUNDING_WARMUP_EPOCHS = 0
     USE_HEATMAP_LOSS = True
     HEATMAP_LOSS_WEIGHT = 0.2
     HEATMAP_LOSS_TYPE = [ "focal"]  # mse | cross_entropy | weighted_bce | focal
@@ -111,10 +113,9 @@ class Config:
     USE_TEXT_GROUNDING_PATH = False
     USE_TEXT_ANCHOR_LOSS = False
     TEXT_ANCHOR_LOSS_WEIGHT = 0.5
-    TEXT_POOLER_ALIGN_START_WEIGHT = 0.05
-    TEXT_POOLER_ALIGN_END_WEIGHT = 0.005
-    TEXT_POOLER_ALIGN_DECAY_EPOCHS = 10
+    TEXT_POOLER_ALIGN_WEIGHT = 0.05
     TEXT_POOLER_ALIGN_STOP_EPOCH = 10
+    TEXT_POOLER_ALIGN_TARGET = "drone"  # drone | satellite
 
 
 def config_to_dict() -> Dict[str, Any]:
@@ -253,25 +254,48 @@ def build_optimizer(model: nn.Module) -> AdamW:
 
 
 def text_pooler_align_weight(epoch: int) -> float:
-    start_weight = float(Config.TEXT_POOLER_ALIGN_START_WEIGHT)
-    end_weight = float(Config.TEXT_POOLER_ALIGN_END_WEIGHT)
-    if start_weight <= 0 and end_weight <= 0:
+    weight = float(Config.TEXT_POOLER_ALIGN_WEIGHT)
+    if weight <= 0:
         return 0.0
 
     epoch_number = int(epoch) + 1
-    stop_epoch = max(1, int(Config.TEXT_POOLER_ALIGN_STOP_EPOCH))
+    stop_epoch = int(Config.TEXT_POOLER_ALIGN_STOP_EPOCH)
+    if stop_epoch <= 0:
+        return 0.0
     if epoch_number > stop_epoch:
         return 0.0
-    decay_epochs = max(1, min(int(Config.TEXT_POOLER_ALIGN_DECAY_EPOCHS), stop_epoch))
-    if epoch_number >= decay_epochs:
-        return end_weight
-
-    progress = float(epoch_number - 1) / float(decay_epochs - 1)
-    return start_weight + (end_weight - start_weight) * progress
+    return weight
 
 
 def text_pooler_align_detach_image(epoch: int) -> bool:
     return False
+
+
+def text_pooler_align_target() -> str:
+    target = str(Config.TEXT_POOLER_ALIGN_TARGET).strip().lower()
+    if target not in {"drone", "satellite"}:
+        raise ValueError(
+            f"Invalid TEXT_POOLER_ALIGN_TARGET={Config.TEXT_POOLER_ALIGN_TARGET}. "
+            "Choose 'drone' or 'satellite'."
+        )
+    return target
+
+
+def grounding_loss_weight(epoch: int, target_weight: float) -> float:
+    target = max(0.0, float(target_weight))
+    if target <= 0:
+        return 0.0
+
+    start_epoch = max(0, int(Config.GROUNDING_START_EPOCH))
+    warmup_epochs = max(0, int(Config.GROUNDING_WARMUP_EPOCHS))
+    epoch = int(epoch)
+    if epoch < start_epoch:
+        return 0.0
+    if warmup_epochs <= 0:
+        return target
+
+    progress = min(epoch - start_epoch + 1, warmup_epochs) / float(warmup_epochs)
+    return target * progress
 
 
 def effective_model_name() -> str:
@@ -745,6 +769,38 @@ def visualize_batch(
 
 
 # --- Loss Functions ---
+def build_retrieval_soft_targets(
+    local_indices: torch.Tensor,
+    satellite_ids: Optional[torch.Tensor] = None,
+    num_locations: int = 9,
+    positive_weight: float = 0.92,
+) -> torch.Tensor:
+    batch_size = int(local_indices.shape[0])
+    device = local_indices.device
+    targets = torch.zeros(batch_size, batch_size * num_locations, device=device)
+
+    for row in range(batch_size):
+        if satellite_ids is None:
+            same_sat_rows = torch.tensor([row], device=device)
+        else:
+            same_sat_rows = torch.where(satellite_ids == satellite_ids[row])[0]
+
+        support_cols = (
+            same_sat_rows.unsqueeze(1) * num_locations
+            + torch.arange(num_locations, device=device).unsqueeze(0)
+        ).reshape(-1)
+        positive_col = row * num_locations + int(local_indices[row].item())
+        other_cols = support_cols[support_cols != positive_col]
+
+        if other_cols.numel() == 0:
+            targets[row, positive_col] = 1.0
+        else:
+            targets[row, positive_col] = float(positive_weight)
+            targets[row, other_cols] = (1.0 - float(positive_weight)) / other_cols.numel()
+
+    return targets
+
+
 def info_nce_loss(
     query_feats: torch.Tensor,
     candidate_feats: torch.Tensor,
@@ -937,6 +993,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
         )
     if Config.USE_TEXT_ANCHOR_LOSS and not Config.USE_TEXT_GROUNDING_PATH:
         raise ValueError("USE_TEXT_ANCHOR_LOSS requires USE_TEXT_GROUNDING_PATH=True.")
+    current_text_pooler_align_target = text_pooler_align_target()
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
@@ -1198,11 +1255,18 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                             if detach_image_for_text_align
                             else anchor_feats
                         )
-                        text_pooler_align_loss = info_nce_loss(
-                            text_feats.detach(),
-                            align_anchor_feats,
-                            pair_labels,
-                        )
+                        if current_text_pooler_align_target == "drone":
+                            text_pooler_align_loss = info_nce_loss(
+                                text_feats.detach(),
+                                align_anchor_feats,
+                                pair_labels,
+                            )
+                        elif current_text_pooler_align_target == "satellite":
+                            text_pooler_align_loss = info_nce_loss(
+                                text_feats.detach(),
+                                candidate_feats,
+                                positive_indices,
+                            )
                         # text_satellite_retrieval_loss = info_nce_loss(
                         #     text_feats.detach(),
                         #     candidate_feats,
@@ -1219,7 +1283,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     # )
                     if Config.OPTIMIZE_OBJECTIVE == "combined":
                         bbox_weight = end_num
-                        retrieval_weight = 1 - end_num
+                        retrieval_weight = 1 - bbox_weight
                         loss = retrieval_weight * image_retrieval_loss + bbox_weight * bbox_loss
                     elif Config.OPTIMIZE_OBJECTIVE == "img_text_only":
                         bbox_weight = 0.0

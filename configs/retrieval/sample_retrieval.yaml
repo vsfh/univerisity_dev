@@ -1,0 +1,17 @@
+exp_name: retrieval_sample4geo
+save_dir: /media/data1/feihong/ckpt/retrieval_sample4geo
+
+model:
+  type: sample_retrieval
+  proj_dim: 1024
+  emb_size: 1024
+  pretrained_backbone: true
+
+train:
+  batch_size: 32
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  amp: true
+
+eval:
+  output_dir: eval_results/retrieval/sample_retrieval

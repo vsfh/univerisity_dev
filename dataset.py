@@ -367,7 +367,7 @@ def _augment_satellite_image_with_bbox_640(
 
 	if mode == "train":
 		context_scale = 3.0
-		min_crop_w = int(random.uniform(1920-900, 1920+900))
+		min_crop_w = int(random.uniform(1920-1280, 1920))
 	else:
 		ratio = max(1e-3, min(1.0, float(test_crop_ratio)))
 		context_scale = 3.0
@@ -855,19 +855,23 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			return_tensors="pt",
 			)
 
-		return {
+		item = {
 			"target_pixel_values": query_inputs["pixel_values"][0],
 			"search_pixel_values": search_inputs["pixel_values"][0],
 			"input_ids": input_ids,
 			"attention_mask": attention_mask,
 			"index": index,
+			"satellite_id": torch.tensor(sample["satellite_id"], dtype=torch.long),
 			"bbox": torch.tensor(resized_bbox, dtype=torch.float32),
 			"height": torch.tensor(sample["height"], dtype=torch.long),
 			"angle": torch.tensor(sample["angle"], dtype=torch.long),
 			"drone_path": sample["drone_path"],
 			"satellite_path": sample["satellite_path"],
 		}
-
+		if getattr(self, "return_search_image", False):
+			item["query_image"] = query_image
+			item["search_image"] = augmented_search_image
+		return item
 
 def initialize_shifted_dataset_like_unified_siglip_supp(
 	split: str,
