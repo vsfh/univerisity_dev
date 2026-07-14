@@ -60,8 +60,10 @@ def _checkpoint_path(cfg: Dict[str, Any]) -> str:
 
 
 def _load_checkpoint(model: torch.nn.Module, path: str) -> None:
-    state = torch.load(path, map_location="cpu")
-    if isinstance(state, dict) and "model_state_dict" in state:
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(state, dict) and "model" in state:
+        state = state["model"]
+    elif isinstance(state, dict) and "model_state_dict" in state:
         state = state["model_state_dict"]
     model.load_state_dict(state, strict=True)
 

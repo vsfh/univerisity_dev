@@ -57,15 +57,26 @@ def _build_lpn(cfg: Dict[str, Any]) -> nn.Module:
     from grounding.legacy.ground_cvos import LPNGeoLite
 
     model_cfg = cfg.get("model", {})
-    return LPNGeoLite(pretrained=_model_bool(model_cfg, "pretrained", True))
+    query_guard = cfg.get("query_guard", {})
+    return LPNGeoLite(
+        pretrained=_model_bool(model_cfg, "pretrained", True),
+        projection_dim=int(query_guard.get("projection_dim", 256)),
+        temperature=float(query_guard.get("temperature", 0.07)),
+        num_parts=int(model_cfg.get("num_parts", 4)),
+    )
 
 
 def _build_sample4geo(cfg: Dict[str, Any]) -> nn.Module:
     from grounding.legacy.ground_cvos import SampleGeoLite, load_sample4geo_backbone
 
     model_cfg = cfg.get("model", {})
-    checkpoint = model_cfg.get("checkpoint", DEFAULT_SAMPLE4GEO_CHECKPOINT)
-    model = SampleGeoLite(pretrained=False if checkpoint else _model_bool(model_cfg, "pretrained", True))
+    query_guard = cfg.get("query_guard", {})
+    checkpoint = model_cfg.get("pretrained_checkpoint", DEFAULT_SAMPLE4GEO_CHECKPOINT)
+    model = SampleGeoLite(
+        pretrained=False if checkpoint else _model_bool(model_cfg, "pretrained", True),
+        projection_dim=int(query_guard.get("projection_dim", 256)),
+        temperature=float(query_guard.get("temperature", 0.07)),
+    )
     if checkpoint:
         load_info = load_sample4geo_backbone(model, str(checkpoint))
         print(f"Loaded Sample4Geo checkpoint from {checkpoint}: {load_info}")
@@ -76,11 +87,14 @@ def _build_smgeo(cfg: Dict[str, Any]) -> nn.Module:
     from grounding.legacy.train_sm import SMGeoLite, load_smgeo_pretrained
 
     model_cfg = cfg.get("model", {})
+    query_guard = cfg.get("query_guard", {})
     model = SMGeoLite(
         num_experts=int(model_cfg.get("num_experts", 6)),
         top_k=int(model_cfg.get("top_k", 2)),
+        projection_dim=int(query_guard.get("projection_dim", 256)),
+        temperature=float(query_guard.get("temperature", 0.07)),
     )
-    checkpoint = model_cfg.get("checkpoint", DEFAULT_SMGEO_CHECKPOINT)
+    checkpoint = model_cfg.get("pretrained_checkpoint", DEFAULT_SMGEO_CHECKPOINT)
     if checkpoint:
         load_info = load_smgeo_pretrained(model, str(checkpoint))
         print(f"Loaded SMGeo checkpoint from {checkpoint}: {load_info}")
@@ -91,20 +105,37 @@ def _build_ocg(cfg: Dict[str, Any]) -> nn.Module:
     from grounding.legacy.train_ocg import OCGNetLite
 
     model_cfg = cfg.get("model", {})
+    query_guard = cfg.get("query_guard", {})
     pretrained = _model_bool(model_cfg, "pretrained_backbone", _model_bool(model_cfg, "pretrained", True))
-    return OCGNetLite(pretrained_backbone=pretrained)
+    return OCGNetLite(
+        pretrained_backbone=pretrained,
+        projection_dim=int(query_guard.get("projection_dim", 256)),
+        temperature=float(query_guard.get("temperature", 0.07)),
+    )
 
 
 def _build_trogeolite(cfg: Dict[str, Any]) -> nn.Module:
     from grounding.legacy.ground_cvos import TROGeoLite
 
-    return TROGeoLite()
+    query_guard = cfg.get("query_guard", {})
+    return TROGeoLite(
+        projection_dim=int(query_guard.get("projection_dim", 256)),
+        temperature=float(query_guard.get("temperature", 0.07)),
+    )
 
 
 def _build_det(cfg: Dict[str, Any]) -> nn.Module:
     from grounding.legacy.ground_cvos import DetGeoLite
 
-    return DetGeoLite()
+    model_cfg = cfg.get("model", {})
+    query_guard = cfg.get("query_guard", {})
+    return DetGeoLite(
+        config_path=str(model_cfg.get("darknet_config", "/media/data1/feihong/ckpt/yolov3_rs.cfg")),
+        weights_path=str(model_cfg.get("pretrained_checkpoint", "/media/data1/feihong/ckpt/yolov3.weights")),
+        projection_dim=int(query_guard.get("projection_dim", 256)),
+        temperature=float(query_guard.get("temperature", 0.07)),
+        load_reference_weights=_model_bool(model_cfg, "load_reference_weights", True),
+    )
 
 
 REGISTRY: Dict[str, ModelEntry] = {

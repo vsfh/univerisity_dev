@@ -1,7 +1,9 @@
 import argparse
+import json
 import math
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict
 
@@ -26,6 +28,12 @@ from grounding.config import load_config
 from grounding.losses import compute_grounding_loss
 from grounding.processors import build_grounding_image_processors
 from grounding.registry import build_model_and_adapter
+from grounding.training_records import (
+    append_jsonl,
+    atomic_save_checkpoint,
+    atomic_write_json,
+    load_v2_resume_checkpoint,
+)
 
 
 class _DistributedInfo(dict):
@@ -116,13 +124,44 @@ def _build_loader(
     ), sampler
 
 
-def _save_checkpoint(model: torch.nn.Module, save_dir: str, name: str) -> str:
+def _save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    cfg: Dict[str, Any],
+    name: str,
+    epoch: int,
+    global_step: int,
+    training_summary: Dict[str, Any],
+) -> str:
+    save_dir = str(cfg["save_dir"])
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, name)
     if isinstance(model, DistributedDataParallel):
         model = model.module
-    torch.save(model.state_dict(), path)
+    payload = {
+        "architecture_version": 2,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch": int(epoch),
+        "global_step": int(global_step),
+        "config": cfg,
+        "training_summary": training_summary,
+    }
+    atomic_save_checkpoint(Path(path), payload)
     return path
+
+
+def _query_gradient_norm(model: torch.nn.Module) -> float:
+    if isinstance(model, DistributedDataParallel):
+        model = model.module
+    squared_norm = 0.0
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+        if "query" not in name and "query_matcher" not in name:
+            continue
+        squared_norm += float(parameter.grad.detach().float().pow(2).sum().item())
+    return squared_norm**0.5
 
 
 def _normalize_for_writer(images: torch.Tensor) -> torch.Tensor:
@@ -215,6 +254,16 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
         lr=float(cfg["train"]["lr"]),
         weight_decay=float(cfg["train"]["weight_decay"]),
     )
+    start_epoch = 0
+    global_step = 0
+    resume_checkpoint = cfg["train"].get("resume_checkpoint")
+    if resume_checkpoint:
+        resume_payload = load_v2_resume_checkpoint(Path(str(resume_checkpoint)))
+        resume_model = model.module if isinstance(model, DistributedDataParallel) else model
+        resume_model.load_state_dict(resume_payload["model"], strict=True)
+        optimizer.load_state_dict(resume_payload["optimizer"])
+        start_epoch = int(resume_payload.get("epoch", -1)) + 1
+        global_step = int(resume_payload.get("global_step", 0))
     amp_enabled = bool(cfg["train"]["amp"]) and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     grad_accumulation_steps = max(1, int(cfg["train"]["grad_accumulation_steps"]))
@@ -223,9 +272,25 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
     if _is_rank_zero(distributed):
         writer = SummaryWriter(os.path.join("runs", "grounding", str(cfg["exp_name"])))
 
-    global_step = 0
+    start_time = time.time()
+    history_path = Path(cfg["save_dir"]) / "train_history.jsonl"
+    summary_path = Path(cfg["save_dir"]) / "training_summary.json"
+    training_summary: Dict[str, Any] = {
+        "status": "running",
+        "architecture_version": 2,
+        "model_type": str(cfg["model"]["type"]),
+        "config_path": str(cfg.get("config_path", "")),
+        "start_time_unix": start_time,
+        "resume_checkpoint": str(resume_checkpoint) if resume_checkpoint else None,
+        "last_epoch": start_epoch - 1,
+        "global_step": global_step,
+    }
+    if _is_rank_zero(distributed):
+        history_path.write_text("", encoding="utf-8")
+        atomic_write_json(summary_path, training_summary)
+
     try:
-        for epoch in range(int(cfg["train"]["epochs"])):
+        for epoch in range(start_epoch, int(cfg["train"]["epochs"])):
             if sampler is not None:
                 sampler.set_epoch(epoch)
             model.train()
@@ -241,15 +306,27 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
                 "geo": 0.0,
                 "cls": 0.0,
                 "heatmap": 0.0,
+                "dense": 0.0,
+                "paper_aux": 0.0,
+                "query_cosine": 0.0,
+                "score_gap": 0.0,
+                "query_grad_norm": 0.0,
             }
             epoch_count = 0
             for batch_idx, batch in enumerate(progress):
                 with torch.amp.autocast("cuda", enabled=amp_enabled):
                     output = adapter.forward(batch, device)
-                    losses = compute_grounding_loss(output, batch, anchors_full, cfg)
+                    losses = compute_grounding_loss(
+                        output,
+                        batch,
+                        anchors_full,
+                        cfg,
+                        epoch=epoch,
+                    )
                     loss_to_backward = losses.total / grad_accumulation_steps
 
                 scaler.scale(loss_to_backward).backward()
+                query_grad_norm = _query_gradient_norm(model) / max(float(scaler.get_scale()), 1.0)
                 should_step = (batch_idx + 1) % grad_accumulation_steps == 0
                 should_stop = max_steps > 0 and global_step + 1 >= max_steps
                 if should_step or should_stop or batch_idx + 1 == len(loader):
@@ -269,11 +346,16 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
                     epoch_totals["geo"] += float(losses.geo.detach().item()) * batch_n
                     epoch_totals["cls"] += float(losses.cls.detach().item()) * batch_n
                     epoch_totals["heatmap"] += float(losses.heatmap.detach().item()) * batch_n
+                    epoch_totals["dense"] += float(losses.dense.detach().item()) * batch_n
+                    epoch_totals["paper_aux"] += float(losses.paper_aux.detach().item()) * batch_n
+                    epoch_totals["query_cosine"] += float(losses.query_cosine.detach().item()) * batch_n
+                    epoch_totals["score_gap"] += float(losses.score_gap.detach().item()) * batch_n
+                    epoch_totals["query_grad_norm"] += float(query_grad_norm) * batch_n
                     progress.set_postfix(
                         {
                             "loss": f"{losses.total.item():.4f}",
                             "bbox": f"{losses.bbox.item():.4f}",
-                            "heatmap": f"{losses.heatmap.item():.4f}",
+                            "dense": f"{losses.dense.item():.4f}",
                         }
                     )
                     if writer is not None:
@@ -282,6 +364,16 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
                         writer.add_scalar("Loss/geo_step", losses.geo.item(), global_step)
                         writer.add_scalar("Loss/cls_step", losses.cls.item(), global_step)
                         writer.add_scalar("Loss/heatmap_step", losses.heatmap.item(), global_step)
+                        writer.add_scalar("Loss/dense_step", losses.dense.item(), global_step)
+                        writer.add_scalar("Loss/paper_aux_step", losses.paper_aux.item(), global_step)
+                        writer.add_scalar("Weight/dense_step", losses.dense_weight, global_step)
+                        writer.add_scalar("Query/offdiag_cosine_step", losses.query_cosine.item(), global_step)
+                        writer.add_scalar("Query/score_gap_step", losses.score_gap.item(), global_step)
+                        writer.add_scalar("Query/grad_norm_step", query_grad_norm, global_step)
+                        writer.add_scalar("Train/learning_rate_step", optimizer.param_groups[0]["lr"], global_step)
+                        if output.paper_aux_losses:
+                            for name, value in output.paper_aux_losses.items():
+                                writer.add_scalar(f"PaperAux/{name}_step", value.item(), global_step)
                         if batch_idx == 0:
                             with torch.no_grad():
                                 pred_bbox = adapter.decode(output, batch, anchors_full)
@@ -290,7 +382,25 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
                                 writer.add_images("Train/predictions", images, epoch)
                 if should_stop:
                     if _is_rank_zero(distributed):
-                        checkpoint = _save_checkpoint(model, cfg["save_dir"], "last.pth")
+                        training_summary.update(
+                            {
+                                "status": "max_steps",
+                                "last_epoch": epoch,
+                                "global_step": global_step,
+                                "end_time_unix": time.time(),
+                            }
+                        )
+                        checkpoint = _save_checkpoint(
+                            model,
+                            optimizer,
+                            cfg,
+                            "last.pth",
+                            epoch,
+                            global_step,
+                            training_summary,
+                        )
+                        training_summary["checkpoint"] = checkpoint
+                        atomic_write_json(summary_path, training_summary)
                         return {"status": "max_steps", "checkpoint": checkpoint, "steps": global_step}
                     return {"status": "max_steps", "steps": global_step}
 
@@ -301,12 +411,78 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
                     writer.add_scalar("Loss/geo_epoch", epoch_totals["geo"] / epoch_count, epoch)
                     writer.add_scalar("Loss/cls_epoch", epoch_totals["cls"] / epoch_count, epoch)
                     writer.add_scalar("Loss/heatmap_epoch", epoch_totals["heatmap"] / epoch_count, epoch)
-                _save_checkpoint(model, cfg["save_dir"], "last.pth")
+                    writer.add_scalar("Loss/dense_epoch", epoch_totals["dense"] / epoch_count, epoch)
+                    writer.add_scalar("Loss/paper_aux_epoch", epoch_totals["paper_aux"] / epoch_count, epoch)
+                    writer.add_scalar("Query/offdiag_cosine_epoch", epoch_totals["query_cosine"] / epoch_count, epoch)
+                    writer.add_scalar("Query/score_gap_epoch", epoch_totals["score_gap"] / epoch_count, epoch)
+                    writer.add_scalar("Query/grad_norm_epoch", epoch_totals["query_grad_norm"] / epoch_count, epoch)
+                epoch_record = {
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "dense_weight": losses.dense_weight,
+                    "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                    **{
+                        key: float(value / max(epoch_count, 1))
+                        for key, value in epoch_totals.items()
+                    },
+                }
+                append_jsonl(history_path, epoch_record)
+                training_summary.update(
+                    {
+                        "last_epoch": epoch,
+                        "global_step": global_step,
+                        "last_metrics": epoch_record,
+                    }
+                )
+                checkpoint = _save_checkpoint(
+                    model,
+                    optimizer,
+                    cfg,
+                    "last.pth",
+                    epoch,
+                    global_step,
+                    training_summary,
+                )
+                training_summary["checkpoint"] = checkpoint
+                atomic_write_json(summary_path, training_summary)
 
         if _is_rank_zero(distributed):
-            checkpoint = _save_checkpoint(model, cfg["save_dir"], "last.pth")
+            final_epoch = max(start_epoch - 1, int(cfg["train"]["epochs"]) - 1)
+            training_summary.update(
+                {
+                    "status": "ok",
+                    "last_epoch": final_epoch,
+                    "global_step": global_step,
+                    "end_time_unix": time.time(),
+                    "duration_seconds": time.time() - start_time,
+                }
+            )
+            checkpoint = _save_checkpoint(
+                model,
+                optimizer,
+                cfg,
+                "last.pth",
+                final_epoch,
+                global_step,
+                training_summary,
+            )
+            training_summary["checkpoint"] = checkpoint
+            atomic_write_json(summary_path, training_summary)
             return {"status": "ok", "checkpoint": checkpoint, "steps": global_step}
         return {"status": "ok", "steps": global_step}
+    except Exception as error:
+        if _is_rank_zero(distributed):
+            training_summary.update(
+                {
+                    "status": "failed",
+                    "global_step": global_step,
+                    "end_time_unix": time.time(),
+                    "duration_seconds": time.time() - start_time,
+                    "error": f"{type(error).__name__}: {error}",
+                }
+            )
+            atomic_write_json(summary_path, training_summary)
+        raise
     finally:
         if writer is not None:
             writer.close()

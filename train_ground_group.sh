@@ -5,7 +5,7 @@ cd /media/data1/feihong/univerisity_dev
 
 DRY_RUN=0
 GPUS_CSV="${CUDA_VISIBLE_DEVICES:-0}"
-EXTRA_ARGS=()
+TRAIN_EXTRA_ARGS=()
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -26,7 +26,7 @@ while [ "$#" -gt 0 ]; do
             shift
             ;;
         *)
-            EXTRA_ARGS+=("$1")
+            TRAIN_EXTRA_ARGS+=("$1")
             shift
             ;;
     esac
@@ -41,12 +41,12 @@ NUM_GPUS="${#GPUS[@]}"
 FIRST_GPU="${GPUS[0]}"
 
 CONFIGS=(
-    "configs/grounding/smgeo.yaml"
+    # "configs/grounding/smgeo.yaml"
     "configs/grounding/trogeolite.yaml"
-    "configs/grounding/det.yaml"
-    "configs/grounding/sample4geo.yaml"
-    "configs/grounding/lpn.yaml"
-    "configs/grounding/ocg.yaml"
+    # "configs/grounding/det.yaml"
+    # "configs/grounding/sample4geo.yaml"
+    # "configs/grounding/lpn.yaml"
+    # "configs/grounding/ocg.yaml"
 )
 
 SUMMARY_DIR="eval_results/grounding"
@@ -67,35 +67,46 @@ for CONFIG_INDEX in "${!CONFIGS[@]}"; do
 
     TRAIN_STATUS="ok"
     EVAL_STATUS="ok"
-    TRAIN_ARGS=("${EXTRA_ARGS[@]}")
-    EVAL_ARGS=("${EXTRA_ARGS[@]}")
-    if [ "$DRY_RUN" -eq 1 ]; then
-        TRAIN_ARGS+=("--dry-run")
-        EVAL_ARGS+=("--dry-run")
-    fi
+    MODEL_TYPE="$(basename "$CONFIG_PATH" .yaml)"
 
-    MASTER_PORT=$((29500 + CONFIG_INDEX))
-    CUDA_VISIBLE_DEVICES="$GPUS_CSV" python -m torch.distributed.run \
-        --master_addr 127.0.0.1 \
-        --master_port "$MASTER_PORT" \
-        --nproc_per_node="$NUM_GPUS" \
-        grounding/train.py \
-        --config "$CONFIG_PATH" \
-        --device cuda:0 \
-        "${TRAIN_ARGS[@]}"
-    if [ "$?" -ne 0 ]; then
-        TRAIN_STATUS="failed"
-        EVAL_STATUS="skipped"
-        printf '{"config_index":%s,"config":"%s","gpus":"%s","num_gpus":%s,"train_status":"%s","eval_status":"%s"}\n' \
-            "$CONFIG_INDEX" "$CONFIG_PATH" "$GPUS_CSV" "$NUM_GPUS" "$TRAIN_STATUS" "$EVAL_STATUS" >> "$SUMMARY_PATH"
-        echo "Training failed; skip eval for this config: ${CONFIG_PATH}"
-        continue
-    fi
+    # if [ "$DRY_RUN" -eq 1 ]; then
+    #     echo "[dry-run] train: ${CONFIG_PATH}"
+    #     echo "[dry-run] test_unify_ground: ${MODEL_TYPE}"
+    #     printf '{"config_index":%s,"config":"%s","model_type":"%s","gpus":"%s","num_gpus":%s,"train_status":"dry_run","eval_status":"dry_run"}\n' \
+    #         "$CONFIG_INDEX" "$CONFIG_PATH" "$MODEL_TYPE" "$GPUS_CSV" "$NUM_GPUS" >> "$SUMMARY_PATH"
+    #     continue
+    # fi
 
-    CUDA_VISIBLE_DEVICES="$FIRST_GPU" python grounding/eval.py \
-        --config "$CONFIG_PATH" \
+    # if [ "$NUM_GPUS" -eq 1 ]; then
+    #     CUDA_VISIBLE_DEVICES="$FIRST_GPU" python grounding/train.py \
+    #         --config "$CONFIG_PATH" \
+    #         --device cuda:0 \
+    #         "${TRAIN_EXTRA_ARGS[@]}"
+    # else
+    #     MASTER_PORT=$((29500 + CONFIG_INDEX))
+    #     CUDA_VISIBLE_DEVICES="$GPUS_CSV" python -m torch.distributed.run \
+    #         --master_addr 127.0.0.1 \
+    #         --master_port "$MASTER_PORT" \
+    #         --nproc_per_node="$NUM_GPUS" \
+    #         grounding/train.py \
+    #         --config "$CONFIG_PATH" \
+    #         --device cuda:0 \
+    #         "${TRAIN_EXTRA_ARGS[@]}"
+    # fi
+    # if [ "$?" -ne 0 ]; then
+    #     TRAIN_STATUS="failed"
+    #     EVAL_STATUS="skipped"
+    #     printf '{"config_index":%s,"config":"%s","gpus":"%s","num_gpus":%s,"train_status":"%s","eval_status":"%s"}\n' \
+    #         "$CONFIG_INDEX" "$CONFIG_PATH" "$GPUS_CSV" "$NUM_GPUS" "$TRAIN_STATUS" "$EVAL_STATUS" >> "$SUMMARY_PATH"
+    #     echo "Training failed; skip eval for this config: ${CONFIG_PATH}"
+    #     continue
+    # fi
+
+    CUDA_VISIBLE_DEVICES="$FIRST_GPU" python test_unify_ground.py \
+        --model-types "$MODEL_TYPE" \
         --device cuda:0 \
-        "${EVAL_ARGS[@]}"
+        --output-dir "$SUMMARY_DIR" \
+        --output-suffix "$MODEL_TYPE"
     if [ "$?" -ne 0 ]; then
         EVAL_STATUS="failed"
     fi
@@ -118,14 +129,6 @@ from grounding.config import load_config
 
 summary_path = Path(sys.argv[1])
 final_json = Path(sys.argv[2])
-metric_keys = [
-    "checkpoint",
-    "mean_iou",
-    "iou_at_0_5",
-    "iou_at_0_25",
-    "mean_center_distance",
-]
-
 items = []
 for line in summary_path.read_text(encoding="utf-8").splitlines():
     if not line.strip():
@@ -133,13 +136,20 @@ for line in summary_path.read_text(encoding="utf-8").splitlines():
 
     item = json.loads(line)
     cfg = load_config(item["config"])
-    metrics_path = Path(cfg["eval"]["output_dir"]) / "metrics.json"
+    model_type = str(cfg["model"]["type"])
+    metrics_path = Path("eval_results/grounding") / f"test_unify_{model_type}_{model_type}.json"
     metrics = {}
     if metrics_path.exists():
         metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
 
-    for key in metric_keys:
-        item[key] = metrics.get(key)
+    overall = metrics.get("overall", {})
+    item["checkpoint"] = metrics.get("checkpoint")
+    item["mean_iou"] = overall.get("mean_iou")
+    item["iou_at_0_5"] = overall.get("ratio_iou_gt_0_5")
+    item["iou_at_0_25"] = overall.get("ratio_iou_gt_0_25")
+    item["mean_center_distance"] = overall.get("mean_center_distance")
+    item["recall_at_1"] = overall.get("recall@1")
+    item["unified_iou"] = overall.get("uIoU")
     items.append(item)
 
 items.sort(key=lambda item: int(item.get("config_index", 0)))

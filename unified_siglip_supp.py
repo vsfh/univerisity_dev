@@ -35,6 +35,7 @@ from bbox.yolo_utils import (
 )
 from dataset import ShiftedSatelliteDroneDataset
 from hf_cache_utils import from_pretrained_prefer_local
+from model_abla import model_bi, model_pre
 
 cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -84,7 +85,8 @@ class Config:
     ENABLE_TF32 = True
     USE_ANGLE_INPUT = True
     USE_TEXT_INPUT = False
-    ENCODER_TYPE = "heat"  # heat | test
+    ENCODER_TYPE = "heat"  # heat | test | model_pre | model_bi
+    PRETRAINED_CHECKPOINT = None
     LORA_RANK = 8
     LORA_ALPHA = 16.0
     LORA_DROPOUT = 0.05
@@ -579,7 +581,7 @@ def add_heatmap_to_confidence(
 ) -> torch.Tensor:
     if (
         heatmap_logits is None
-        or Config.ENCODER_TYPE not in {"heat", "test"}
+        or Config.ENCODER_TYPE not in {"heat", "test", "model_pre", "model_bi"}
         or Config.HEATMAP_CONFIDENCE_WEIGHT <= 0.0
     ):
         return pred_anchor
@@ -693,8 +695,38 @@ def build_encoder(use_ap: bool, usesg: bool = True) -> nn.Module:
             lora_dropout=Config.LORA_DROPOUT,
             use_text_grounding_path=Config.USE_TEXT_GROUNDING_PATH,
         )
+    if Config.ENCODER_TYPE == "model_pre":
+        if not Config.PRETRAINED_CHECKPOINT:
+            raise ValueError(
+                "ENCODER_TYPE='model_pre' requires PRETRAINED_CHECKPOINT."
+            )
+        return model_pre(
+            ckpt_path=str(Config.PRETRAINED_CHECKPOINT),
+            model_name=Config.MODEL_NAME,
+            proj_dim=Config.PROJECTION_DIM,
+            usesg=usesg,
+            useap=use_ap,
+            use_heatmap=Config.USE_HEATMAP_LOSS,
+            lora_rank=Config.LORA_RANK,
+            lora_alpha=Config.LORA_ALPHA,
+            lora_dropout=Config.LORA_DROPOUT,
+            use_text_grounding_path=Config.USE_TEXT_GROUNDING_PATH,
+        )
+    if Config.ENCODER_TYPE == "model_bi":
+        return model_bi(
+            model_name=Config.MODEL_NAME,
+            proj_dim=Config.PROJECTION_DIM,
+            usesg=usesg,
+            useap=use_ap,
+            use_heatmap=Config.USE_HEATMAP_LOSS,
+            lora_rank=Config.LORA_RANK,
+            lora_alpha=Config.LORA_ALPHA,
+            lora_dropout=Config.LORA_DROPOUT,
+            use_text_grounding_path=Config.USE_TEXT_GROUNDING_PATH,
+        )
     raise ValueError(
-        f"Invalid ENCODER_TYPE={Config.ENCODER_TYPE}. Choose 'heat' or 'test'."
+        f"Invalid ENCODER_TYPE={Config.ENCODER_TYPE}. Choose 'heat', 'test', "
+        "'model_pre', or 'model_bi'."
     )
 
 
@@ -1199,7 +1231,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     bbox_loss = loss_geo + loss_cls
                     if (
                         Config.USE_HEATMAP_LOSS
-                        and Config.ENCODER_TYPE in {"heat", "test"}
+                        and Config.ENCODER_TYPE in {"heat", "test", "model_pre", "model_bi"}
                         and heatmap_logits is not None
                     ):
                         heatmap_loss, heatmap_target = heatmap_loss_fn(
@@ -1244,7 +1276,7 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                         anchor_feats, candidate_feats, positive_indices
                     )
                     if (
-                        Config.ENCODER_TYPE == "test"
+                        Config.ENCODER_TYPE in {"test", "model_pre", "model_bi"}
                         and text_feats is not None
                         and current_text_pooler_align_weight > 0
                     ):

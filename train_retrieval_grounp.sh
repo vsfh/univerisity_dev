@@ -41,8 +41,8 @@ FIRST_GPU="${GPUS[0]}"
 
 CONFIGS=(
     # Skipped: last.pth generated after 2026-07-08.
-    # "configs/retrieval/siglip.yaml"
-    # "configs/retrieval/clip.yaml"
+    "configs/retrieval/siglip.yaml"
+    "configs/retrieval/clip.yaml"
     "configs/retrieval/openclip.yaml"
     "configs/retrieval/evaclip.yaml"
     "configs/retrieval/sample_retrieval.yaml"
@@ -73,18 +73,18 @@ for CONFIG_INDEX in "${!CONFIGS[@]}"; do
         EVAL_ARGS+=("--dry-run")
     fi
 
-    CUDA_VISIBLE_DEVICES="$GPUS_CSV" python retrieval/train.py \
-        --config "$CONFIG_PATH" \
-        --device cuda:0 \
-        "${TRAIN_ARGS[@]}"
-    if [ "$?" -ne 0 ]; then
-        TRAIN_STATUS="failed"
-        EVAL_STATUS="skipped"
-        printf '{"config_index":%s,"config":"%s","gpus":"%s","train_status":"%s","eval_status":"%s"}\n' \
-            "$CONFIG_INDEX" "$CONFIG_PATH" "$GPUS_CSV" "$TRAIN_STATUS" "$EVAL_STATUS" >> "$SUMMARY_PATH"
-        echo "Training failed; skip eval for this config: ${CONFIG_PATH}"
-        continue
-    fi
+    # CUDA_VISIBLE_DEVICES="$GPUS_CSV" python retrieval/train.py \
+    #     --config "$CONFIG_PATH" \
+    #     --device cuda:0 \
+    #     "${TRAIN_ARGS[@]}"
+    # if [ "$?" -ne 0 ]; then
+    #     TRAIN_STATUS="failed"
+    #     EVAL_STATUS="skipped"
+    #     printf '{"config_index":%s,"config":"%s","gpus":"%s","train_status":"%s","eval_status":"%s"}\n' \
+    #         "$CONFIG_INDEX" "$CONFIG_PATH" "$GPUS_CSV" "$TRAIN_STATUS" "$EVAL_STATUS" >> "$SUMMARY_PATH"
+    #     echo "Training failed; skip eval for this config: ${CONFIG_PATH}"
+    #     continue
+    # fi
 
     CUDA_VISIBLE_DEVICES="$FIRST_GPU" python retrieval/eval.py \
         --config "$CONFIG_PATH" \

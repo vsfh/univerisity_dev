@@ -7,6 +7,11 @@ import torch
 import torch.nn.functional as F
 
 from bbox.yolo_utils import bbox_iou, build_target, xywh2xyxy, yolo_loss
+from grounding.query_guard import (
+    build_dense_bbox_targets,
+    dense_local_contrastive_loss,
+    deranged_score_gap,
+)
 
 
 @dataclass
@@ -16,6 +21,34 @@ class GroundingLoss:
     geo: torch.Tensor
     cls: torch.Tensor
     heatmap: torch.Tensor
+    dense: torch.Tensor
+    paper_aux: torch.Tensor
+    dense_weight: float
+    query_cosine: torch.Tensor
+    score_gap: torch.Tensor
+
+
+def query_guard_weight(cfg: Dict[str, Any], epoch: int) -> float:
+    query_guard = cfg.get("query_guard", {})
+    if not bool(query_guard.get("enabled", False)):
+        return 0.0
+    target_weight = float(query_guard.get("weight", 0.0))
+    warmup_epochs = int(query_guard.get("warmup_epochs", 0))
+    if warmup_epochs <= 0:
+        return target_weight
+    progress = min(max(float(epoch) / float(warmup_epochs), 0.0), 1.0)
+    return target_weight * progress
+
+
+def _query_batch_cosine(query_embedding: Optional[torch.Tensor]) -> torch.Tensor:
+    if query_embedding is None:
+        return torch.tensor(0.0)
+    if query_embedding.shape[0] < 2:
+        return query_embedding.new_zeros(())
+    query_embedding = F.normalize(query_embedding, p=2, dim=1)
+    cosine = torch.matmul(query_embedding, query_embedding.transpose(0, 1))
+    mask = ~torch.eye(cosine.shape[0], device=cosine.device, dtype=torch.bool)
+    return cosine[mask].mean()
 
 
 def build_geo_features(batch: Dict[str, Any], device: torch.device) -> Optional[torch.Tensor]:
@@ -253,7 +286,13 @@ def add_heatmap_to_confidence(
     return torch.cat([pred_anchor[:, :, :4, :, :], pred_anchor[:, :, 4:5, :, :] + heat_confidence], dim=2)
 
 
-def compute_grounding_loss(output: Any, batch: Dict[str, Any], anchors_full: torch.Tensor, cfg: Dict[str, Any]) -> GroundingLoss:
+def compute_grounding_loss(
+    output: Any,
+    batch: Dict[str, Any],
+    anchors_full: torch.Tensor,
+    cfg: Dict[str, Any],
+    epoch: int = 0,
+) -> GroundingLoss:
     target_bbox = batch["bbox"].to(output.device)
     image_wh = output.image_wh
     pred_anchor = output.pred_anchor
@@ -274,39 +313,97 @@ def compute_grounding_loss(output: Any, batch: Dict[str, Any], anchors_full: tor
             + float(cfg["loss"].get("moe_entropy_weight", 0.0)) * moe_loss
         )
         zero = bbox_loss.new_zeros(())
-        return GroundingLoss(total=total, bbox=bbox_loss, geo=bbox_loss, cls=zero, heatmap=heatmap_loss)
-
-    if pred_anchor is None:
+        geo_loss = bbox_loss
+        cls_loss = zero
+    elif pred_anchor is None:
         pred_bbox = output.pred_bbox
         iou = bbox_iou(pred_bbox, target_bbox, x1y1x2y2=True)
         bbox_loss = F.l1_loss(pred_bbox, target_bbox) + (1.0 - iou).mean()
         zero = bbox_loss.new_zeros(())
         total = float(cfg["loss"]["bbox_weight"]) * bbox_loss
-        return GroundingLoss(total=total, bbox=bbox_loss, geo=bbox_loss, cls=zero, heatmap=zero)
+        geo_loss = bbox_loss
+        cls_loss = zero
+        heatmap_loss = zero
+    else:
+        if pred_anchor.ndim == 4:
+            pred_anchor = pred_anchor.view(pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3])
+        pred_anchor = add_heatmap_to_confidence(
+            pred_anchor,
+            output.heatmap,
+            float(cfg["loss"]["heatmap_confidence_weight"]),
+        )
+        grid_wh = (pred_anchor.shape[4], pred_anchor.shape[3])
+        new_gt_bbox, best_anchor_gi_gj = build_target(target_bbox, anchors_full, image_wh, grid_wh)
+        geo_loss, cls_loss = yolo_loss(
+            pred_anchor,
+            new_gt_bbox,
+            anchors_full,
+            best_anchor_gi_gj,
+            image_wh,
+            confidence_loss_type=str(cfg["loss"].get("anchor_confidence_loss_type", "balanced_bce")),
+        )
+        bbox_loss = geo_loss + cls_loss
+        heatmap_loss = pred_anchor.new_zeros(())
+        if output.heatmap is not None and cfg["model"]["use_heatmap"]:
+            heatmap_loss = heatmap_loss_fn(output.heatmap, target_bbox, image_wh, cfg)
+        total = (
+            float(cfg["loss"]["bbox_weight"]) * bbox_loss
+            + float(cfg["loss"]["heatmap_weight"]) * heatmap_loss
+        )
 
-    if pred_anchor.ndim == 4:
-        pred_anchor = pred_anchor.view(pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3])
-    pred_anchor = add_heatmap_to_confidence(
-        pred_anchor,
-        output.heatmap,
-        float(cfg["loss"]["heatmap_confidence_weight"]),
+    zero = total.new_zeros(())
+    paper_aux = zero
+    if output.paper_aux_losses:
+        paper_aux = torch.stack(
+            [value.to(device=total.device).reshape(()) for value in output.paper_aux_losses.values()]
+        ).sum()
+
+    dense = zero
+    dense_weight = query_guard_weight(cfg, epoch)
+    query_cosine = _query_batch_cosine(output.query_embedding).to(device=total.device)
+    score_gap = zero
+    if bool(cfg.get("query_guard", {}).get("enabled", False)):
+        if output.matcher_logits is None:
+            raise ValueError("query_guard is enabled but output.matcher_logits is missing.")
+        grid_hw = output.search_grid_size
+        if grid_hw is None and output.search_local_features is not None:
+            grid_hw = tuple(int(value) for value in output.search_local_features.shape[-2:])
+        if grid_hw is None:
+            raise ValueError("query_guard is enabled but search grid size is missing.")
+        identity_key = str(cfg["query_guard"].get("identity_key", "object_id"))
+        identities = batch.get(identity_key)
+        if identities is None:
+            identities = batch.get("satellite_id")
+        if identities is None:
+            identities = torch.arange(target_bbox.shape[0], device=target_bbox.device)
+        identities = identities.to(device=target_bbox.device).view(-1)
+        dense_targets = build_dense_bbox_targets(
+            bboxes=target_bbox,
+            image_wh=image_wh,
+            grid_hw=grid_hw,
+            identities=identities,
+            center_weight=float(cfg["query_guard"].get("center_weight", 0.7)),
+        )
+        dense = dense_local_contrastive_loss(output.matcher_logits, dense_targets)
+        score_gap = deranged_score_gap(
+            output.matcher_logits,
+            identities,
+            int(grid_hw[0]) * int(grid_hw[1]),
+        )
+
+    total = total + dense_weight * dense + paper_aux
+    return GroundingLoss(
+        total=total,
+        bbox=bbox_loss,
+        geo=geo_loss,
+        cls=cls_loss,
+        heatmap=heatmap_loss,
+        dense=dense,
+        paper_aux=paper_aux,
+        dense_weight=dense_weight,
+        query_cosine=query_cosine,
+        score_gap=score_gap,
     )
-    grid_wh = (pred_anchor.shape[4], pred_anchor.shape[3])
-    new_gt_bbox, best_anchor_gi_gj = build_target(target_bbox, anchors_full, image_wh, grid_wh)
-    loss_geo, loss_cls = yolo_loss(
-        pred_anchor,
-        new_gt_bbox,
-        anchors_full,
-        best_anchor_gi_gj,
-        image_wh,
-        confidence_loss_type=str(cfg["loss"].get("anchor_confidence_loss_type", "balanced_bce")),
-    )
-    bbox_loss = loss_geo + loss_cls
-    heatmap_loss = pred_anchor.new_zeros(())
-    if output.heatmap is not None and cfg["model"]["use_heatmap"]:
-        heatmap_loss = heatmap_loss_fn(output.heatmap, target_bbox, image_wh, cfg)
-    total = float(cfg["loss"]["bbox_weight"]) * bbox_loss + float(cfg["loss"]["heatmap_weight"]) * heatmap_loss
-    return GroundingLoss(total=total, bbox=bbox_loss, geo=loss_geo, cls=loss_cls, heatmap=heatmap_loss)
 
 
 def decode_anchor_prediction(pred_anchor: torch.Tensor, anchors_full: torch.Tensor, image_wh: Tuple[int, int]) -> torch.Tensor:

@@ -67,15 +67,15 @@ echo "Checkpoint: ${CHECKPOINT_PATH}"
 echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================"
 
-for candidate_size in "${CANDIDATE_SIZES[@]}"; do
-    echo "Testing candidate_size=${candidate_size}, test_crop_ratio=1.0"
-    python test_unify.py \
-        "${COMMON_ARGS[@]}" \
-        --candidate-size "${candidate_size}" \
-        --test-crop-ratio 1.0 \
-        --output-suffix "${EXP_NAME}_candidate_sweep_candidate_${candidate_size}_crop_1.0" \
-        "$@"
-done
+# for candidate_size in "${CANDIDATE_SIZES[@]}"; do
+#     echo "Testing candidate_size=${candidate_size}, test_crop_ratio=1.0"
+#     python test_unify.py \
+#         "${COMMON_ARGS[@]}" \
+#         --candidate-size "${candidate_size}" \
+#         --test-crop-ratio 1.0 \
+#         --output-suffix "${EXP_NAME}_candidate_sweep_candidate_${candidate_size}_crop_1.0" \
+#         "$@"
+# done
 
 for test_crop_ratio in "${TEST_CROP_RATIOS[@]}"; do
     echo "Testing candidate_size=100, test_crop_ratio=${test_crop_ratio}"

@@ -11,11 +11,11 @@ CONFIGS=(
     # "configs/unified_siglip_supp/single_config/baseline_retrieval_only.yaml"
     # "configs/unified_siglip_supp/single_config/baseline_retrieval_text.yaml"
     
-    "configs/unified_siglip_supp/single_config/baseline_wo_input_ids.yaml"
-    "configs/unified_siglip_supp/single_config/baseline.yaml"
-    "configs/unified_siglip_supp/single_config/baseline_sat.yaml"
-    "configs/unified_siglip_supp/single_config/baseline_0.005.yaml"
-    "configs/unified_siglip_supp/single_config/baseline_5.yaml"
+    # "configs/unified_siglip_supp/single_config/baseline_wo_heading_input_ids.yaml"
+    # "configs/unified_siglip_supp/single_config/baseline_wo_heading.yaml"
+    "configs/unified_siglip_supp/single_config/baseline_pre.yaml"
+    "configs/unified_siglip_supp/single_config/baseline_bi.yaml"
+    # "configs/unified_siglip_supp/single_config/baseline_5.yaml"
 )
 
 MODEL_TYPES=(
@@ -28,9 +28,9 @@ MODEL_TYPES=(
 
     "encoder_test"
     "encoder_test"
-    "encoder_test"
-    "encoder_test"
-    "encoder_test"
+    # "encoder_test"
+    # "encoder_test"
+    # "encoder_test"
 )
 
 CHECKPOINT_DIRS=(
@@ -41,11 +41,11 @@ CHECKPOINT_DIRS=(
     # "/media/data1/feihong/ckpt/baseline_retrieval_only"
     # "/media/data1/feihong/ckpt/baseline_retrieval_text"
 
-    "/media/data1/feihong/ckpt/baseline_wo_input_ids"
-    "/media/data1/feihong/ckpt/baseline"
-    "/media/data1/feihong/ckpt/baseline_sat"
-    "/media/data1/feihong/ckpt/baseline_0.005"
-    "/media/data1/feihong/ckpt/baseline_5"
+    # "/media/data1/feihong/ckpt/baseline_wo_heading_input_ids"
+    # "/media/data1/feihong/ckpt/baseline_wo_heading"
+    "/media/data1/feihong/ckpt/baseline_pre"
+    "/media/data1/feihong/ckpt/baseline_bi"
+    # "/media/data1/feihong/ckpt/baseline_5"
 )
 
 TEXT_FLAGS=(
@@ -56,11 +56,11 @@ TEXT_FLAGS=(
 #     "--no-encoder-heat-use-text"
 #     "--encoder-heat-use-text"
 
-    "--no-encoder-heat-use-text"
+    # "--no-encoder-heat-use-text"
+    # "--encoder-heat-use-text"
     "--encoder-heat-use-text"
     "--encoder-heat-use-text"
-    "--encoder-heat-use-text"
-    "--encoder-heat-use-text"
+    # "--encoder-heat-use-text"
 )
 
 HEATMAP_FLAGS=(
@@ -71,11 +71,11 @@ HEATMAP_FLAGS=(
     # "--no-encoder-heat-use-heatmap"
     # "--no-encoder-heat-use-heatmap"
 
+    # "--encoder-heat-use-heatmap"
+    # "--encoder-heat-use-heatmap"
     "--encoder-heat-use-heatmap"
     "--encoder-heat-use-heatmap"
-    "--encoder-heat-use-heatmap"
-    "--encoder-heat-use-heatmap"
-    "--encoder-heat-use-heatmap"
+    # "--encoder-heat-use-heatmap"
 
 )
 
@@ -87,11 +87,11 @@ ANGLE_FLAGS=(
     # "--no-encoder-heat-use-angle"
     # "--no-encoder-heat-use-angle"
 
+    # "--no-encoder-heat-use-angle"
+    # "--encoder-heat-use-angle"
     "--encoder-heat-use-angle"
     "--encoder-heat-use-angle"
-    "--encoder-heat-use-angle"
-    "--encoder-heat-use-angle"
-    "--encoder-heat-use-angle"
+    # "--encoder-heat-use-angle"
 )
 
 CHECKPOINT_NAME="${CHECKPOINT_NAME:-last.pth}"

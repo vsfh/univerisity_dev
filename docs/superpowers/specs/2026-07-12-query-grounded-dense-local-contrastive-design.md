@@ -1,61 +1,20 @@
-# Query-Grounded Dense Local Contrastive Training Design
+# 六模型 Query 约束重构规格
 
-## Goal
+## 目标
 
-Restore the query-dependent mechanisms that matter in the DetGeo, LPN,
-Sample4Geo, TROGeoLite, OCGNet, and SMGeo grounding variants, while preserving
-the repository's unified training entry point. Add an augmented-bbox-driven
-dense local contrastive objective and a mandatory spatial matching gate so the
-localization path cannot reduce to a satellite-only detector.
+重构 `det/lpn/sample4geo/trogeolite/ocg/smgeo`：
 
-This is a key-mechanism restoration, not a line-for-line import of six official
-projects. Existing unified adapters, image sizes, localization heads, and the
-shared dataset remain the integration boundary.
+1. 恢复各论文中会影响 query 使用的编码、prompt 和融合机制；
+2. 用增强后的 satellite bbox 构造密集局部对比标签；
+3. 同一相似度矩阵同时用于 InfoNCE 和定位主干的强制空间门控，避免 bbox 分支绕过 query；
+4. 保留统一训练入口，新增独立的 `test_unify_ground.py` 测试六个模型；
+5. 只提供训练代码和记录能力，完整训练与正式测试由用户执行。
 
-## Problem
+不做六个官方仓库的逐行移植，不加载旧 `ground_*/last.pth` 开始新训练。
 
-The current group training path supervises bbox and optional heatmap outputs but
-does not penalize query-independent predictions. Random satellite bbox
-augmentation changes the target location, but each satellite sample still has a
-single supervised target. A model can therefore learn satellite saliency without
-using the paired drone query.
+## 统一输出接口
 
-The observed DetGeo checkpoint confirms this failure mode: shuffling queries
-changes predicted boxes by only about 0.1 pixels, and different query embeddings
-have near-unity cosine similarity. The affected group models report test mIoU
-near 0.03.
-
-`unified_siglip_supp.py` avoids the same degree of collapse in its combined
-configuration because query features must retrieve the correct region from
-`B * 9` satellite candidates through a dominant InfoNCE objective. Its
-`bbox_only` configuration does not have the same guarantee.
-
-## Scope
-
-### Included
-
-- Restore each model's query/reference encoding, prompt, fusion, or retrieval
-  mechanism where it materially affects query dependence.
-- Add a common pre-fusion query/local-feature contract.
-- Add bbox-derived dense soft targets and local InfoNCE.
-- Feed the same matcher into localization through a mandatory spatial gate.
-- Add explicit query-click data flow.
-- Extend `test_unify.py` to support all six grounding model types with its
-  existing protocol and result schema.
-- Record training losses, query-dependence diagnostics, configuration, and
-  checkpoint metadata.
-
-### Excluded
-
-- Full verbatim ports of the six official repositories.
-- Reproduction of every paper-specific dependency or preprocessing step.
-- Loading old `ground_*/last.pth` checkpoints into the new training runs.
-- Running full training or formal evaluation experiments as part of the code
-  change. The user will run those experiments.
-
-## Selected Architecture
-
-Each model retains a paper-specific feature path but exposes a common output:
+扩展 `grounding/adapters.py::GroundingOutput`：
 
 ```python
 @dataclass
@@ -67,104 +26,87 @@ class GroundingOutput:
     heatmap: torch.Tensor | None = None
     bbox_raw: torch.Tensor | None = None
     moe_entropy: torch.Tensor | None = None
-    query_embedding: torch.Tensor | None = None
-    search_local_features: torch.Tensor | None = None
+    query_embedding: torch.Tensor | None = None        # [B, Cq]
+    search_local_features: torch.Tensor | None = None  # [B, Cs, Hg, Wg]
     search_grid_size: tuple[int, int] | None = None
     matcher_logits: torch.Tensor | None = None
     paper_aux_losses: dict[str, torch.Tensor] | None = None
 ```
 
-`query_embedding` and `search_local_features` must be taken before cross-view
-fusion. A fused query representation is forbidden because it can leak satellite
-information into the contrastive query.
+约束：
 
-Every model owns lightweight projections to a configurable common dimension:
+- `query_embedding` 和 `search_local_features` 必须来自 cross-view fusion 之前；
+- 禁止用含有 satellite 信息的 fused feature 作为 query；
+- adapter 只整理返回值，不重复跑 backbone 或重新提取特征。
 
-```text
-query native feature     -> Linear(native_dim, projection_dim)
-satellite native feature -> 1x1 Conv(native_dim, projection_dim)
-```
+## 局部 Matcher 和强制门控
 
-Both outputs are L2 normalized before similarity calculation.
-
-## Mandatory Query Matcher
-
-An auxiliary projection alone is insufficient: the projection branch could use
-the query while the bbox branch remains satellite-only. The matcher therefore
-also gates the satellite localization feature.
-
-For projected query `q` and projected satellite cells `s_n`:
+新增通用组件，模型按自身通道数创建投影层：
 
 ```text
-local_logits[n] = cosine(q, s_n) / temperature
-gate = spatial_softmax(local_logits) * num_cells
-gated_satellite = satellite_feature * gate
+query feature     -> Linear(Cq, 256) -> L2 normalize
+satellite feature -> Conv1x1(Cs, 256) -> L2 normalize
 ```
 
-There is no ungated satellite residual around this operation. The gated feature
-is passed to the paper-specific fusion and localization head. Multiplication by
-the number of cells preserves an average gate magnitude near one.
+单张 satellite 内的局部相似度：
 
-The same local logits are used by the dense contrastive objective. This couples
-the representation objective and localization path: local InfoNCE prevents a
-uniform gate, and the no-residual gate prevents the bbox path from bypassing it.
+```python
+local_logits = einsum("bd,bdhw->bhw", query_proj, search_proj) / temperature
+gate = softmax(local_logits.flatten(1), dim=1).view(B, 1, Hg, Wg) * (Hg * Wg)
+gated_search = search_features * gate
+```
 
-For models that already contain query-aware spatial gating, such as DetGeo and
-SMGeo, the common projected matcher replaces or supplies that gate rather than
-adding an independent competing attention map.
+`gated_search` 进入各模型原有 fusion/head。不得添加 `search_features + gated_search` 或其他未门控的 satellite residual。
 
-## Augmented-Bbox-Driven Dense Targets
+训练用的 `[B, B*N]` logits 由同一组投影特征计算：
 
-Targets use `batch["bbox"]` after satellite augmentation and resizing. No
-pre-augmentation coordinates or fixed 3x3 index may be used.
+```python
+all_logits = query_proj @ search_proj.flatten(2).permute(0, 2, 1).reshape(B * N, D).T
+all_logits = all_logits / temperature
+```
 
-Given an augmented bbox `[x1, y1, x2, y2]`, satellite image size `(W, H)`, and
-local feature grid `(Hg, Wg)`, coordinates are mapped continuously:
+这样 projection 不是独立辅助分支，定位路径和对比损失共用 matcher。
+
+## 增强 bbox 密集标签
+
+输入必须使用 dataset augment 和 resize 后的 `batch["bbox"]`。
+
+对每个 bbox：
+
+1. 修正 xyxy 顺序并裁剪到 `(W, H)`；
+2. 连续映射到 `(Hg, Wg)`；
+3. 计算每个 cell 与 bbox 的相交面积；
+4. 构造：
 
 ```text
-x_grid = x / W * Wg
-y_grid = y / H * Hg
+target = 0.7 * bbox中心cell one-hot + 0.3 * 归一化cell相交面积
 ```
 
-The per-reference target distribution is:
+小 bbox 或退化 bbox 至少保留中心 cell；每个 query 的最终 target 行归一化为 1。
+
+batch 候选为所有 `B*N` cells。正样本身份优先级：
 
 ```text
-target = center_weight * center_one_hot
-       + (1 - center_weight) * normalized_cell_bbox_overlap
+object_id -> satellite_id -> batch row index
 ```
 
-The default `center_weight` is `0.7`. The center cell is always positive, even
-when the bbox is smaller than a grid cell. Invalid/reversed coordinates are
-ordered and clipped to the image before target construction. A degenerate bbox
-falls back to the clipped center cell.
+当前数据使用 `satellite_id`。同 ID 的其他增强样本只把其 bbox 覆盖 cells 设为正样本，其他 cells 仍为负样本。
 
-For batch size `B` and `N` cells per reference, candidates are flattened to
-`B * N`. Positive support for a query includes bbox cells from every batch row
-with the same identity. Identity resolution is:
+损失：
+
+```python
+dense_loss = -(target * F.log_softmax(all_logits, dim=1)).sum(dim=1).mean()
+```
+
+总损失：
 
 ```text
-object_id -> satellite_id -> row index
+total = grounding_loss
+      + scheduled_dense_weight * dense_loss
+      + sum(paper_aux_losses)
 ```
 
-The current dataset supplies `satellite_id`; this represents the same physical
-target across height/angle views. Same-identity cells outside their augmented
-bboxes remain negatives. Rows with different identities are negatives.
-
-The dense loss is soft-target cross entropy:
-
-```text
-L_dense = mean_i(-sum_j(target_ij * log_softmax(logits_ij)))
-```
-
-Total training loss is:
-
-```text
-L_total = L_grounding
-        + dense_weight * L_dense
-        + L_paper_aux
-```
-
-Defaults:
+默认配置：
 
 ```yaml
 query_guard:
@@ -177,241 +119,167 @@ query_guard:
   identity_key: object_id
 ```
 
-`dense_weight` increases linearly from zero to `0.2` over two epochs.
+前两个 epoch 将 dense weight 从 0 线性增加到 0.2。
 
-## Query Click Contract
+## Query click 数据流
 
-The dataset returns an explicit normalized point:
+`dataset.py` 增加：
 
 ```python
-batch["query_click"]  # float tensor [B, 2], values in [0, 1]
+"query_click": torch.tensor([0.5, 0.5], dtype=torch.float32)
 ```
 
-The current drone crops designate a centered object, so the initial value is
-`(0.5, 0.5)`. Models must not silently manufacture a center prompt. This makes
-the assumption visible and permits future real click annotations without model
-interface changes.
+坐标归一化到 `[0, 1]`。当前 drone crop 的目标位于中心，因此使用 `(0.5, 0.5)`；模型内部不再隐式生成中心 prompt。
 
-DetGeo, OCGNet, TROGeoLite, and SMGeo convert this point into a Gaussian click
-map. Sample4Geo and LPN retain whole-image retrieval semantics and do not require
-the click map.
+Det、OCG、TROGeoLite、SMGeo 将坐标转换成 Gaussian click map。Sample4Geo、LPN 不使用 click map。
 
-## Per-Model Restoration
+## 六模型改动
 
 ### DetGeo
 
-- Restore distinct query ResNet18 and reference Darknet branches.
-- Initialize the query branch from ImageNet and the reference branch from the
-  configured YOLO/Darknet weights when available.
-- Concatenate the explicit click map with the query RGB input through the
-  original input adapter.
-- Derive the contrastive query from the mapped query feature and satellite local
-  candidates from the mapped Darknet feature.
-- Use the common matcher as the original cosine spatial gate before the YOLO
-  bbox head.
+- query 使用 ResNet18，reference 使用 Darknet，不共享参数；
+- query 输入显式 click map；
+- matcher 输入：mapped query 全局池化、mapped Darknet feature map；
+- matcher gate 后接现有 YOLO bbox head；
+- reference Darknet 权重只从配置的 YOLO 预训练文件初始化。
 
 ### OCGNet
 
-- Restore separate query and reference encoders.
-- Preserve Gaussian Knowledge Transfer, early/late Location Enhancement, and
-  Multi-Head Cross Attention.
-- Derive query/local contrastive features after GKT and reference encoding but
-  before MHCA.
-- Apply the mandatory matcher gate to reference features before MHCA/fusion.
+- query/reference encoder 不共享；
+- 保留 GKT、early/late Location Enhancement、MHCA；
+- matcher 输入取 GKT 后、MHCA 前的 query/reference feature；
+- reference feature 先经过 mandatory gate，再进入 MHCA/fusion。
 
 ### TROGeoLite
 
-- Restore click-conditioned query input.
-- Preserve its shared Swin transformer and Cross-View Object Perception-style
-  query-context attention.
-- Keep bbox and coordinate/segmentation-compatible auxiliary outputs.
-- Extract both contrastive inputs before CVOPM and gate reference features
-  before cross-attention.
+- 恢复 click-conditioned query 输入；
+- 保留共享 Swin 和 CVOPM 风格 cross-attention；
+- matcher 输入取 cross-attention 前的 query/reference feature；
+- reference feature 先门控，再进入 cross-attention；
+- 保留 bbox 和 coordinate 辅助输出。
 
 ### Sample4Geo
 
-- Preserve the weight-shared ConvNeXt encoder.
-- Restore global symmetric InfoNCE as a paper auxiliary objective.
-- Use pooled query features for the global objective and the common query
-  projection.
-- Use the pre-fusion ConvNeXt satellite feature map for dense candidates.
-- Gate the reference map before the grounding cross-attention extension.
+- 保留共享 ConvNeXt；
+- 恢复全局 symmetric InfoNCE，作为 paper auxiliary loss；
+- dense matcher 使用 pooled query 和 pre-fusion reference feature map；
+- reference feature 先门控，再进入 grounding cross-attention。
 
 ### LPN
 
-- Preserve the shared ResNet50 encoder.
-- Restore local partition/ring pooling descriptors and their global aggregation.
-- Use the aggregated query descriptor for matching and the final pre-fusion
-  reference map as dense candidates.
-- Gate the reference map before grounding cross-attention.
+- 保留共享 ResNet50；
+- 恢复局部分块/环形 pooling descriptor；
+- 聚合后的 query descriptor 用于 matcher，reference 最后一层 feature map 作为局部候选；
+- reference feature 先门控，再进入 grounding cross-attention。
 
 ### SMGeo
 
-- Preserve view-specific patch embeddings, the shared Swin stages, GMoE routing,
-  query-guided fusion, and the anchor-free heatmap/bbox head.
-- Add the explicit click prompt to the query encoding path.
-- Expose the existing post-GMoE query vector and pre-conditioning satellite map.
-- Replace the residual sigmoid condition with the mandatory matcher gate before
-  the anchor-free head.
+- 保留 view-specific patch embedding、共享 Swin、GMoE 和 anchor-free head；
+- query 编码加入显式 click prompt；
+- matcher 使用 post-GMoE query vector 和 pre-conditioning satellite map；
+- 移除可绕过的 residual sigmoid condition，改用 mandatory gate。
 
-## Adapter and Training Flow
+## 训练入口和 checkpoint
 
-Adapters pass query images, satellite images, optional geo features, and the
-explicit query click to the model. They normalize paper-specific return types
-into `GroundingOutput` but do not recompute model features.
+保持现有六个配置的 `save_dir`，不增加 `_dense_v2`。
 
-The unified training loop performs one backbone forward per image pair:
+初始化来源只允许：
 
-```text
-batch -> adapter/model -> GroundingOutput
-      -> existing grounding loss
-      -> dense target construction from augmented batch bbox
-      -> dense local contrastive loss
-      -> paper auxiliary losses
-      -> weighted total/backward
+- ImageNet/timm backbone；
+- DetGeo 配置的 YOLO/Darknet 权重；
+- Sample4Geo 论文预训练权重；
+- SMGeo 论文预训练权重。
+
+新训练不得自动读取 save dir 中已有的 `last.pth`。保存新训练时直接覆盖该文件。
+
+checkpoint 改成包含：
+
+```python
+{
+    "architecture_version": 2,
+    "model": model.state_dict(),
+    "optimizer": optimizer.state_dict(),
+    "epoch": epoch,
+    "global_step": global_step,
+    "config": cfg,
+    "training_summary": summary,
+}
 ```
 
-Only projections, a similarity matrix, and the spatial gate are added. No
-shuffled-query second backbone forward is part of normal training.
+默认禁止 resume。显式 resume 时只接受 `architecture_version == 2`，拒绝旧 plain state dict 和旧 grounding checkpoint。
 
-## Checkpoints and Initialization
+checkpoint 使用临时文件写入后 `os.replace`，避免中断留下半文件。
 
-Existing config `save_dir` values remain unchanged; no `_dense_v2` directories
-are introduced.
+## 训练记录
 
-New training never reads the existing `last.pth` in those directories. It starts
-from configured ImageNet, YOLO, Sample4Geo, or SMGeo paper/backbone pretraining.
-The next training run directly overwrites the existing `last.pth`, as explicitly
-approved by the user.
+TensorBoard 按 step/epoch 记录：
 
-Checkpoint payloads contain:
+- total/bbox/geo/cls/heatmap loss；
+- dense loss 和当前 dense weight；
+- paper auxiliary losses；
+- learning rate；
+- query encoder gradient norm；
+- query batch 的非对角平均 cosine；
+- 利用现有 `[B, B*N]` 矩阵计算 matched 与 deranged score gap，不增加 backbone forward。
 
-```text
-architecture_version = 2
-model state
-optimizer state
-epoch and global step
-merged config
-query_guard config
-training summary
-```
+每个 save dir 写入：
 
-Automatic resume is disabled by default. An explicit resume path is accepted
-only when its payload has `architecture_version == 2`; old plain state dicts and
-old grounding `last.pth` files are rejected as resume checkpoints.
+- `train_history.jsonl`：每 epoch 一行；
+- `training_summary.json`：模型、配置、初始化加载报告、最后指标、checkpoint、起止时间和状态；
+- `last.pth`：每 epoch 原子覆盖。
 
-Paper/backbone initialization is configured separately from resume state. A
-load report lists loaded, missing, unexpected, and shape-incompatible tensors.
+## `test_unify_ground.py`
 
-## Training Records
-
-The implementation supplies the training process and records, while the user
-runs full experiments.
-
-TensorBoard records per-step and per-epoch:
-
-- total loss;
-- bbox, geo, classification, and heatmap losses;
-- dense local contrastive loss and its scheduled weight;
-- each paper auxiliary loss;
-- learning rate;
-- query encoder gradient norm;
-- mean off-diagonal query cosine;
-- matched-versus-deranged local score gap computed from the existing similarity
-  matrix without another backbone forward.
-
-Each save directory also contains:
-
-- `train_history.jsonl`: one structured record per epoch;
-- `training_summary.json`: model/config identity, initialization report, final
-  epoch values, best observed training diagnostics, checkpoint path, start/end
-  times, and status;
-- `last.pth`: the current checkpoint, overwritten atomically after each epoch.
-
-An interrupted run writes a failure/interruption status to the summary when the
-training process can handle the exception or signal normally.
-
-## `test_unify.py` Compatibility
-
-Extend `test_unify.py` choices with:
+`test_unify.py` 不允许修改。新增 `test_unify_ground.py`，支持：
 
 ```text
 det, lpn, sample4geo, trogeolite, ocg, smgeo
 ```
 
-The six models use the current test protocol without changing defaults:
+新文件尽量直接引用 `test_unify.py` 中已有的：
+
+- dataset/loader 创建函数；
+- `FeatureBundle`；
+- `score_grid_encoder_query()`；
+- `summarize_records()` 和 `group_summaries()`；
+- 路径标签、include map、结果保存和指标打印辅助函数。
+
+不能直接复用 `score_retrieval_and_uiou()`：它当前只区分 SigLIP grid scorer 和 `unify_geo` detail scorer，ground model type 会错误进入后者。新文件单独实现 ground retrieval 路由，不改变原函数。
+
+新文件保持 `test_unify.py` 的默认测试参数和 JSON/CSV 指标结构。
+
+特征：
 
 ```text
-satellite size: 432 x 768
-candidate size: 100
-test crop ratio: 1.0
-seed: 43
-heights: 150, 200, 250, 300
-angles: 0, 45, 90, 135, 180, 225, 270, 315
-include file: /media/data1/feihong/ckpt/include2.json
+query_feats   = normalized projected query embedding
+gallery_feats = normalized projected satellite local features
+retrieval score = max_cell cosine(query, satellite_cell)
 ```
 
-Gallery features are the normalized projected satellite local features. Query
-features are normalized projected query embeddings. Retrieval scores use the
-same local matcher as training:
+配对 satellite 的 grounding 结果由统一 adapter decode。正式训练、`test_unify_ground.py` 运行和指标分析由用户执行。
 
-```text
-score(query, satellite) = max_cell cosine(query, satellite_cell)
-```
+## 实现验证
 
-Paired-reference grounding predictions are decoded through the existing model
-adapter. Results retain the current JSON/CSV schema, including Recall@1/5/10,
-mean IoU, IoU threshold ratios, uIoU, center distance, and height/angle groups.
-Formal experiments and interpretation are outside this implementation scope.
+只做重构所需的自动验证，不跑完整实验：
 
-## Error Handling
+- bbox 到 grid soft target 的数值、归一化、裁剪和退化情况；
+- 同 `satellite_id` 的正样本展开；
+- matched dense loss 小于 mismatched loss；
+- mandatory gate 的形状、均值和 query 依赖；
+- combined loss 能向 query encoder 反传非零梯度；
+- click 坐标从 dataset 传到模型；
+- 六模型轻量 forward/output contract smoke test；
+- 旧 checkpoint resume 被拒绝，新 checkpoint/JSONL/summary 可读写；
+- `test_unify.py` 文件内容和行为完全不变；
+- `test_unify_ground.py` 的 parser、六模型路由和输出 schema 与 `test_unify.py` 对齐。
 
-- Missing configured paper/backbone weights fail with a path-specific error
-  unless the config explicitly permits random initialization.
-- Dense loss fails clearly when enabled but query/local features are missing,
-  have inconsistent batch sizes, or contain non-finite values.
-- Feature-grid/image-size mismatches are validated before bbox target mapping.
-- Invalid identity tensor shapes fail instead of silently treating positives as
-  negatives.
-- Resume rejects architecture version mismatches.
-- Training records include initialization and checkpoint write failures.
+## 完成条件
 
-## Verification Strategy
-
-Implementation follows test-first development for deterministic components and
-CPU-scale smoke checks. It does not run the user's full training experiments.
-
-Required automated coverage:
-
-- bbox-to-grid center/overlap target construction;
-- degenerate/small/clipped bboxes;
-- normalized target rows;
-- same-identity positive support;
-- dense loss ordering for matched and mismatched features;
-- mandatory gate shape, normalization, query dependence, and absence of an
-  ungated residual;
-- nonzero query-encoder gradients from the combined objective;
-- explicit click propagation;
-- output-shape/finite-value smoke tests for each model using lightweight or
-  dependency-injected backbones;
-- checkpoint version rejection and training record serialization;
-- `test_unify.py` parser/model routing and output-schema compatibility.
-
-## Acceptance Criteria
-
-- All six registry models expose valid pre-fusion query and satellite-local
-  features through the common adapter output.
-- Dense targets come from the augmented bbox and handle repeated
-  `satellite_id` values without false negatives.
-- The similarity matrix is reused for both dense InfoNCE and mandatory spatial
-  gating.
-- The localization path has no ungated satellite feature bypass around the
-  mandatory gate.
-- Training starts without reading old grounding `last.pth` files and overwrites
-  the configured `last.pth` only when saving the new run.
-- Training writes TensorBoard, `train_history.jsonl`, and
-  `training_summary.json` records with all specified loss and query diagnostics.
-- `test_unify.py` accepts all six models and emits its existing comparable
-  metric schema.
-- Focused automated tests and import/compile checks pass. Full model training and
-  official metric experiments remain the user's responsibility.
+- 六模型都输出 fusion 前 query/local features；
+- dense target 只使用增强后 bbox；
+- InfoNCE 与定位 gate 共用相似度特征；
+- 定位路径不存在未门控的 satellite bypass；
+- 新训练不读取旧 `last.pth`，保存时按约定直接覆盖；
+- 训练记录字段齐全；
+- `test_unify.py` 零改动，`test_unify_ground.py` 支持六模型；
+- 相关自动测试和 Python 编译检查通过。

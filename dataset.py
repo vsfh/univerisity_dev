@@ -34,6 +34,11 @@ DEFAULT_CACHE_DIR = "/media/data1/feihong/hf_cache"
 TEXT_DESCRIPTION_FILE = "qwen_6_28_description.json"
 TEXT_CYCLE_ORDER = (5, 4, 3, 2, 1)
 
+
+def build_default_query_click() -> torch.Tensor:
+	"""Return the explicit normalized click for centered drone crops."""
+	return torch.tensor([0.5, 0.5], dtype=torch.float32)
+
 TRAIN_HEIGHT_TO_BOX_SIZE = {
 	150: 330//2,
 	200: 414//2,
@@ -348,6 +353,7 @@ def _augment_satellite_image_with_bbox_640(
 	mode: str,
 	target_size: Tuple[int, int] = (640, 640),
 	test_crop_ratio: float = DEFAULT_TEST_CROP_RATIO,
+	train_crop_ratio_range: Optional[Tuple[float, float]] = None,
 ) -> Tuple[Image.Image, List[float]]:
 	"""Aspect-ratio-aware crop path; keeps crop_w/crop_h aligned with target_w/target_h."""
 	target_h, target_w = int(target_size[0]), int(target_size[1])
@@ -367,15 +373,21 @@ def _augment_satellite_image_with_bbox_640(
 
 	if mode == "train":
 		context_scale = 3.0
-		min_crop_w = int(random.uniform(1920-1280, 1920))
+		if train_crop_ratio_range is None:
+			min_crop_w = int(random.uniform(1920 - 1280, 1920))
+		else:
+			min_ratio, max_ratio = [float(v) for v in train_crop_ratio_range]
+			min_ratio = max(1e-3, min(1.0, min_ratio))
+			max_ratio = max(min_ratio, min(1.0, max_ratio))
+			min_crop_w = int(random.uniform(min_ratio, max_ratio) * max_crop_w)
 	else:
 		ratio = max(1e-3, min(1.0, float(test_crop_ratio)))
 		context_scale = 3.0
 		min_crop_w = 3840
 		# Keep ratio<1.0 as an optional lower bound; ratio>=1.0 should not force full-size crop.
 		if ratio < 1.0:
-			ratio_crop_w = max_crop_w * ratio
-			min_crop_w = max(min_crop_w, ratio_crop_w)
+			min_crop_w = max_crop_w * ratio
+			# min_crop_w = max(min_crop_w, ratio_crop_w)
 
 	min_crop_w = min(max_crop_w, max(1.0, min_crop_w))
 	min_crop_h = min(max_crop_h, min_crop_w / max(target_aspect, 1e-6))
@@ -485,12 +497,14 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		bbox_file: str = BBOX_FILE,
 		train_max_satellite_id: int = TRAIN_MAX_SATELLITE_ID,
 		train_split_file: str = TRAIN_SPLIT_FILE,
-			val_split_file: str = VAL_SPLIT_FILE,
-			test_split_file: str = TEST_SPLIT_FILE,
-			val_split_count: int = VAL_SPLIT_COUNT,
-			max_text_length: int = MAX_TEXT_LENGTH,
-			sat_target_size: Tuple[int, int] = DEFAULT_SAT_TARGET_SIZE,
+		val_split_file: str = VAL_SPLIT_FILE,
+		test_split_file: str = TEST_SPLIT_FILE,
+		val_split_count: int = VAL_SPLIT_COUNT,
+		max_text_length: int = MAX_TEXT_LENGTH,
+		sat_target_size: Tuple[int, int] = DEFAULT_SAT_TARGET_SIZE,
 		test_crop_ratio: float = DEFAULT_TEST_CROP_RATIO,
+		train_crop_ratio_range: Optional[Tuple[float, float]] = None,
+		train_bbox_scale: float = 1.0,
 		subset_heights: Optional[Sequence[int]] = None,
 		subset_angles: Optional[Sequence[int]] = None,
 		enable_timing_log: bool = DEFAULT_ENABLE_TIMING_LOG,
@@ -523,6 +537,20 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			sat_target_size,
 		)
 		self.test_crop_ratio = max(0.0, min(1.0, float(test_crop_ratio)))
+		if train_crop_ratio_range is None:
+			self.train_crop_ratio_range = None
+		else:
+			if len(train_crop_ratio_range) != 2:
+				raise ValueError("train_crop_ratio_range must contain (min_ratio, max_ratio).")
+			min_ratio, max_ratio = [float(v) for v in train_crop_ratio_range]
+			if not (0.0 < min_ratio <= max_ratio <= 1.0):
+				raise ValueError(
+					"train_crop_ratio_range must satisfy 0 < min_ratio <= max_ratio <= 1."
+				)
+			self.train_crop_ratio_range = (min_ratio, max_ratio)
+		self.train_bbox_scale = float(train_bbox_scale)
+		if self.train_bbox_scale <= 0.0:
+			raise ValueError("train_bbox_scale must be positive.")
 		self.subset_heights = _normalize_subset_values(
 			subset_heights,
 			DEFAULT_SUBSET_HEIGHTS,
@@ -816,7 +844,7 @@ class ShiftedSatelliteDroneDataset(Dataset):
 		orig_w, orig_h = search_image.size
 
 		if self.split == "train":
-			bbox_size = float(sample["bbox_size"])
+			bbox_size = float(sample["bbox_size"]) * self.train_bbox_scale
 			base_bbox = _build_center_bbox(
 				image_width=orig_w,
 				image_height=orig_h,
@@ -832,6 +860,7 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			mode=self.split,
 			target_size=self.sat_target_size,
 			test_crop_ratio=self.test_crop_ratio,
+			train_crop_ratio_range=self.train_crop_ratio_range,
 		)
 
 		target_h, target_w = self.sat_target_size
@@ -862,6 +891,7 @@ class ShiftedSatelliteDroneDataset(Dataset):
 			"attention_mask": attention_mask,
 			"index": index,
 			"satellite_id": torch.tensor(sample["satellite_id"], dtype=torch.long),
+			"query_click": build_default_query_click(),
 			"bbox": torch.tensor(resized_bbox, dtype=torch.float32),
 			"height": torch.tensor(sample["height"], dtype=torch.long),
 			"angle": torch.tensor(sample["angle"], dtype=torch.long),

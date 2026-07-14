@@ -45,6 +45,7 @@ def evaluate(cfg: Dict[str, Any], dry_run: bool = False, max_batches: int = 0) -
         device = "cpu"
     metrics = legacy_eval(
         model_type=str(cfg["model"]["type"]),
+        model_config=dict(cfg["model"]),
         checkpoint_path=checkpoint,
         subset_heights=cfg["data"].get("subset_heights"),
         subset_angles=cfg["data"].get("subset_angles"),

@@ -669,21 +669,28 @@ def pca_visualization(
 	return saved_paths
 
 
-def _build_model_and_io(model_type: str, device: str):
+def _build_model_and_io(
+	model_type: str,
+	device: str,
+	model_config: Optional[Dict[str, object]] = None,
+):
 	model_type = _canonical_model_type(model_type)
+	model_config = model_config or {}
 
 	if model_type == "siglip":
+		model_name = str(model_config.get("model_name", SIGLIP_MODEL_NAME))
+		proj_dim = int(model_config.get("proj_dim", SIGLIP_PROJECTION_DIM))
 		processor = AutoImageProcessor.from_pretrained(
-			SIGLIP_MODEL_NAME,
+			model_name,
 			cache_dir=SIGLIP_CACHE_DIR,
 		)
 		processor_sat = AutoImageProcessor.from_pretrained(
-			SIGLIP_MODEL_NAME,
+			model_name,
 			cache_dir=SIGLIP_CACHE_DIR,
 		)
 		set_siglip_processor_size(processor_sat, PROCESSOR_IMAGE_SIZE)
-		tokenizer = AutoTokenizer.from_pretrained(SIGLIP_MODEL_NAME)
-		model = SiglipEncoder(SIGLIP_MODEL_NAME, proj_dim=SIGLIP_PROJECTION_DIM).to(device)
+		tokenizer = AutoTokenizer.from_pretrained(model_name)
+		model = SiglipEncoder(model_name, proj_dim=proj_dim).to(device)
 		return model, processor, processor_sat, tokenizer
 
 	if model_type == "encoder_abla":
@@ -763,46 +770,53 @@ def _build_model_and_io(model_type: str, device: str):
 		return model, processor, processor, tokenizer
 
 	if model_type == "clip":
+		model_name = str(model_config.get("model_name", CLIP_MODEL_NAME))
+		proj_dim = int(model_config.get("proj_dim", CLIP_PROJECTION_DIM))
 		processor = CLIPProcessor.from_pretrained(
-			CLIP_MODEL_NAME,
+			model_name,
 			cache_dir=CLIP_CACHE_DIR,
 		)
 		processor_sat = CLIPProcessor.from_pretrained(
-			CLIP_MODEL_NAME,
+			model_name,
 			cache_dir=CLIP_CACHE_DIR,
 		)
 		set_clip_processor_size(processor_sat, PROCESSOR_IMAGE_SIZE)
-		tokenizer = AutoTokenizer.from_pretrained(CLIP_MODEL_NAME, cache_dir=CLIP_CACHE_DIR)
-		model = ClipEncoder(CLIP_MODEL_NAME, proj_dim=CLIP_PROJECTION_DIM).to(device)
+		tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=CLIP_CACHE_DIR)
+		model = ClipEncoder(model_name, proj_dim=proj_dim).to(device)
 		return model, processor, processor_sat, tokenizer
 
 	if model_type == "openclip":
+		model_name = str(model_config.get("model_name", OPENCLIP_MODEL_NAME))
+		pretrained = str(model_config.get("pretrained", OPENCLIP_PRETRAINED))
+		proj_dim = int(model_config.get("proj_dim", OPENCLIP_PROJECTION_DIM))
 		_, _, preprocess = open_clip.create_model_and_transforms(
-			OPENCLIP_MODEL_NAME,
-			pretrained=OPENCLIP_PRETRAINED,
+			model_name,
+			pretrained=pretrained,
 			cache_dir=OPENCLIP_CACHE_DIR,
 		)
-		tokenizer = open_clip.get_tokenizer(OPENCLIP_MODEL_NAME)
+		tokenizer = open_clip.get_tokenizer(model_name)
 		processor_wrapper = OpenClipImageProcessorWrapper(preprocess)
 		tokenizer_wrapper = OpenClipTokenizerWrapper(tokenizer)
 		model = OpenClipEncoder(
-			model_name=OPENCLIP_MODEL_NAME,
-			pretrained=OPENCLIP_PRETRAINED,
-			proj_dim=OPENCLIP_PROJECTION_DIM,
+			model_name=model_name,
+			pretrained=pretrained,
+			proj_dim=proj_dim,
 		).to(device)
 		return model, processor_wrapper, processor_wrapper, tokenizer_wrapper
 
 	if model_type == "evaclip":
+		model_name = str(model_config.get("model_name", EVACLIP_MODEL_NAME))
+		proj_dim = int(model_config.get("proj_dim", EVACLIP_PROJECTION_DIM))
 		_, _, preprocess = open_clip.create_model_and_transforms(
-			EVACLIP_MODEL_NAME,
+			model_name,
 			cache_dir=EVACLIP_CACHE_DIR,
 		)
-		tokenizer = open_clip.get_tokenizer(EVACLIP_MODEL_NAME)
+		tokenizer = open_clip.get_tokenizer(model_name)
 		processor_wrapper = EvaImageProcessorWrapper(preprocess)
 		tokenizer_wrapper = EvaTokenizerWrapper(tokenizer)
 		model = EvaClipEncoder(
-			model_name=EVACLIP_MODEL_NAME,
-			proj_dim=EVACLIP_PROJECTION_DIM,
+			model_name=model_name,
+			proj_dim=proj_dim,
 		).to(device)
 		return model, processor_wrapper, processor_wrapper, tokenizer_wrapper
 
@@ -817,9 +831,14 @@ def _extract_features(
 	num_workers: int,
 	subset_heights: Sequence[int],
 	subset_angles: Sequence[int],
+	model_config: Optional[Dict[str, object]] = None,
 ):
 	model_type = _canonical_model_type(model_type)
-	model, processor, processor_sat, tokenizer = _build_model_and_io(model_type, device)
+	model, processor, processor_sat, tokenizer = _build_model_and_io(
+		model_type,
+		device,
+		model_config=model_config,
+	)
 
 	resolved_checkpoint = checkpoint_path or _default_checkpoint_for(model_type)
 	if not os.path.exists(resolved_checkpoint):
@@ -1092,6 +1111,7 @@ def _score_recall(
 
 def eval(
 	model_type: str,
+	model_config: Optional[Dict[str, object]] = None,
 	checkpoint_path: Optional[str] = None,
 	subset_heights: Optional[Sequence[int]] = None,
 	subset_angles: Optional[Sequence[int]] = None,
@@ -1128,6 +1148,7 @@ def eval(
 		gallery_satellite_paths,
 	) = _extract_features(
 		model_type=model_type,
+		model_config=model_config,
 		checkpoint_path=checkpoint_path,
 		device=device,
 		batch_size=batch_size,

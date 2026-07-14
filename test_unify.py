@@ -18,6 +18,7 @@ from bbox.yolo_utils import bbox_iou, build_target, eval_iou_acc
 from dataset import DEFAULT_SUBSET_ANGLES, DEFAULT_SUBSET_HEIGHTS, ShiftedSatelliteDroneDataset
 from hf_cache_utils import from_pretrained_prefer_local
 from model import Encoder_heat, Encoder_test
+from model_abla import model_bi, model_pre
 from train_uni import (
     BACKBONE_NAME as UNIFY_BACKBONE_NAME,
     DRONE_SIZE,
@@ -44,9 +45,17 @@ DEFAULT_OUTPUT_DIR = "/media/data1/feihong/univerisity_dev/eval_results/test_uni
 DEFAULT_INCLUDE_FILE = "/media/data1/feihong/ckpt/include2.json"
 DEFAULT_ENCODER_HEAT_CONFIG_DIR = "/media/data1/feihong/univerisity_dev/configs/unified_siglip_supp"
 DEFAULT_ENCODER_HEAT_CHECKPOINT = "/media/data1/feihong/ckpt/model_full/last.pth"
+DEFAULT_PRETRAINED_CHECKPOINT = "/media/data1/feihong/ckpt/baseline/last.pth"
 DEFAULT_UNIFY_CHECKPOINT = "/media/data1/feihong/ckpt/unify_geo/last.pth"
 DEFAULT_TRANS_CHECKPOINT = "/media/data1/feihong/ckpt/trans_geo/last.pth"
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
+ENCODER_MODEL_TYPES = {"encoder_heat", "encoder_test", "model_pre", "model_bi"}
+ENCODER_CLASSES = {
+    "encoder_heat": Encoder_heat,
+    "encoder_test": Encoder_test,
+    "model_pre": model_pre,
+    "model_bi": model_bi,
+}
 
 
 @dataclass
@@ -233,7 +242,8 @@ def discover_encoder_heat_runs(config_dir: str, checkpoint_name: str) -> List[Di
         config = payload.get("config", {}) or {}
         if not isinstance(config, dict):
             raise ValueError(f"'config' must be a mapping in {config_path}")
-        if str(config.get("ENCODER_TYPE", "heat")).lower() != "heat":
+        encoder_type = str(config.get("ENCODER_TYPE", "heat")).lower()
+        if encoder_type not in {"heat", "test", "model_pre", "model_bi"}:
             continue
 
         checkpoint_path = resolve_encoder_heat_checkpoint(
@@ -247,6 +257,8 @@ def discover_encoder_heat_runs(config_dir: str, checkpoint_name: str) -> List[Di
                 "config_name": config_path.stem,
                 "exp_name": str(payload.get("exp_name") or payload.get("name") or config_path.stem),
                 "checkpoint_path": checkpoint_path,
+                "encoder_type": encoder_type,
+                "pretrained_checkpoint": config.get("PRETRAINED_CHECKPOINT"),
                 "use_text": bool_from_config(config, "USE_TEXT_INPUT", True),
                 "use_angle": bool_from_config(config, "USE_ANGLE_INPUT", True),
                 "use_ap": bool(payload.get("use_ap", True)),
@@ -393,8 +405,9 @@ def extract_encoder_heat_features(
     lora_rank: int = 8,
     lora_alpha: float = 16.0,
     lora_dropout: float = 0.05,
+    pretrained_checkpoint: Optional[str] = None,
 ) -> FeatureBundle:
-    model = encoder_cls(
+    encoder_kwargs = dict(
         model_name=MODEL_NAME,
         proj_dim=768,
         usesg=True,
@@ -403,7 +416,14 @@ def extract_encoder_heat_features(
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
-    ).to(device)
+    )
+    if encoder_cls is model_pre:
+        if not pretrained_checkpoint:
+            raise ValueError(
+                "model_pre evaluation requires a pretrained checkpoint path."
+            )
+        encoder_kwargs["ckpt_path"] = str(pretrained_checkpoint)
+    model = encoder_cls(**encoder_kwargs).to(device)
     load_checkpoint(model, checkpoint_path)
     model.eval()
 
@@ -877,7 +897,7 @@ def score_retrieval_and_uiou(
             sampled_negatives = rng.sample(negative_pool, int(candidate_size) - 1)
             candidate_indices = sampled_negatives + [gt_gallery_index]
 
-        if model_type in {"encoder_heat", "encoder_test"}:
+        if model_type in ENCODER_MODEL_TYPES:
             text_feat = (
                 bundle.query_text_feats[q_idx]
                 if bundle.query_text_feats is not None
@@ -1039,8 +1059,8 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
     subset_heights = args.subset_heights if args.subset_heights else None
     subset_angles = args.subset_angles if args.subset_angles else None
 
-    if model_type in {"encoder_heat", "encoder_test"}:
-        encoder_cls = Encoder_test if model_type == "encoder_test" else Encoder_heat
+    if model_type in ENCODER_MODEL_TYPES:
+        encoder_cls = ENCODER_CLASSES[model_type]
         encoder_eval_use_text = False
         bundle = extract_encoder_heat_features(
             checkpoint_path=checkpoint_path,
@@ -1061,6 +1081,7 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
             lora_rank=args.lora_rank,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
+            pretrained_checkpoint=args.pretrained_checkpoint,
         )
     elif model_type == "unify_geo":
         bundle = extract_unify_features(
@@ -1120,20 +1141,20 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
         "candidate_size": args.candidate_size,
         "test_crop_ratio": float(args.test_crop_ratio),
         "seed": int(args.seed),
-        "encoder_use_text": False if model_type in {"encoder_heat", "encoder_test"} else None,
-        "encoder_use_angle": bool(args.encoder_heat_use_angle) if model_type in {"encoder_heat", "encoder_test"} else None,
-        "encoder_heat_use_ap": bool(args.encoder_heat_use_ap) if model_type in {"encoder_heat", "encoder_test"} else None,
-        "encoder_heat_use_heatmap": bool(args.encoder_heat_use_heatmap) if model_type in {"encoder_heat", "encoder_test"} else None,
-        "heatmap_confidence_weight": float(args.heatmap_confidence_weight) if model_type in {"encoder_heat", "encoder_test"} else None,
-        "encoder_heat_text_score_weight": 0.0 if model_type in {"encoder_heat", "encoder_test"} else None,
-        "encoder_heat_text_rerank_topk": 0 if model_type in {"encoder_heat", "encoder_test"} else None,
+        "encoder_use_text": False if model_type in ENCODER_MODEL_TYPES else None,
+        "encoder_use_angle": bool(args.encoder_heat_use_angle) if model_type in ENCODER_MODEL_TYPES else None,
+        "encoder_heat_use_ap": bool(args.encoder_heat_use_ap) if model_type in ENCODER_MODEL_TYPES else None,
+        "encoder_heat_use_heatmap": bool(args.encoder_heat_use_heatmap) if model_type in ENCODER_MODEL_TYPES else None,
+        "heatmap_confidence_weight": float(args.heatmap_confidence_weight) if model_type in ENCODER_MODEL_TYPES else None,
+        "encoder_heat_text_score_weight": 0.0 if model_type in ENCODER_MODEL_TYPES else None,
+        "encoder_heat_text_rerank_topk": 0 if model_type in ENCODER_MODEL_TYPES else None,
         "lora": (
             {
                 "rank": int(args.lora_rank),
                 "alpha": float(args.lora_alpha),
                 "dropout": float(args.lora_dropout),
             }
-            if model_type in {"encoder_heat", "encoder_test"}
+            if model_type in ENCODER_MODEL_TYPES
             else None
         ),
         "include_file": args.include_file,
@@ -1156,7 +1177,7 @@ def checkpoint_for_model(model_type: str, args: argparse.Namespace) -> str:
         if len(args.model_types) != 1:
             raise ValueError("--checkpoint can only be used with exactly one --model-types value.")
         return args.checkpoint
-    if model_type in {"encoder_heat", "encoder_test"}:
+    if model_type in ENCODER_MODEL_TYPES:
         return args.encoder_heat_checkpoint
     if model_type == "unify_geo":
         return args.unify_checkpoint
@@ -1213,10 +1234,11 @@ def parse_args() -> argparse.Namespace:
         "--model-types",
         nargs="+",
         default=["encoder_heat"],
-        choices=["encoder_heat", "encoder_test", "unify_geo", "trans_geo"],
+        choices=["encoder_heat", "encoder_test", "model_pre", "model_bi", "unify_geo", "trans_geo"],
     )
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--encoder-heat-checkpoint", type=str, default=DEFAULT_ENCODER_HEAT_CHECKPOINT)
+    parser.add_argument("--pretrained-checkpoint", type=str, default=DEFAULT_PRETRAINED_CHECKPOINT)
     parser.add_argument("--encoder-heat-config-dir", type=str, default=DEFAULT_ENCODER_HEAT_CONFIG_DIR)
     parser.add_argument("--eval-encoder-heat-configs", action="store_true")
     parser.add_argument("--encoder-heat-checkpoint-name", type=str, default="last.pth")
@@ -1300,8 +1322,15 @@ def main() -> None:
             checkpoint_name=args.encoder_heat_checkpoint_name,
         )
         for run in runs:
+            encoder_type = str(run["encoder_type"])
+            model_type = {
+                "heat": "encoder_heat",
+                "test": "encoder_test",
+                "model_pre": "model_pre",
+                "model_bi": "model_bi",
+            }[encoder_type]
             print(
-                f"\nEvaluating encoder_heat config={run['config_name']} "
+                f"\nEvaluating {model_type} config={run['config_name']} "
                 f"checkpoint={run['checkpoint_path']}"
             )
             args.encoder_heat_use_text = False
@@ -1309,7 +1338,9 @@ def main() -> None:
             args.encoder_heat_use_ap = bool(run["use_ap"])
             args.encoder_heat_use_heatmap = bool(run["use_heatmap"])
             args.heatmap_confidence_weight = float(run["heatmap_confidence_weight"])
-            metrics = evaluate_model("encoder_heat", str(run["checkpoint_path"]), args)
+            if run["pretrained_checkpoint"]:
+                args.pretrained_checkpoint = str(run["pretrained_checkpoint"])
+            metrics = evaluate_model(model_type, str(run["checkpoint_path"]), args)
             metrics["config_path"] = run["config_path"]
             metrics["config_name"] = run["config_name"]
             metrics["exp_name"] = run["exp_name"]

@@ -10,7 +10,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "save_dir": "/media/data1/feihong/ckpt/grounding_exp",
     "model": {
         "type": "siglip2_heat",
-        "checkpoint": None,
+        "pretrained_checkpoint": None,
         "model_name": "google/siglip2-base-patch16-224",
         "cache_dir": "/media/data1/feihong/hf_cache",
         "use_angle": True,
@@ -31,6 +31,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "amp": True,
         "grad_clip_norm": 5.0,
         "device": "cuda:1",
+        "resume_checkpoint": None,
     },
     "loss": {
         "bbox_weight": 1.0,
@@ -42,6 +43,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "heatmap_bbox_center_log_scale": 9.0,
         "smgeo_heatmap_sigma": 1.5,
         "moe_entropy_weight": 0.0,
+    },
+    "query_guard": {
+        "enabled": True,
+        "projection_dim": 256,
+        "temperature": 0.07,
+        "weight": 0.2,
+        "warmup_epochs": 2,
+        "center_weight": 0.7,
+        "identity_key": "object_id",
     },
     "eval": {
         "batch_size": 8,

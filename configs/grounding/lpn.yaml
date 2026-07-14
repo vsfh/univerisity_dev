@@ -4,12 +4,22 @@ save_dir: /media/data1/feihong/ckpt/ground_lpn
 model:
   type: lpn
   pretrained: true
+  num_parts: 4
   use_angle: true
   use_heatmap: false
   use_text: false
 
 train:
   batch_size: 30
+
+query_guard:
+  enabled: true
+  projection_dim: 256
+  temperature: 0.07
+  weight: 0.2
+  warmup_epochs: 2
+  center_weight: 0.7
+  identity_key: object_id
 
 eval:
   output_dir: eval_results/grounding/lpn

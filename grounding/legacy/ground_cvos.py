@@ -12,6 +12,7 @@ import random
 import json
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import cv2
 import numpy as np
 import torch.backends.cudnn as cudnn
@@ -36,6 +37,7 @@ from bbox.yolo_utils import yolo_loss, build_target
 from grounding.legacy.utils.utils import AverageMeter, eval_iou_acc
 from grounding.legacy.utils.checkpoint import save_checkpoint
 from grounding.legacy.model.darknet import *
+from grounding.query_guard import DenseQueryMatcher, build_gaussian_click_map
 
 DATA_ROOT = "/media/data1/feihong/CVOGL"
 DATA_NAME = "CVOGL_DroneAerial"
@@ -276,17 +278,31 @@ class GeoConditioner(nn.Module):
 
 
 class TROGeoLite(nn.Module):
-    """Simplified TROGeo without click point input for direct bbox regression."""
+    """TROGeo query-prompt path with a mandatory dense query gate."""
 
-    def __init__(self, emb_size=768):
+    def __init__(
+        self,
+        emb_size=768,
+        backbone=None,
+        cross_attention=None,
+        projection_dim=256,
+        temperature=0.07,
+    ):
         super(TROGeoLite, self).__init__()
 
-        base_model = SwinTransformer()
+        base_model = backbone if backbone is not None else SwinTransformer()
         self.query_model = base_model
         self.reference_model = base_model
+        self.combine_clickptns_conv = double_conv(4, 3)
 
-        self.cross_attention = SpatialTransformer(
+        self.cross_attention = cross_attention or SpatialTransformer(
             in_channels=emb_size, n_heads=12, d_head=64, depth=1, context_dim=emb_size
+        )
+        self.query_matcher = DenseQueryMatcher(
+            emb_size,
+            emb_size,
+            projection_dim=projection_dim,
+            temperature=temperature,
         )
         self.geo_conditioner = GeoConditioner(emb_size)
 
@@ -314,36 +330,67 @@ class TROGeoLite(nn.Module):
             nn.Conv2d(emb_size // 2, 1, kernel_size=1),
         )
 
-    def forward(self, query_imgs, reference_imgs, geo=None):
+    def forward(self, query_imgs, reference_imgs, query_click=None, geo=None):
+        if query_click is None:
+            raise ValueError("TROGeoLite requires explicit query_click coordinates.")
+        click_map = build_gaussian_click_map(query_imgs, query_click)
+        query_imgs = self.combine_clickptns_conv(
+            torch.cat([query_imgs, click_map.unsqueeze(1)], dim=1)
+        )
         query_fvisu = self.query_model(query_imgs)
         reference_fvisu = self.reference_model(reference_imgs)
 
+        query_native = query_fvisu.mean(dim=(2, 3))
+        match = self.query_matcher(query_native, reference_fvisu)
         context = rearrange(query_fvisu, "b c h w -> b (h w) c").contiguous()
-        fused_features = self.cross_attention(x=reference_fvisu, context=context)
+        fused_features = self.cross_attention(x=match.gated_search, context=context)
         fused_features = self.geo_conditioner(fused_features, geo)
 
         outbox = self.fcn_out(fused_features)
         coodrs = self.coodrs_out(fused_features)
 
-        return outbox, coodrs
+        return {
+            "pred_anchor": outbox,
+            "heatmap": coodrs,
+            "query_embedding": match.query_projected,
+            "query_native": query_native,
+            "search_local_features": match.search_projected,
+            "matcher_logits": match.all_logits,
+            "paper_aux_losses": {},
+        }
 
-    def bbox_forward(self, query_imgs, reference_imgs, geo=None):
-        return self.forward(query_imgs, reference_imgs, geo=geo)
+    def bbox_forward(self, query_imgs, reference_imgs, query_click=None, geo=None):
+        return self.forward(query_imgs, reference_imgs, query_click=query_click, geo=geo)["pred_anchor"]
 
 
 class SampleGeoLite(nn.Module):
-    """Simplified TROGeo without click point input for direct bbox regression."""
+    """Shared Sample4Geo encoder with symmetric and dense local contrastive paths."""
 
-    def __init__(self, emb_size=1024, pretrained=True):
+    def __init__(
+        self,
+        emb_size=1024,
+        pretrained=True,
+        backbone=None,
+        cross_attention=None,
+        projection_dim=256,
+        temperature=0.07,
+    ):
         super(SampleGeoLite, self).__init__()
 
         model_name = "convnext_base.fb_in22k_ft_in1k_384"
-        base_model = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        base_model = backbone or timm.create_model(model_name, pretrained=pretrained, num_classes=0)
         self.query_model = base_model
         self.reference_model = base_model
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1.0 / temperature))
 
-        self.cross_attention = SpatialTransformer(
+        self.cross_attention = cross_attention or SpatialTransformer(
             in_channels=emb_size, n_heads=12, d_head=64, depth=1, context_dim=emb_size
+        )
+        self.query_matcher = DenseQueryMatcher(
+            emb_size,
+            emb_size,
+            projection_dim=projection_dim,
+            temperature=temperature,
         )
         self.geo_conditioner = GeoConditioner(emb_size)
 
@@ -371,38 +418,80 @@ class SampleGeoLite(nn.Module):
             nn.Conv2d(emb_size // 2, 1, kernel_size=1),
         )
 
-    def forward(self, query_imgs, reference_imgs, geo=None):
+    def _global_feature(self, feature_map):
+        if hasattr(self.query_model, "forward_head"):
+            return self.query_model.forward_head(feature_map, pre_logits=False)
+        return feature_map.mean(dim=(2, 3))
+
+    def forward(self, query_imgs, reference_imgs, query_click=None, geo=None):
+        del query_click
         query_fvisu = self.query_model.forward_features(query_imgs)
         reference_fvisu = self.reference_model.forward_features(reference_imgs)
 
+        query_native = self._global_feature(query_fvisu)
+        match = self.query_matcher(query_native, reference_fvisu)
         context = rearrange(query_fvisu, "b c h w -> b (h w) c").contiguous()
-        fused_features = self.cross_attention(x=reference_fvisu, context=context)
+        fused_features = self.cross_attention(x=match.gated_search, context=context)
         fused_features = self.geo_conditioner(fused_features, geo)
 
         outbox = self.fcn_out(fused_features)
         coodrs = self.coodrs_out(fused_features)
 
-        return outbox, coodrs
+        reference_global = F.normalize(match.search_projected.mean(dim=(2, 3)), p=2, dim=1)
+        scale = self.logit_scale.exp().clamp(max=100.0)
+        retrieval_logits = scale * torch.matmul(match.query_projected, reference_global.transpose(0, 1))
+        labels = torch.arange(retrieval_logits.shape[0], device=retrieval_logits.device)
+        retrieval_loss = 0.5 * (
+            F.cross_entropy(retrieval_logits, labels)
+            + F.cross_entropy(retrieval_logits.transpose(0, 1), labels)
+        )
+        return {
+            "pred_anchor": outbox,
+            "heatmap": coodrs,
+            "query_embedding": match.query_projected,
+            "query_native": query_native,
+            "search_local_features": match.search_projected,
+            "matcher_logits": match.all_logits,
+            "paper_aux_losses": {"sample4geo_symmetric_infonce": retrieval_loss},
+        }
 
-    def bbox_forward(self, query_imgs, reference_imgs, geo=None):
-        return self.forward(query_imgs, reference_imgs, geo=geo)
+    def bbox_forward(self, query_imgs, reference_imgs, query_click=None, geo=None):
+        return self.forward(query_imgs, reference_imgs, query_click=query_click, geo=geo)["pred_anchor"]
 
 
 class LPNGeoLite(nn.Module):
-    """Simplified TROGeo without click point input for direct bbox regression."""
+    """LPN local-part query descriptor with a mandatory dense query gate."""
 
-    def __init__(self, emb_size=2048, pretrained=False):
+    def __init__(
+        self,
+        emb_size=2048,
+        pretrained=False,
+        backbone=None,
+        cross_attention=None,
+        projection_dim=256,
+        temperature=0.07,
+        num_parts=4,
+    ):
         super(LPNGeoLite, self).__init__()
 
         model_name = "resnet50"
-        base_model = timm.create_model(
+        base_model = backbone or timm.create_model(
             model_name, pretrained=pretrained, features_only=True, out_indices=[4]
         )
         self.query_model = base_model
         self.reference_model = base_model
+        self.num_parts = int(num_parts)
+        if self.num_parts <= 0:
+            raise ValueError("num_parts must be positive.")
 
-        self.cross_attention = SpatialTransformer(
+        self.cross_attention = cross_attention or SpatialTransformer(
             in_channels=emb_size, n_heads=12, d_head=64, depth=1, context_dim=emb_size
+        )
+        self.query_matcher = DenseQueryMatcher(
+            emb_size * self.num_parts,
+            emb_size,
+            projection_dim=projection_dim,
+            temperature=temperature,
         )
         self.geo_conditioner = GeoConditioner(emb_size)
 
@@ -439,21 +528,50 @@ class LPNGeoLite(nn.Module):
             nn.Conv2d(hidden_dim, 1, kernel_size=1),
         )
 
-    def forward(self, query_imgs, reference_imgs, geo=None):
+    def _ring_descriptor(self, feature_map):
+        batch_size, channels, height, width = feature_map.shape
+        y = torch.linspace(-1.0, 1.0, height, device=feature_map.device, dtype=feature_map.dtype)
+        x = torch.linspace(-1.0, 1.0, width, device=feature_map.device, dtype=feature_map.dtype)
+        grid_y, grid_x = torch.meshgrid(y, x, indexing="ij")
+        radius = torch.maximum(grid_x.abs(), grid_y.abs())
+        edges = torch.linspace(0.0, 1.0, self.num_parts + 1, device=feature_map.device)
+        descriptors = []
+        for part in range(self.num_parts):
+            lower = edges[part]
+            upper = edges[part + 1]
+            mask = radius <= upper if part == 0 else ((radius > lower) & (radius <= upper))
+            weights = mask.to(dtype=feature_map.dtype).view(1, 1, height, width)
+            pooled = (feature_map * weights).sum(dim=(2, 3))
+            pooled = pooled / weights.sum().clamp_min(1.0)
+            descriptors.append(pooled)
+        return torch.cat(descriptors, dim=1).view(batch_size, channels * self.num_parts)
+
+    def forward(self, query_imgs, reference_imgs, query_click=None, geo=None):
+        del query_click
         query_fvisu = self.query_model(query_imgs)[0]
         reference_fvisu = self.reference_model(reference_imgs)[0]
 
+        query_native = self._ring_descriptor(query_fvisu)
+        match = self.query_matcher(query_native, reference_fvisu)
         context = rearrange(query_fvisu, "b c h w -> b (h w) c").contiguous()
-        fused_features = self.cross_attention(x=reference_fvisu, context=context)
+        fused_features = self.cross_attention(x=match.gated_search, context=context)
         fused_features = self.geo_conditioner(fused_features, geo)
 
         outbox = self.fcn_out(fused_features)
         coodrs = self.coodrs_out(fused_features)
 
-        return outbox, coodrs
+        return {
+            "pred_anchor": outbox,
+            "heatmap": coodrs,
+            "query_embedding": match.query_projected,
+            "query_native": query_native,
+            "search_local_features": match.search_projected,
+            "matcher_logits": match.all_logits,
+            "paper_aux_losses": {},
+        }
 
-    def bbox_forward(self, query_imgs, reference_imgs, geo=None):
-        return self.forward(query_imgs, reference_imgs, geo=geo)
+    def bbox_forward(self, query_imgs, reference_imgs, query_click=None, geo=None):
+        return self.forward(query_imgs, reference_imgs, query_click=query_click, geo=geo)["pred_anchor"]
 
 class SiglipLite(nn.Module):
     """DetGeo based on original DetGeo architecture with ResNet-18 and Darknet."""
@@ -549,7 +667,7 @@ class SiglipLite(nn.Module):
         return outbox, outbox
     
 class DetGeoLite(nn.Module):
-    """DetGeo-style model using a shared ResNet-18 query/reference feature space."""
+    """Original DetGeo two-tower path with a mandatory dense query gate."""
 
     def __init__(
         self,
@@ -557,20 +675,37 @@ class DetGeoLite(nn.Module):
         config_path="/media/data1/feihong/ckpt/yolov3_rs.cfg",
         weights_path="/media/data1/feihong/ckpt/yolov3.weights",
         use_instnorm=False,
+        query_backbone=None,
+        reference_backbone=None,
+        query_feature_dim=512,
+        reference_feature_dim=512,
+        projection_dim=256,
+        temperature=0.07,
+        load_reference_weights=True,
     ):
         super(DetGeoLite, self).__init__()
 
-        shared_resnet = MyResnet()
-        self.query_resnet = shared_resnet
-        self.reference_resnet = shared_resnet
+        self.query_resnet = query_backbone if query_backbone is not None else MyResnet()
+        self.reference_darknet = (
+            reference_backbone
+            if reference_backbone is not None
+            else Darknet(config_path=config_path, img_size=1024)
+        )
+        if (
+            reference_backbone is None
+            and load_reference_weights
+            and weights_path
+            and os.path.exists(weights_path)
+        ):
+            self.reference_darknet.load_weights(weights_path)
 
         self.combine_clickptns_conv = ConvBatchNormReLU(
             4, 3, 1, 1, 0, 1, leaky=True, instance=use_instnorm
         )
         self.crossview_fusionmodule = CrossViewFusionModule()
 
-        self.query_visudim = 512
-        self.reference_visudim = 512
+        self.query_visudim = int(query_feature_dim)
+        self.reference_visudim = int(reference_feature_dim)
 
         self.query_mapping_visu = ConvBatchNormReLU(
             self.query_visudim, emb_size, 1, 1, 0, 1, leaky=True, instance=use_instnorm
@@ -584,6 +719,12 @@ class DetGeoLite(nn.Module):
             1,
             leaky=True,
             instance=use_instnorm,
+        )
+        self.query_matcher = DenseQueryMatcher(
+            emb_size,
+            emb_size,
+            projection_dim=projection_dim,
+            temperature=temperature,
         )
         self.geo_conditioner = GeoConditioner(emb_size)
 
@@ -601,67 +742,50 @@ class DetGeoLite(nn.Module):
             nn.Conv2d(emb_size // 2, 1, kernel_size=1),
         )
 
-    def forward(self, query_imgs, reference_imgs, click_pts=None, geo=None):
-        if click_pts is not None:
-            click_pts = click_pts.unsqueeze(1)
-            query_imgs = self.combine_clickptns_conv(
-                torch.cat((query_imgs, click_pts), dim=1)
-            )
+    def forward(self, query_imgs, reference_imgs, query_click=None, geo=None):
+        if query_click is None:
+            raise ValueError("DetGeoLite requires explicit query_click coordinates.")
+        click_map = build_gaussian_click_map(query_imgs, query_click)
+        query_imgs = self.combine_clickptns_conv(
+            torch.cat((query_imgs, click_map.unsqueeze(1)), dim=1)
+        )
 
         query_fvisu = self.query_resnet(query_imgs)
-
-        reference_fvisu = self.reference_resnet(reference_imgs)
+        reference_outputs = self.reference_darknet(reference_imgs)
+        reference_fvisu = (
+            reference_outputs[1]
+            if isinstance(reference_outputs, (tuple, list))
+            else reference_outputs
+        )
 
         query_fvisu = self.query_mapping_visu(query_fvisu)
         reference_fvisu = self.reference_mapping_visu(reference_fvisu)
 
-        B, D, Hquery, Wquery = query_fvisu.shape
-        B, D, Hreference, Wreference = reference_fvisu.shape
-
-        query_gvisu = torch.mean(
-            query_fvisu.view(B, D, Hquery * Wquery), dim=2, keepdims=False
-        ).view(B, D)
-        fused_features, attn_score = self.crossview_fusionmodule(
-            query_gvisu, reference_fvisu
-        )
+        query_gvisu = query_fvisu.mean(dim=(2, 3))
+        match = self.query_matcher(query_gvisu, reference_fvisu)
+        fused_features = match.gated_search
         fused_features = self.geo_conditioner(fused_features, geo)
-        attn_score = attn_score.squeeze(1)
 
         outbox = self.fcn_out(fused_features)
         coodrs = self.coodrs_out(fused_features)
 
-        return outbox, coodrs
+        return {
+            "pred_anchor": outbox,
+            "heatmap": coodrs,
+            "query_embedding": match.query_projected,
+            "query_native": query_gvisu,
+            "search_local_features": match.search_projected,
+            "matcher_logits": match.all_logits,
+            "paper_aux_losses": {},
+        }
 
-    def bbox_forward(self, query_imgs, reference_imgs, click_pts=None, geo=None):
-        if click_pts is not None:
-            click_pts = click_pts.unsqueeze(1)
-            query_imgs = self.combine_clickptns_conv(
-                torch.cat((query_imgs, click_pts), dim=1)
-            )
-
-        query_fvisu = self.query_resnet(query_imgs)
-
-        reference_fvisu = self.reference_resnet(reference_imgs)
-
-        query_fvisu = self.query_mapping_visu(query_fvisu)
-        reference_fvisu = self.reference_mapping_visu(reference_fvisu)
-
-        B, D, Hquery, Wquery = query_fvisu.shape
-        B, D, Hreference, Wreference = reference_fvisu.shape
-
-        query_gvisu = torch.mean(
-            query_fvisu.view(B, D, Hquery * Wquery), dim=2, keepdims=False
-        ).view(B, D)
-        fused_features, attn_score = self.crossview_fusionmodule(
-            query_gvisu, reference_fvisu
-        )
-        fused_features = self.geo_conditioner(fused_features, geo)
-        attn_score = attn_score.squeeze(1)
-
-        outbox = self.fcn_out(fused_features)
-        coodrs = self.coodrs_out(fused_features)
-
-        return outbox, coodrs
+    def bbox_forward(self, query_imgs, reference_imgs, query_click=None, geo=None):
+        return self.forward(
+            query_imgs,
+            reference_imgs,
+            query_click=query_click,
+            geo=geo,
+        )["pred_anchor"]
 
 def visualize_bbox_comparison(
     query_img: np.ndarray,

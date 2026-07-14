@@ -13,12 +13,13 @@ The implementation adapts the ideas from arXiv:2505.07622:
 """
 
 import argparse
+import json
 import os
 import random
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -28,7 +29,7 @@ import torch.nn.functional as F
 import timm
 from PIL import Image
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import BatchSampler, DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -46,7 +47,7 @@ SAT_SIZE = (768, 432)  # (width, height)
 DRONE_SIZE = (256, 256)  # (width, height)
 BATCH_SIZE = 16
 NUM_EPOCHS = 40
-LEARNING_RATE = 4.5e-4
+LEARNING_RATE = 1e-4
 BACKBONE_LEARNING_RATE = 1e-5
 WEIGHT_DECAY = 0.04
 PRINT_FREQ = 50
@@ -56,13 +57,17 @@ RETRIEVAL_LOSS_WEIGHT = 1.0
 LOCALIZATION_LOSS_WEIGHT = 1.0
 BBOX_LOSS_WEIGHT = 5.0
 RERANK_LOSS_WEIGHT = 1.0
+TRIPLET_LOSS_WEIGHT = 0.5
+BBOX_IOU_LOSS_WEIGHT = 2.0
 RETRIEVAL_ONLY_EPOCHS = 0
-GROUNDING_RAMP_EPOCHS = 1
-RERANK_START_EPOCH = 1
-MEMORY_QUEUE_SIZE = 0
+GROUNDING_RAMP_EPOCHS = 3
+RERANK_START_EPOCH = 0
+MEMORY_QUEUE_SIZE = 2048
 BACKBONE_NAME = "swin_small_patch4_window7_224"
 PRETRAINED_CHECKPOINT = "/media/data1/feihong/ckpt/pretrained/smgeo/swin_s_imagenet1k_v1.pth"
-VAL_FRACTION = 0.25
+VAL_FRACTION = 1.0
+TRAIN_CROP_RATIO_RANGE = (0.6, 1.0)
+TRAIN_BBOX_SCALE = 2.0
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
@@ -96,6 +101,56 @@ class DummyTokenizer:
         input_ids = torch.zeros((1, max_length), dtype=torch.long)
         attention_mask = torch.ones_like(input_ids)
         return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+
+class IdentityBalancedBatchSampler(BatchSampler):
+    """Yield batches with at most one query per satellite identity.
+
+    Every sample is still visited once per epoch. This removes contradictory
+    in-batch negatives when a satellite has many height/heading variants.
+    """
+
+    def __init__(self, dataset, batch_size: int, drop_last: bool = True, seed: int = 2024):
+        self.batch_size = int(batch_size)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.groups: Dict[int, List[int]] = {}
+        for index, sample in enumerate(dataset.samples):
+            self.groups.setdefault(int(sample["satellite_id"]), []).append(index)
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if not self.groups:
+            raise ValueError("IdentityBalancedBatchSampler received an empty dataset.")
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[List[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        groups = {identity: list(indices) for identity, indices in self.groups.items()}
+        for indices in groups.values():
+            rng.shuffle(indices)
+        max_group_size = max(len(indices) for indices in groups.values())
+        for round_index in range(max_group_size):
+            identities = [identity for identity, indices in groups.items() if round_index < len(indices)]
+            rng.shuffle(identities)
+            round_indices = [groups[identity][round_index] for identity in identities]
+            for start in range(0, len(round_indices), self.batch_size):
+                batch = round_indices[start : start + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    yield batch
+
+    def __len__(self) -> int:
+        max_group_size = max(len(indices) for indices in self.groups.values())
+        count = 0
+        for round_index in range(max_group_size):
+            identities = sum(round_index < len(indices) for indices in self.groups.values())
+            if self.drop_last:
+                count += identities // self.batch_size
+            else:
+                count += (identities + self.batch_size - 1) // self.batch_size
+        return count
 
 
 class LayerNorm2d(nn.Module):
@@ -305,7 +360,7 @@ class LocalizationDecoder(nn.Module):
         return heatmap.view(batch_size, 1, height, width)
 
     def forward(self, ground_detail, ground_detail_map, aerial_detail):
-        temp = self.temperature.clamp(min=0.01, max=1.0)
+        temp = self.temperature.clamp(min=0.03, max=0.2)
         heatmap_logits = self._dynamic_heatmap(ground_detail_map, aerial_detail) / temp
         heat_gate = F.softmax(heatmap_logits.flatten(1), dim=1).view_as(heatmap_logits)
         heat_gate = heat_gate * float(heat_gate.shape[-2] * heat_gate.shape[-1])
@@ -314,7 +369,7 @@ class LocalizationDecoder(nn.Module):
         return heatmap_logits, bbox_raw
 
     def batch_rerank_logits(self, ground_detail, aerial_detail, retrieval_logits):
-        temp = self.temperature.clamp(min=0.01, max=1.0)
+        temp = self.temperature.clamp(min=0.03, max=0.2)
         detail_scores = torch.einsum("bd,kdhw->bkhw", ground_detail, aerial_detail) / temp
         detail_scores = detail_scores.flatten(2).max(dim=-1)[0]
         return retrieval_logits + detail_scores
@@ -565,6 +620,51 @@ def symmetric_info_nce(logits, label_smoothing: float = 0.1):
     return 0.5 * (loss_q2r + loss_r2q)
 
 
+def multi_positive_cross_entropy(
+    logits: torch.Tensor,
+    row_ids: torch.Tensor,
+    column_ids: torch.Tensor,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    """Cross entropy with every same-identity item treated as a positive."""
+    positive_mask = row_ids.view(-1, 1).eq(column_ids.view(1, -1)).to(dtype=logits.dtype)
+    positive_count = positive_mask.sum(dim=1, keepdim=True)
+    if bool((positive_count == 0).any()):
+        raise ValueError("Each row must have at least one positive column.")
+    targets = positive_mask / positive_count
+    smoothing = float(label_smoothing)
+    if smoothing > 0.0:
+        targets = (1.0 - smoothing) * targets + smoothing / float(logits.shape[1])
+    return -(targets * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
+
+
+def soft_margin_batch_hard_triplet(
+    query_feats: torch.Tensor,
+    aerial_feats: torch.Tensor,
+    identities: torch.Tensor,
+    alpha: float = 10.0,
+) -> torch.Tensor:
+    """TransGeo-style soft-margin loss with the hardest batch negatives."""
+    query_feats = F.normalize(query_feats, p=2, dim=1)
+    aerial_feats = F.normalize(aerial_feats, p=2, dim=1)
+    similarity = query_feats @ aerial_feats.t()
+    positive_mask = identities.view(-1, 1).eq(identities.view(1, -1))
+    negative_mask = ~positive_mask
+    if not bool(negative_mask.any()):
+        return similarity.new_zeros(())
+
+    def directional_loss(scores: torch.Tensor, positives: torch.Tensor, negatives: torch.Tensor) -> torch.Tensor:
+        hardest_positive = scores.masked_fill(~positives, float("inf")).min(dim=1).values
+        hardest_negative = scores.masked_fill(~negatives, float("-inf")).max(dim=1).values
+        valid = torch.isfinite(hardest_positive) & torch.isfinite(hardest_negative)
+        return F.softplus(float(alpha) * (hardest_negative[valid] - hardest_positive[valid])).mean()
+
+    return 0.5 * (
+        directional_loss(similarity, positive_mask, negative_mask)
+        + directional_loss(similarity.t(), positive_mask.t(), negative_mask.t())
+    )
+
+
 class RetrievalMemoryQueue:
     """Detached cross-batch negatives for the global retrieval objective."""
 
@@ -572,30 +672,43 @@ class RetrievalMemoryQueue:
         self.capacity = max(0, int(capacity))
         self.query_feats: Optional[torch.Tensor] = None
         self.aerial_feats: Optional[torch.Tensor] = None
+        self.identities: Optional[torch.Tensor] = None
 
     def __len__(self) -> int:
         if self.query_feats is None:
             return 0
         return int(self.query_feats.shape[0])
 
-    def enqueue(self, query_feats: torch.Tensor, aerial_feats: torch.Tensor) -> None:
+    def enqueue(
+        self,
+        query_feats: torch.Tensor,
+        aerial_feats: torch.Tensor,
+        identities: torch.Tensor,
+    ) -> None:
         if self.capacity <= 0:
             return
         query_feats = F.normalize(query_feats.detach(), p=2, dim=1).cpu()
         aerial_feats = F.normalize(aerial_feats.detach(), p=2, dim=1).cpu()
+        identities = identities.detach().view(-1).long().cpu()
         if self.query_feats is None:
             self.query_feats = query_feats[-self.capacity :]
             self.aerial_feats = aerial_feats[-self.capacity :]
+            self.identities = identities[-self.capacity :]
             return
         self.query_feats = torch.cat([self.query_feats, query_feats], dim=0)[-self.capacity :]
         self.aerial_feats = torch.cat([self.aerial_feats, aerial_feats], dim=0)[-self.capacity :]
+        self.identities = torch.cat([self.identities, identities], dim=0)[-self.capacity :]
 
-    def get(self, device: torch.device) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if self.query_feats is None or self.aerial_feats is None:
-            return None, None
+    def get(
+        self,
+        device: torch.device,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.query_feats is None or self.aerial_feats is None or self.identities is None:
+            return None, None, None
         return (
             self.query_feats.to(device=device, non_blocking=True),
             self.aerial_feats.to(device=device, non_blocking=True),
+            self.identities.to(device=device, non_blocking=True),
         )
 
 
@@ -605,26 +718,33 @@ def retrieval_loss_with_memory(
     logit_scale: torch.Tensor,
     memory_queue: Optional[RetrievalMemoryQueue],
     label_smoothing: float,
+    identities: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     query_feats = F.normalize(query_feats, p=2, dim=1)
     aerial_feats = F.normalize(aerial_feats, p=2, dim=1)
     logits = logit_scale * query_feats @ aerial_feats.t()
-    labels = torch.arange(query_feats.shape[0], device=query_feats.device)
+    if identities is None:
+        identities = torch.arange(query_feats.shape[0], device=query_feats.device)
+    identities = identities.view(-1).long()
     if memory_queue is None or len(memory_queue) == 0:
         return 0.5 * (
-            F.cross_entropy(logits, labels, label_smoothing=label_smoothing)
-            + F.cross_entropy(logits.t(), labels, label_smoothing=label_smoothing)
+            multi_positive_cross_entropy(logits, identities, identities, label_smoothing)
+            + multi_positive_cross_entropy(logits.t(), identities, identities, label_smoothing)
         )
 
-    memory_query, memory_aerial = memory_queue.get(query_feats.device)
-    if memory_query is None or memory_aerial is None:
-        return symmetric_info_nce(logits, label_smoothing=label_smoothing)
+    memory_query, memory_aerial, memory_ids = memory_queue.get(query_feats.device)
+    if memory_query is None or memory_aerial is None or memory_ids is None:
+        return 0.5 * (
+            multi_positive_cross_entropy(logits, identities, identities, label_smoothing)
+            + multi_positive_cross_entropy(logits.t(), identities, identities, label_smoothing)
+        )
 
     query_logits = torch.cat([logits, logit_scale * query_feats @ memory_aerial.t()], dim=1)
     aerial_logits = torch.cat([logits.t(), logit_scale * aerial_feats @ memory_query.t()], dim=1)
+    candidate_ids = torch.cat([identities, memory_ids], dim=0)
     return 0.5 * (
-        F.cross_entropy(query_logits, labels, label_smoothing=label_smoothing)
-        + F.cross_entropy(aerial_logits, labels, label_smoothing=label_smoothing)
+        multi_positive_cross_entropy(query_logits, identities, candidate_ids, label_smoothing)
+        + multi_positive_cross_entropy(aerial_logits, identities, candidate_ids, label_smoothing)
     )
 
 

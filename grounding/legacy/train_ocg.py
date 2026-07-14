@@ -39,6 +39,7 @@ from bbox.yolo_utils import bbox_iou, build_target, eval_iou_acc, yolo_loss
 from dataset import ShiftedSatelliteDroneDataset
 from grounding.legacy.model.darknet import ConvBatchNormReLU, Darknet
 from grounding.legacy.utils.utils import AverageMeter
+from grounding.query_guard import DenseQueryMatcher, build_gaussian_click_map
 
 
 # --- Configuration ---
@@ -409,33 +410,65 @@ class OCGNetLite(nn.Module):
         channels: int = 512,
         num_heads: int = 8,
         pretrained_backbone: bool = False,
+        query_encoder=None,
+        reference_encoder=None,
+        cross_attention=None,
+        fusion=None,
+        projection_dim: int = 256,
+        temperature: float = 0.07,
     ):
         super().__init__()
-        shared_encoder = QueryEncoder(pretrained=pretrained_backbone)
-        self.query_encoder = shared_encoder
-        self.reference_encoder = shared_encoder
+        self.query_encoder = query_encoder or QueryEncoder(pretrained=pretrained_backbone)
+        self.reference_encoder = reference_encoder or ReferenceEncoder(pretrained=pretrained_backbone)
         self.gkt = GaussianKnowledgeTransfer(channels)
-        self.cross_attention = CrossViewAttention(channels, num_heads=num_heads)
-        self.fusion = CrossViewFusion(channels)
+        self.query_matcher = DenseQueryMatcher(
+            channels,
+            channels,
+            projection_dim=projection_dim,
+            temperature=temperature,
+        )
+        self.cross_attention = cross_attention or CrossViewAttention(channels, num_heads=num_heads)
+        self.fusion = fusion or CrossViewFusion(channels)
         self.bbox_head = nn.Sequential(
             ConvBNReLU(channels // 2, channels // 2, kernel_size=3, padding=1),
             nn.Conv2d(channels // 2, 9 * 5, kernel_size=1),
         )
 
-    def forward(self, query_imgs, reference_imgs, click_maps=None):
-        if click_maps is None:
-            click_maps = build_center_click_maps(query_imgs)
+    def forward(self, query_imgs, reference_imgs, query_click=None, geo=None):
+        del geo
+        if query_click is None:
+            raise ValueError("OCGNetLite requires explicit query_click coordinates.")
+        click_maps = build_gaussian_click_map(
+            query_imgs,
+            query_click,
+            sigma=CLICK_SIGMA,
+        ).unsqueeze(1)
 
         query_feats = self.query_encoder(query_imgs, click_maps)
         query_feats = self.gkt(query_feats, click_maps)
         reference_feats = self.reference_encoder(reference_imgs)
-        query_feats = self.cross_attention(query_feats, reference_feats)
-        fused_feats = self.fusion(query_feats, reference_feats)
+        query_native = query_feats.mean(dim=(2, 3))
+        match = self.query_matcher(query_native, reference_feats)
+        query_feats = self.cross_attention(query_feats, match.gated_search)
+        fused_feats = self.fusion(query_feats, match.gated_search)
         pred_anchor = self.bbox_head(fused_feats)
-        return pred_anchor, click_maps
+        return {
+            "pred_anchor": pred_anchor,
+            "heatmap": click_maps,
+            "query_embedding": match.query_projected,
+            "query_native": query_native,
+            "search_local_features": match.search_projected,
+            "matcher_logits": match.all_logits,
+            "paper_aux_losses": {},
+        }
 
-    def bbox_forward(self, query_imgs, reference_imgs):
-        return self.forward(query_imgs, reference_imgs)[0]
+    def bbox_forward(self, query_imgs, reference_imgs, query_click=None, geo=None):
+        return self.forward(
+            query_imgs,
+            reference_imgs,
+            query_click=query_click,
+            geo=geo,
+        )["pred_anchor"]
 
 
 def build_center_click_maps(query_imgs: torch.Tensor, sigma: float = CLICK_SIGMA) -> torch.Tensor:

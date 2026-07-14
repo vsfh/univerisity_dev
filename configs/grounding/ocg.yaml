@@ -11,5 +11,14 @@ model:
 train:
   batch_size: 30
 
+query_guard:
+  enabled: true
+  projection_dim: 256
+  temperature: 0.07
+  weight: 0.2
+  warmup_epochs: 2
+  center_weight: 0.7
+  identity_key: object_id
+
 eval:
   output_dir: eval_results/grounding/ocg

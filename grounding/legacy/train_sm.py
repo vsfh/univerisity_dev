@@ -37,6 +37,7 @@ if str(REPO_ROOT) not in sys.path:
 from dataset import ShiftedSatelliteDroneDataset
 from grounding.legacy.utils.utils import AverageMeter
 from bbox.yolo_utils import bbox_iou
+from grounding.query_guard import DenseQueryMatcher, build_gaussian_click_map
 
 
 # --- Configuration ---
@@ -424,27 +425,62 @@ class SMGeoLite(nn.Module):
         window_size: int = 8,
         num_experts: int = 4,
         top_k: int = 2,
+        backbone=None,
+        head=None,
+        projection_dim: int = 256,
+        temperature: float = 0.07,
     ):
         super().__init__()
-        self.backbone = SwinMoEBackbone(
+        self.backbone = backbone or SwinMoEBackbone(
             embed_dim=embed_dim,
             patch_size=patch_size,
             window_size=window_size,
             num_experts=num_experts,
             top_k=top_k,
         )
-        self.condition = CrossViewConditioning(self.backbone.out_dim)
-        self.head = AnchorFreeHead(self.backbone.out_dim)
+        self.query_click_adapter = nn.Conv2d(4, 3, kernel_size=1, bias=False)
+        with torch.no_grad():
+            self.query_click_adapter.weight.zero_()
+            for channel in range(3):
+                self.query_click_adapter.weight[channel, channel, 0, 0] = 1.0
+        self.query_matcher = DenseQueryMatcher(
+            self.backbone.out_dim,
+            self.backbone.out_dim,
+            projection_dim=projection_dim,
+            temperature=temperature,
+        )
+        self.head = head or AnchorFreeHead(self.backbone.out_dim)
 
-    def forward(self, query_imgs, sat_imgs):
+    def forward(self, query_imgs, sat_imgs, query_click=None, geo=None):
+        del geo
+        if query_click is None:
+            raise ValueError("SMGeoLite requires explicit query_click coordinates.")
+        click_map = build_gaussian_click_map(query_imgs, query_click).unsqueeze(1)
+        query_imgs = self.query_click_adapter(torch.cat([query_imgs, click_map], dim=1))
         query_vec, sat_feat, moe_entropy = self.backbone(query_imgs, sat_imgs)
-        sat_feat = self.condition(query_vec, sat_feat)
-        heatmap_logits, bbox_raw = self.head(sat_feat)
-        return heatmap_logits, bbox_raw, moe_entropy
+        match = self.query_matcher(query_vec, sat_feat)
+        heatmap_logits, bbox_raw = self.head(match.gated_search)
+        return {
+            "heatmap_logits": heatmap_logits,
+            "bbox_raw": bbox_raw,
+            "moe_entropy": moe_entropy,
+            "query_embedding": match.query_projected,
+            "query_native": query_vec,
+            "search_local_features": match.search_projected,
+            "search_native": sat_feat,
+            "gated_search": match.gated_search,
+            "spatial_gate": match.spatial_gate,
+            "matcher_logits": match.all_logits,
+            "paper_aux_losses": {},
+        }
 
-    def bbox_forward(self, query_imgs, sat_imgs):
-        heatmap_logits, bbox_raw, _ = self.forward(query_imgs, sat_imgs)
-        return decode_anchor_free(heatmap_logits, bbox_raw, (sat_imgs.shape[-1], sat_imgs.shape[-2]))
+    def bbox_forward(self, query_imgs, sat_imgs, query_click=None, geo=None):
+        outputs = self.forward(query_imgs, sat_imgs, query_click=query_click, geo=geo)
+        return decode_anchor_free(
+            outputs["heatmap_logits"],
+            outputs["bbox_raw"],
+            (sat_imgs.shape[-1], sat_imgs.shape[-2]),
+        )
 
 
 def _unwrap_smgeo_state_dict(checkpoint):
