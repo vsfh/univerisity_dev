@@ -40,6 +40,7 @@ if str(REPO_ROOT) not in sys.path:
 from bbox.yolo_utils import bbox_iou
 from dataset import ShiftedSatelliteDroneDataset
 from grounding.utils.utils import AverageMeter
+from unify_compare_dataset import JointGeoTrainingDataset
 
 
 # --- Configuration ---
@@ -58,7 +59,7 @@ LOCALIZATION_LOSS_WEIGHT = 1.0
 BBOX_LOSS_WEIGHT = 5.0
 RERANK_LOSS_WEIGHT = 1.0
 TRIPLET_LOSS_WEIGHT = 0.5
-BBOX_IOU_LOSS_WEIGHT = 2.0
+BBOX_IOU_LOSS_WEIGHT = 0.5
 RETRIEVAL_ONLY_EPOCHS = 0
 GROUNDING_RAMP_EPOCHS = 3
 RERANK_START_EPOCH = 0
@@ -106,8 +107,9 @@ class DummyTokenizer:
 class IdentityBalancedBatchSampler(BatchSampler):
     """Yield batches with at most one query per satellite identity.
 
-    Every sample is still visited once per epoch. This removes contradictory
-    in-batch negatives when a satellite has many height/heading variants.
+    Every sample is visited when ``drop_last=False``. With ``drop_last=True``,
+    only the final identity-incomplete batch can be omitted. This removes
+    contradictory in-batch negatives when a satellite has many variants.
     """
 
     def __init__(self, dataset, batch_size: int, drop_last: bool = True, seed: int = 2024):
@@ -126,31 +128,34 @@ class IdentityBalancedBatchSampler(BatchSampler):
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
-    def __iter__(self) -> Iterator[List[int]]:
+    def _batches(self) -> Iterator[List[int]]:
         rng = random.Random(self.seed + self.epoch)
         groups = {identity: list(indices) for identity, indices in self.groups.items()}
         for indices in groups.values():
             rng.shuffle(indices)
-        max_group_size = max(len(indices) for indices in groups.values())
-        for round_index in range(max_group_size):
-            identities = [identity for identity, indices in groups.items() if round_index < len(indices)]
-            rng.shuffle(identities)
-            round_indices = [groups[identity][round_index] for identity in identities]
-            for start in range(0, len(round_indices), self.batch_size):
-                batch = round_indices[start : start + self.batch_size]
-                if len(batch) == self.batch_size or not self.drop_last:
-                    yield batch
+
+        # Draw from identities with the most remaining samples. Unlike
+        # per-round chunking, this does not discard a short tail every round.
+        while groups:
+            tie_break = {identity: rng.random() for identity in groups}
+            identities = sorted(
+                groups,
+                key=lambda identity: (-len(groups[identity]), tie_break[identity]),
+            )
+            chosen = identities[: self.batch_size]
+            if len(chosen) < self.batch_size and self.drop_last:
+                break
+            batch = [groups[identity].pop() for identity in chosen]
+            for identity in chosen:
+                if not groups[identity]:
+                    del groups[identity]
+            yield batch
+
+    def __iter__(self) -> Iterator[List[int]]:
+        yield from self._batches()
 
     def __len__(self) -> int:
-        max_group_size = max(len(indices) for indices in self.groups.values())
-        count = 0
-        for round_index in range(max_group_size):
-            identities = sum(round_index < len(indices) for indices in self.groups.values())
-            if self.drop_last:
-                count += identities // self.batch_size
-            else:
-                count += (identities + self.batch_size - 1) // self.batch_size
-        return count
+        return sum(1 for _ in self._batches())
 
 
 class LayerNorm2d(nn.Module):
@@ -329,6 +334,13 @@ class LocalizationDecoder(nn.Module):
             nn.GELU(),
             nn.Conv2d(detail_dim, 4, kernel_size=1),
         )
+        # sigmoid(0)=50% produces huge initial boxes. The true boxes occupy
+        # roughly 9%-18% of the full satellite width, so initialize near 15%.
+        nn.init.zeros_(self.bbox_head[-1].weight)
+        with torch.no_grad():
+            self.bbox_head[-1].bias.copy_(
+                torch.tensor([0.0, 0.0, -1.7346, -1.7346])
+            )
 
     def _dynamic_heatmap(self, ground_detail_map, aerial_detail):
         if ground_detail_map.ndim != 4:
@@ -574,7 +586,7 @@ class UnifyGeoLite(nn.Module):
         self.decoder = LocalizationDecoder(detail_dim)
         self.logit_scale = nn.Parameter(torch.tensor(np.log(1 / 0.07), dtype=torch.float32))
 
-    def forward(self, query_imgs, aerial_imgs):
+    def forward(self, query_imgs, aerial_imgs, compute_rerank: bool = True):
         ground = self.ground_encoder(query_imgs)
         aerial = self.aerial_encoder(aerial_imgs)
 
@@ -586,13 +598,7 @@ class UnifyGeoLite(nn.Module):
         heatmap_logits, bbox_raw = self.decoder(ground_detail, ground_detail_map, aerial_detail)
         scale = self.logit_scale.exp().clamp(max=100.0)
         retrieval_logits = scale * query_global @ aerial_global.t()
-        rerank_logits = self.decoder.batch_rerank_logits(
-            ground_detail,
-            aerial_detail,
-            retrieval_logits,
-        )
-
-        return {
+        outputs = {
             "query_global": query_global,
             "aerial_global": aerial_global,
             "ground_detail": ground_detail,
@@ -601,8 +607,14 @@ class UnifyGeoLite(nn.Module):
             "bbox_raw": bbox_raw,
             "logit_scale": scale,
             "retrieval_logits": retrieval_logits,
-            "rerank_logits": rerank_logits,
         }
+        if compute_rerank:
+            outputs["rerank_logits"] = self.decoder.batch_rerank_logits(
+                ground_detail,
+                aerial_detail,
+                retrieval_logits,
+            )
+        return outputs
 
     def bbox_forward(self, query_imgs, aerial_imgs):
         outputs = self.forward(query_imgs, aerial_imgs)
@@ -645,9 +657,10 @@ def soft_margin_batch_hard_triplet(
     alpha: float = 10.0,
 ) -> torch.Tensor:
     """TransGeo-style soft-margin loss with the hardest batch negatives."""
-    query_feats = F.normalize(query_feats, p=2, dim=1)
-    aerial_feats = F.normalize(aerial_feats, p=2, dim=1)
-    similarity = query_feats @ aerial_feats.t()
+    with torch.autocast(device_type=query_feats.device.type, enabled=False):
+        query_feats = F.normalize(query_feats.float(), p=2, dim=1)
+        aerial_feats = F.normalize(aerial_feats.float(), p=2, dim=1)
+        similarity = query_feats @ aerial_feats.t()
     positive_mask = identities.view(-1, 1).eq(identities.view(1, -1))
     negative_mask = ~positive_mask
     if not bool(negative_mask.any()):
@@ -687,9 +700,16 @@ class RetrievalMemoryQueue:
     ) -> None:
         if self.capacity <= 0:
             return
-        query_feats = F.normalize(query_feats.detach(), p=2, dim=1).cpu()
-        aerial_feats = F.normalize(aerial_feats.detach(), p=2, dim=1).cpu()
+        query_feats = F.normalize(query_feats.detach().float(), p=2, dim=1).cpu()
+        aerial_feats = F.normalize(aerial_feats.detach().float(), p=2, dim=1).cpu()
         identities = identities.detach().view(-1).long().cpu()
+        finite_rows = torch.isfinite(query_feats).all(dim=1) & torch.isfinite(aerial_feats).all(dim=1)
+        if not bool(finite_rows.all()):
+            query_feats = query_feats[finite_rows]
+            aerial_feats = aerial_feats[finite_rows]
+            identities = identities[finite_rows]
+        if query_feats.numel() == 0:
+            return
         if self.query_feats is None:
             self.query_feats = query_feats[-self.capacity :]
             self.aerial_feats = aerial_feats[-self.capacity :]
@@ -704,6 +724,16 @@ class RetrievalMemoryQueue:
         device: torch.device,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         if self.query_feats is None or self.aerial_feats is None or self.identities is None:
+            return None, None, None
+        finite_rows = torch.isfinite(self.query_feats).all(dim=1) & torch.isfinite(self.aerial_feats).all(dim=1)
+        if not bool(finite_rows.all()):
+            self.query_feats = self.query_feats[finite_rows]
+            self.aerial_feats = self.aerial_feats[finite_rows]
+            self.identities = self.identities[finite_rows]
+        if self.query_feats.numel() == 0:
+            self.query_feats = None
+            self.aerial_feats = None
+            self.identities = None
             return None, None, None
         return (
             self.query_feats.to(device=device, non_blocking=True),
@@ -720,9 +750,11 @@ def retrieval_loss_with_memory(
     label_smoothing: float,
     identities: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    query_feats = F.normalize(query_feats, p=2, dim=1)
-    aerial_feats = F.normalize(aerial_feats, p=2, dim=1)
-    logits = logit_scale * query_feats @ aerial_feats.t()
+    with torch.autocast(device_type=query_feats.device.type, enabled=False):
+        query_feats = F.normalize(query_feats.float(), p=2, dim=1)
+        aerial_feats = F.normalize(aerial_feats.float(), p=2, dim=1)
+        logit_scale = logit_scale.float()
+        logits = logit_scale * query_feats @ aerial_feats.t()
     if identities is None:
         identities = torch.arange(query_feats.shape[0], device=query_feats.device)
     identities = identities.view(-1).long()
@@ -739,8 +771,9 @@ def retrieval_loss_with_memory(
             + multi_positive_cross_entropy(logits.t(), identities, identities, label_smoothing)
         )
 
-    query_logits = torch.cat([logits, logit_scale * query_feats @ memory_aerial.t()], dim=1)
-    aerial_logits = torch.cat([logits.t(), logit_scale * aerial_feats @ memory_query.t()], dim=1)
+    with torch.autocast(device_type=query_feats.device.type, enabled=False):
+        query_logits = torch.cat([logits, logit_scale * query_feats @ memory_aerial.float().t()], dim=1)
+        aerial_logits = torch.cat([logits.t(), logit_scale * aerial_feats @ memory_query.float().t()], dim=1)
     candidate_ids = torch.cat([identities, memory_ids], dim=0)
     return 0.5 * (
         multi_positive_cross_entropy(query_logits, identities, candidate_ids, label_smoothing)
@@ -821,6 +854,69 @@ def bbox_l1_loss(bbox_raw, gt_bbox, image_wh: Tuple[int, int]):
     return F.l1_loss(selected, target)
 
 
+def soft_decode_bbox(heatmap_logits, bbox_raw, image_wh: Tuple[int, int]):
+    """Differentiable bbox decode used only by the training loss."""
+    B, _, H, W = heatmap_logits.shape
+    image_w, image_h = float(image_wh[0]), float(image_wh[1])
+    probabilities = F.softmax(heatmap_logits.flatten(1), dim=1)
+    grid_y, grid_x = torch.meshgrid(
+        torch.arange(H, device=bbox_raw.device, dtype=bbox_raw.dtype),
+        torch.arange(W, device=bbox_raw.device, dtype=bbox_raw.dtype),
+        indexing="ij",
+    )
+    offsets = bbox_raw[:, :2].sigmoid()
+    sizes = bbox_raw[:, 2:4].sigmoid()
+    center_x = (grid_x.unsqueeze(0) + offsets[:, 0]) / float(W)
+    center_y = (grid_y.unsqueeze(0) + offsets[:, 1]) / float(H)
+    probability_map = probabilities.view(B, H, W)
+    cx = (probability_map * center_x).sum(dim=(1, 2)) * image_w
+    cy = (probability_map * center_y).sum(dim=(1, 2)) * image_h
+    bw = (probability_map * sizes[:, 0]).sum(dim=(1, 2)) * image_w
+    bh = (probability_map * sizes[:, 1]).sum(dim=(1, 2)) * image_h
+    return torch.stack([cx - 0.5 * bw, cy - 0.5 * bh, cx + 0.5 * bw, cy + 0.5 * bh], dim=1)
+
+
+def generalized_iou_loss(pred_bbox: torch.Tensor, target_bbox: torch.Tensor) -> torch.Tensor:
+    pred_x1 = torch.minimum(pred_bbox[:, 0], pred_bbox[:, 2])
+    pred_y1 = torch.minimum(pred_bbox[:, 1], pred_bbox[:, 3])
+    pred_x2 = torch.maximum(pred_bbox[:, 0], pred_bbox[:, 2])
+    pred_y2 = torch.maximum(pred_bbox[:, 1], pred_bbox[:, 3])
+    target_x1 = torch.minimum(target_bbox[:, 0], target_bbox[:, 2])
+    target_y1 = torch.minimum(target_bbox[:, 1], target_bbox[:, 3])
+    target_x2 = torch.maximum(target_bbox[:, 0], target_bbox[:, 2])
+    target_y2 = torch.maximum(target_bbox[:, 1], target_bbox[:, 3])
+
+    inter_w = (torch.minimum(pred_x2, target_x2) - torch.maximum(pred_x1, target_x1)).clamp_min(0.0)
+    inter_h = (torch.minimum(pred_y2, target_y2) - torch.maximum(pred_y1, target_y1)).clamp_min(0.0)
+    intersection = inter_w * inter_h
+    pred_area = (pred_x2 - pred_x1).clamp_min(0.0) * (pred_y2 - pred_y1).clamp_min(0.0)
+    target_area = (target_x2 - target_x1).clamp_min(0.0) * (target_y2 - target_y1).clamp_min(0.0)
+    union = (pred_area + target_area - intersection).clamp_min(1e-6)
+    iou = intersection / union
+
+    cover_w = (torch.maximum(pred_x2, target_x2) - torch.minimum(pred_x1, target_x1)).clamp_min(0.0)
+    cover_h = (torch.maximum(pred_y2, target_y2) - torch.minimum(pred_y1, target_y1)).clamp_min(0.0)
+    cover_area = (cover_w * cover_h).clamp_min(1e-6)
+    giou = iou - (cover_area - union) / cover_area
+    return (1.0 - giou).mean()
+
+
+def bbox_regression_loss(
+    heatmap_logits,
+    bbox_raw,
+    gt_bbox,
+    image_wh: Tuple[int, int],
+    iou_weight: float = BBOX_IOU_LOSS_WEIGHT,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    teacher_l1 = bbox_l1_loss(bbox_raw, gt_bbox, image_wh)
+    soft_bbox = soft_decode_bbox(heatmap_logits, bbox_raw, image_wh)
+    image_scale = gt_bbox.new_tensor([image_wh[0], image_wh[1], image_wh[0], image_wh[1]])
+    decoded_l1 = F.smooth_l1_loss(soft_bbox / image_scale, gt_bbox / image_scale)
+    iou_loss = generalized_iou_loss(soft_bbox, gt_bbox)
+    total = teacher_l1 + decoded_l1 + float(iou_weight) * iou_loss
+    return total, teacher_l1 + decoded_l1, iou_loss
+
+
 def decode_bbox(heatmap_logits, bbox_raw, image_wh: Tuple[int, int]):
     B, _, H, W = heatmap_logits.shape
     image_w, image_h = float(image_wh[0]), float(image_wh[1])
@@ -849,8 +945,11 @@ def compute_losses(
     args,
     epoch: int,
     memory_queue: Optional[RetrievalMemoryQueue] = None,
+    identities: Optional[torch.Tensor] = None,
 ):
-    labels = torch.arange(outputs["retrieval_logits"].shape[0], device=gt_bbox.device)
+    if identities is None:
+        identities = torch.arange(outputs["retrieval_logits"].shape[0], device=gt_bbox.device)
+    identities = identities.view(-1).long()
     weights = scheduled_loss_weights(epoch, args)
     retrieval_loss = retrieval_loss_with_memory(
         outputs["query_global"],
@@ -858,6 +957,13 @@ def compute_losses(
         outputs["logit_scale"],
         memory_queue,
         label_smoothing=args.label_smoothing,
+        identities=identities,
+    )
+    triplet_loss = soft_margin_batch_hard_triplet(
+        outputs["query_global"],
+        outputs["aerial_global"],
+        identities,
+        alpha=args.triplet_alpha,
     )
     localization_loss = spatial_ce_loss(
         outputs["heatmap_logits"],
@@ -865,29 +971,55 @@ def compute_losses(
         image_wh,
         sigma=args.heatmap_sigma,
     )
-    bbox_loss = bbox_l1_loss(outputs["bbox_raw"], gt_bbox, image_wh)
-    rerank_loss = F.cross_entropy(outputs["rerank_logits"], labels)
+    bbox_loss, bbox_l1, bbox_iou = bbox_regression_loss(
+        outputs["heatmap_logits"],
+        outputs["bbox_raw"],
+        gt_bbox,
+        image_wh,
+        iou_weight=args.bbox_iou_loss_weight,
+    )
+    rerank_loss = 0.5 * (
+        multi_positive_cross_entropy(outputs["rerank_logits"], identities, identities)
+        + multi_positive_cross_entropy(outputs["rerank_logits"].t(), identities, identities)
+    )
     total = (
         weights["retrieval"] * retrieval_loss
+        + float(args.triplet_loss_weight) * triplet_loss
         + weights["localization"] * localization_loss
         + weights["bbox"] * bbox_loss
         + weights["rerank"] * rerank_loss
     )
     return total, {
         "retrieval": retrieval_loss,
+        "triplet": triplet_loss,
         "localization": localization_loss,
         "bbox": bbox_loss,
+        "bbox_l1": bbox_l1,
+        "bbox_iou": bbox_iou,
         "rerank": rerank_loss,
     }, weights
 
 
-def train_epoch(loader, model, optimizer, epoch, args, memory_queue: Optional[RetrievalMemoryQueue] = None):
+def train_epoch(
+    loader,
+    model,
+    optimizer,
+    epoch,
+    args,
+    memory_queue: Optional[RetrievalMemoryQueue] = None,
+    scaler: Optional[torch.amp.GradScaler] = None,
+):
     model.train()
+    if hasattr(loader.batch_sampler, "set_epoch"):
+        loader.batch_sampler.set_epoch(epoch)
     meters = {
         "loss": AverageMeter(),
         "retrieval": AverageMeter(),
+        "triplet": AverageMeter(),
         "localization": AverageMeter(),
         "bbox": AverageMeter(),
+        "bbox_l1": AverageMeter(),
+        "bbox_iou": AverageMeter(),
         "rerank": AverageMeter(),
     }
     batch_time = AverageMeter()
@@ -897,25 +1029,38 @@ def train_epoch(loader, model, optimizer, epoch, args, memory_queue: Optional[Re
         query_imgs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
         aerial_imgs = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
         gt_bbox = batch["bbox"].to(DEVICE, non_blocking=True)
+        identities = batch["satellite_id"].to(DEVICE, non_blocking=True)
         image_wh = (aerial_imgs.shape[-1], aerial_imgs.shape[-2])
 
-        outputs = model(query_imgs, aerial_imgs)
-        loss, loss_items, loss_weights = compute_losses(
-            outputs,
-            gt_bbox,
-            image_wh,
-            args,
-            epoch=epoch,
-            memory_queue=memory_queue,
-        )
-
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        amp_enabled = scaler is not None and scaler.is_enabled()
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
+            outputs = model(query_imgs, aerial_imgs)
+            loss, loss_items, loss_weights = compute_losses(
+                outputs,
+                gt_bbox,
+                image_wh,
+                args,
+                epoch=epoch,
+                memory_queue=memory_queue,
+                identities=identities,
+            )
+
+        if scaler is None:
+            loss.backward()
+        else:
+            scaler.scale(loss).backward()
         if args.grad_clip > 0:
+            if scaler is not None:
+                scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step()
+        if scaler is None:
+            optimizer.step()
+        else:
+            scaler.step(optimizer)
+            scaler.update()
         if memory_queue is not None:
-            memory_queue.enqueue(outputs["query_global"], outputs["aerial_global"])
+            memory_queue.enqueue(outputs["query_global"], outputs["aerial_global"], identities)
 
         bs = query_imgs.shape[0]
         meters["loss"].update(loss.item(), bs)
@@ -930,6 +1075,7 @@ def train_epoch(loader, model, optimizer, epoch, args, memory_queue: Optional[Re
                 f"Time: {batch_time.val:.3f}\t"
                 f"Loss: {meters['loss'].val:.4f} ({meters['loss'].avg:.4f})\t"
                 f"Ret: {meters['retrieval'].val:.4f}\t"
+                f"Tri: {meters['triplet'].val:.4f}\t"
                 f"Loc: {meters['localization'].val:.4f}\t"
                 f"Bbox: {meters['bbox'].val:.4f}\t"
                 f"Rerank: {meters['rerank'].val:.4f}\t"
@@ -947,52 +1093,100 @@ def validate(loader, model):
     model.eval()
     iou_values: List[float] = []
     center_distances: List[float] = []
-    top1_hits = 0
-    total = 0
+    query_features: List[torch.Tensor] = []
+    query_details: List[torch.Tensor] = []
+    query_ids: List[torch.Tensor] = []
+    gallery_features: Dict[int, torch.Tensor] = {}
+    gallery_details: Dict[int, torch.Tensor] = {}
 
-    for batch in tqdm(loader, desc="Validating"):
-        query_imgs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
-        aerial_imgs = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
-        gt_bbox = batch["bbox"].to(DEVICE, non_blocking=True)
-        with torch.no_grad():
+    with torch.inference_mode():
+        for batch in tqdm(loader, desc="Validating"):
+            query_imgs = batch["target_pixel_values"].to(DEVICE, non_blocking=True)
+            aerial_imgs = batch["search_pixel_values"].to(DEVICE, non_blocking=True)
+            gt_bbox = batch["bbox"].to(DEVICE, non_blocking=True)
+            identities = batch["satellite_id"].view(-1).long()
             outputs = model(query_imgs, aerial_imgs)
             pred_bbox = decode_bbox(
                 outputs["heatmap_logits"],
                 outputs["bbox_raw"],
                 image_wh=(aerial_imgs.shape[-1], aerial_imgs.shape[-2]),
             )
-            labels = torch.arange(outputs["retrieval_logits"].shape[0], device=DEVICE)
-            top1_hits += int((outputs["retrieval_logits"].argmax(dim=1) == labels).sum().item())
-            total += int(labels.numel())
+            query_features.append(outputs["query_global"].detach().cpu())
+            query_details.append(outputs["ground_detail"].detach().cpu())
+            query_ids.append(identities.cpu())
+            aerial_global = outputs["aerial_global"].detach().cpu()
+            aerial_detail = outputs["aerial_detail"].detach().cpu()
 
-        for idx in range(pred_bbox.shape[0]):
-            pred_xyxy = pred_bbox[idx].float()
-            gt_xyxy = gt_bbox[idx].float()
-            iou = float(
-                bbox_iou(
-                    pred_xyxy.unsqueeze(0),
-                    gt_xyxy.unsqueeze(0),
-                    x1y1x2y2=True,
-                ).item()
-            )
-            pred_cx = 0.5 * (pred_xyxy[0] + pred_xyxy[2])
-            pred_cy = 0.5 * (pred_xyxy[1] + pred_xyxy[3])
-            gt_cx = 0.5 * (gt_xyxy[0] + gt_xyxy[2])
-            gt_cy = 0.5 * (gt_xyxy[1] + gt_xyxy[3])
-            center_dist = float(torch.sqrt((pred_cx - gt_cx) ** 2 + (pred_cy - gt_cy) ** 2).item())
-            iou_values.append(iou)
-            center_distances.append(center_dist)
+            for idx, identity in enumerate(identities.tolist()):
+                if identity not in gallery_features:
+                    gallery_features[identity] = aerial_global[idx]
+                    gallery_details[identity] = aerial_detail[idx]
+
+                pred_xyxy = pred_bbox[idx].float()
+                gt_xyxy = gt_bbox[idx].float()
+                iou_values.append(
+                    float(
+                        bbox_iou(
+                            pred_xyxy.unsqueeze(0),
+                            gt_xyxy.unsqueeze(0),
+                            x1y1x2y2=True,
+                        ).item()
+                    )
+                )
+                pred_center = 0.5 * (pred_xyxy[:2] + pred_xyxy[2:])
+                gt_center = 0.5 * (gt_xyxy[:2] + gt_xyxy[2:])
+                center_distances.append(float(torch.linalg.vector_norm(pred_center - gt_center).item()))
 
     if not iou_values:
-        return {"mean_iou": 0.0, "accu50": 0.0, "center_distance": 0.0, "retrieval_top1": 0.0}
+        return {
+            "mean_iou": 0.0,
+            "accu50": 0.0,
+            "center_distance": 0.0,
+            "retrieval_top1": 0.0,
+            "uiou": 0.0,
+            "uiou_at_0_25": 0.0,
+        }
+
+    query_feature_tensor = torch.cat(query_features, dim=0)
+    query_detail_tensor = torch.cat(query_details, dim=0)
+    query_id_tensor = torch.cat(query_ids, dim=0)
+    gallery_ids = sorted(gallery_features)
+    gallery_feature_tensor = torch.stack([gallery_features[identity] for identity in gallery_ids], dim=0)
+    gallery_detail_tensor = torch.stack([gallery_details[identity] for identity in gallery_ids], dim=0)
+    gallery_id_tensor = torch.tensor(gallery_ids, dtype=torch.long)
+    scale = float(model.logit_scale.detach().exp().clamp(max=100.0).cpu().item())
+    if hasattr(model, "decoder"):
+        temperature = float(model.decoder.temperature.detach().clamp(min=0.03, max=0.2).cpu().item())
+    else:
+        temperature = float(model.temperature.detach().clamp(min=0.03, max=0.2).cpu().item())
+
+    retrieval_hits: List[torch.Tensor] = []
+    score_chunk_size = 32
+    gallery_feature_device = gallery_feature_tensor.to(DEVICE)
+    gallery_detail_device = gallery_detail_tensor.to(DEVICE)
+    gallery_id_device = gallery_id_tensor.to(DEVICE)
+    with torch.inference_mode():
+        for start in range(0, query_feature_tensor.shape[0], score_chunk_size):
+            query_chunk = query_feature_tensor[start : start + score_chunk_size].to(DEVICE)
+            detail_chunk = query_detail_tensor[start : start + score_chunk_size].to(DEVICE)
+            score = scale * query_chunk @ gallery_feature_device.t()
+            detail_score = torch.einsum("bd,kdhw->bkhw", detail_chunk, gallery_detail_device)
+            score = score + detail_score.flatten(2).max(dim=-1).values / max(temperature, 1e-6)
+            predicted_ids = gallery_id_device[score.argmax(dim=1)].cpu()
+            retrieval_hits.append(predicted_ids.eq(query_id_tensor[start : start + score_chunk_size]))
+
+    retrieval_correct = torch.cat(retrieval_hits, dim=0).numpy().astype(np.float32)
 
     iou_arr = np.array(iou_values, dtype=np.float32)
     center_arr = np.array(center_distances, dtype=np.float32)
+    uiou_arr = iou_arr * retrieval_correct
     return {
         "mean_iou": float(iou_arr.mean()),
         "accu50": float((iou_arr > 0.5).mean()),
         "center_distance": float(center_arr.mean()),
-        "retrieval_top1": float(top1_hits / max(total, 1)),
+        "retrieval_top1": float(retrieval_correct.mean()),
+        "uiou": float(uiou_arr.mean()),
+        "uiou_at_0_25": float((uiou_arr > 0.25).mean()),
     }
 
 
@@ -1001,17 +1195,19 @@ def build_dataloaders(args):
     processor_sat = TransformProcessorWrapper(args.sat_size)
     tokenizer = DummyTokenizer()
 
-    train_dataset = ShiftedSatelliteDroneDataset(
+    train_dataset = JointGeoTrainingDataset(
         processor=processor,
         processor_sat=processor_sat,
         tokenizer=tokenizer,
-        split="train",
+        train_crop_ratio_range=(args.train_crop_min_ratio, args.train_crop_max_ratio),
+        train_bbox_scale=args.train_bbox_scale,
     )
     val_dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
         processor_sat=processor_sat,
         tokenizer=tokenizer,
-        split="test",
+        split="val",
+        test_crop_ratio=1.0,
     )
     raw_val_count = len(val_dataset)
     val_fraction = float(args.val_fraction)
@@ -1022,21 +1218,33 @@ def build_dataloaders(args):
         val_indices = list(range(0, raw_val_count, step))
         val_dataset = Subset(val_dataset, val_indices)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        pin_memory=True,
-        drop_last=True,
-        num_workers=args.num_workers,
-        persistent_workers=args.num_workers > 0,
-        prefetch_factor=4 if args.num_workers > 0 else None,
-    )
+    loader_kwargs = {
+        "pin_memory": torch.cuda.is_available(),
+        "num_workers": args.num_workers,
+        "persistent_workers": args.num_workers > 0,
+        "prefetch_factor": 4 if args.num_workers > 0 else None,
+    }
+    if args.identity_balanced_batches:
+        batch_sampler = IdentityBalancedBatchSampler(
+            train_dataset,
+            batch_size=args.batch_size,
+            drop_last=True,
+            seed=args.seed,
+        )
+        train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, **loader_kwargs)
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=True,
+            **loader_kwargs,
+        )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        pin_memory=True,
+        pin_memory=torch.cuda.is_available(),
         drop_last=False,
         num_workers=args.num_workers,
         persistent_workers=args.num_workers > 0,
@@ -1058,6 +1266,34 @@ def adjust_learning_rate(args, optimizer, epoch):
     print(("lr", [param_group["lr"] for param_group in optimizer.param_groups]))
 
 
+def save_training_checkpoint(path, model, optimizer, epoch, best_iou, best_uiou, args) -> None:
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": int(epoch),
+            "best_iou": float(best_iou),
+            "best_uiou": float(best_uiou),
+            "args": vars(args),
+        },
+        path,
+    )
+
+
+def resume_training_checkpoint(path, model, optimizer) -> Tuple[int, float, float]:
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict) or "model" not in payload:
+        raise ValueError("Resume checkpoint must contain model and optimizer training state.")
+    model.load_state_dict(payload["model"], strict=True)
+    if "optimizer" in payload:
+        optimizer.load_state_dict(payload["optimizer"])
+    return (
+        int(payload.get("epoch", -1)) + 1,
+        float(payload.get("best_iou", -1.0)),
+        float(payload.get("best_uiou", -1.0)),
+    )
+
+
 def main(args):
     cudnn.benchmark = False
     cudnn.deterministic = True
@@ -1067,6 +1303,8 @@ def main(args):
 
     os.makedirs(args.checkpoint, exist_ok=True)
     writer = SummaryWriter(f"runs/{args.savename}")
+    with open(os.path.join(args.checkpoint, "train_config.json"), "w", encoding="utf-8") as f:
+        json.dump(vars(args), f, ensure_ascii=False, indent=2)
 
     print("Creating datasets from shared data source...")
     train_loader, val_loader, train_count, val_count = build_dataloaders(args)
@@ -1107,12 +1345,30 @@ def main(args):
         if int(args.memory_queue_size) > 0
         else None
     )
+    scaler = torch.amp.GradScaler("cuda", enabled=bool(args.amp and torch.cuda.is_available()))
+    start_epoch = 0
     best_iou = -1.0
+    best_uiou = -1.0
+    if args.resume:
+        start_epoch, best_iou, best_uiou = resume_training_checkpoint(
+            args.resume,
+            model,
+            optimizer,
+        )
+        print(f"Resumed {args.resume} at epoch {start_epoch}.")
 
     print(f"Starting training for {args.max_epoch} epochs...")
-    for epoch in range(args.max_epoch):
+    for epoch in range(start_epoch, args.max_epoch):
         adjust_learning_rate(args, optimizer, epoch)
-        train_metrics = train_epoch(train_loader, model, optimizer, epoch, args, memory_queue=memory_queue)
+        train_metrics = train_epoch(
+            train_loader,
+            model,
+            optimizer,
+            epoch,
+            args,
+            memory_queue=memory_queue,
+            scaler=scaler,
+        )
         val_metrics = validate(val_loader, model)
 
         for name, value in train_metrics.items():
@@ -1124,6 +1380,7 @@ def main(args):
             f"Epoch {epoch + 1}/{args.max_epoch}:\t"
             f"Train Loss: {train_metrics['loss']:.4f}\t"
             f"Ret: {train_metrics['retrieval']:.4f}\t"
+            f"Tri: {train_metrics['triplet']:.4f}\t"
             f"Loc: {train_metrics['localization']:.4f}\t"
             f"Bbox: {train_metrics['bbox']:.4f}\t"
             f"Rerank: {train_metrics['rerank']:.4f}\t"
@@ -1131,13 +1388,45 @@ def main(args):
             f"{train_metrics['weight_bbox']:.3f}/{train_metrics['weight_rerank']:.3f}\t"
             f"Queue: {int(train_metrics['memory_queue_size'])}\t"
             f"Val mIoU: {val_metrics['mean_iou']:.4f}\t"
-            f"Val R@1: {val_metrics['retrieval_top1']:.4f}"
+            f"Val R@1: {val_metrics['retrieval_top1']:.4f}\t"
+            f"Val uIoU: {val_metrics['uiou']:.4f}"
         )
 
-        torch.save(model.state_dict(), os.path.join(args.checkpoint, "last.pth"))
-        if val_metrics["mean_iou"] > best_iou:
+        improved_iou = val_metrics["mean_iou"] > best_iou
+        improved_uiou = val_metrics["uiou"] > best_uiou
+        if improved_iou:
             best_iou = val_metrics["mean_iou"]
-            torch.save(model.state_dict(), os.path.join(args.checkpoint, "best_iou.pth"))
+        if improved_uiou:
+            best_uiou = val_metrics["uiou"]
+        save_training_checkpoint(
+            os.path.join(args.checkpoint, "last.pth"),
+            model,
+            optimizer,
+            epoch,
+            best_iou,
+            best_uiou,
+            args,
+        )
+        if improved_iou:
+            save_training_checkpoint(
+                os.path.join(args.checkpoint, "best_iou.pth"),
+                model,
+                optimizer,
+                epoch,
+                best_iou,
+                best_uiou,
+                args,
+            )
+        if improved_uiou:
+            save_training_checkpoint(
+                os.path.join(args.checkpoint, "best_joint.pth"),
+                model,
+                optimizer,
+                epoch,
+                best_iou,
+                best_uiou,
+                args,
+            )
 
     print("\nTraining complete. Saved checkpoint to last.pth")
     writer.close()
@@ -1192,12 +1481,15 @@ if __name__ == "__main__":
     )
     parser.add_argument("--proj-dim", type=int, default=PROJECTION_DIM, help="retrieval descriptor dimension")
     parser.add_argument("--detail-dim", type=int, default=384, help="detailed matching feature dimension")
-    parser.add_argument("--label-smoothing", type=float, default=0.1, help="InfoNCE label smoothing")
+    parser.add_argument("--label-smoothing", type=float, default=0.0, help="InfoNCE label smoothing")
     parser.add_argument("--heatmap-sigma", type=float, default=HEATMAP_SIGMA, help="Gaussian target sigma in feature cells")
     parser.add_argument("--retrieval-loss-weight", type=float, default=RETRIEVAL_LOSS_WEIGHT)
     parser.add_argument("--localization-loss-weight", type=float, default=LOCALIZATION_LOSS_WEIGHT)
     parser.add_argument("--bbox-loss-weight", type=float, default=BBOX_LOSS_WEIGHT)
     parser.add_argument("--rerank-loss-weight", type=float, default=RERANK_LOSS_WEIGHT)
+    parser.add_argument("--triplet-loss-weight", type=float, default=TRIPLET_LOSS_WEIGHT)
+    parser.add_argument("--triplet-alpha", type=float, default=10.0)
+    parser.add_argument("--bbox-iou-loss-weight", type=float, default=BBOX_IOU_LOSS_WEIGHT)
     parser.add_argument(
         "--retrieval-only-epochs",
         type=int,
@@ -1223,6 +1515,37 @@ if __name__ == "__main__":
         help="detached cross-batch retrieval negatives; <=0 disables the queue",
     )
     parser.add_argument("--grad-clip", type=float, default=1.0, help="gradient clipping norm, <=0 disables")
+    parser.add_argument(
+        "--identity-balanced-batches",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="keep duplicate satellite identities out of the same mini-batch",
+    )
+    parser.add_argument(
+        "--train-crop-min-ratio",
+        type=float,
+        default=TRAIN_CROP_RATIO_RANGE[0],
+        help="minimum train satellite crop width relative to the full scene",
+    )
+    parser.add_argument(
+        "--train-crop-max-ratio",
+        type=float,
+        default=TRAIN_CROP_RATIO_RANGE[1],
+        help="maximum train satellite crop width relative to the full scene",
+    )
+    parser.add_argument(
+        "--train-bbox-scale",
+        type=float,
+        default=TRAIN_BBOX_SCALE,
+        help="scale the synthetic centered train bbox to match test annotation scale",
+    )
+    parser.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="use CUDA automatic mixed precision",
+    )
+    parser.add_argument("--resume", type=str, default=None, help="resume a full training checkpoint")
     parser.add_argument(
         "--checkpoint",
         type=str,

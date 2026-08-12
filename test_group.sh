@@ -10,9 +10,8 @@ CHECKPOINT_NAME="${CHECKPOINT_NAME:-last.pth}"
 OUTPUT_DIR="${OUTPUT_DIR:-/media/data1/feihong/univerisity_dev/eval_results/test_unify}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
-MODEL_TYPE="${MODEL_TYPE:-encoder_test}"
 
-read -r EXP_NAME SAVE_ROOT USE_ANGLE USE_HEATMAP < <(
+read -r EXP_NAME SAVE_ROOT USE_ANGLE USE_HEATMAP CONFIG_MODEL_TYPE < <(
 python - "$CONFIG_PATH" <<'PY'
 import sys
 import yaml
@@ -20,11 +19,21 @@ import yaml
 with open(sys.argv[1], "r", encoding="utf-8") as f:
     cfg = yaml.safe_load(f) or {}
 config = cfg.get("config", {}) or {}
+encoder_type = str(config.get("ENCODER_TYPE", "heat")).lower()
+model_type = {
+    "heat": "encoder_heat",
+    "test": "encoder_test",
+    "model_pre": "model_pre",
+    "model_bi": "model_bi",
+}.get(encoder_type)
+if model_type is None:
+    raise SystemExit(f"Unsupported ENCODER_TYPE: {encoder_type}")
 print(
     cfg.get("exp_name"),
     cfg.get("save_root", "/media/data1/feihong/ckpt"),
     int(bool(config.get("USE_ANGLE_INPUT", True))),
     int(bool(config.get("USE_HEATMAP_LOSS", True))),
+    model_type,
 )
 PY
 )
@@ -34,6 +43,7 @@ if [ -z "${EXP_NAME}" ] || [ "${EXP_NAME}" = "None" ]; then
     exit 1
 fi
 
+MODEL_TYPE="${MODEL_TYPE:-${CONFIG_MODEL_TYPE}}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-${SAVE_ROOT}/${EXP_NAME}/${CHECKPOINT_NAME}}"
 ANGLE_FLAG="--no-encoder-heat-use-angle"
 HEATMAP_FLAG="--no-encoder-heat-use-heatmap"

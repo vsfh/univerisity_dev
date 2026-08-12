@@ -210,7 +210,12 @@ runs/
 *.jpg
 *.png
 *.npz
+*.pdf
+*.pth
+*.csv
 *.pt
 .codex
 eval_results/
 node_modules/
+figures/
+reports/

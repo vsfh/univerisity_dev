@@ -21,7 +21,7 @@ from model import Encoder_heat, Encoder_test
 from model_abla import model_bi, model_pre
 from train_uni import (
     BACKBONE_NAME as UNIFY_BACKBONE_NAME,
-    DRONE_SIZE,
+    DRONE_SIZE as UNIFY_DRONE_SIZE,
     PROJECTION_DIM,
     DummyTokenizer,
     TransformProcessorWrapper,
@@ -30,9 +30,11 @@ from train_uni import (
 )
 from train_trans import (
     DETAIL_DIM as TRANS_DETAIL_DIM,
+    DRONE_SIZE as TRANS_DRONE_SIZE,
     EMBED_DIM as TRANS_EMBED_DIM,
     NUM_HEADS as TRANS_NUM_HEADS,
     PATCH_SIZE as TRANS_PATCH_SIZE,
+    PROJECTION_DIM as TRANS_PROJECTION_DIM,
     TransGeoGrounding,
 )
 
@@ -47,7 +49,7 @@ DEFAULT_ENCODER_HEAT_CONFIG_DIR = "/media/data1/feihong/univerisity_dev/configs/
 DEFAULT_ENCODER_HEAT_CHECKPOINT = "/media/data1/feihong/ckpt/model_full/last.pth"
 DEFAULT_PRETRAINED_CHECKPOINT = "/media/data1/feihong/ckpt/baseline/last.pth"
 DEFAULT_UNIFY_CHECKPOINT = "/media/data1/feihong/ckpt/unify_geo/last.pth"
-DEFAULT_TRANS_CHECKPOINT = "/media/data1/feihong/ckpt/trans_geo/last.pth"
+DEFAULT_TRANS_CHECKPOINT = "/media/data1/feihong/ckpt/trans_geo_deit/last.pth"
 ANCHORS = "37,41, 78,84, 96,215, 129,129, 194,82, 198,179, 246,280, 395,342, 550,573"
 ENCODER_MODEL_TYPES = {"encoder_heat", "encoder_test", "model_pre", "model_bi"}
 ENCODER_CLASSES = {
@@ -169,7 +171,10 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> None:
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    state = torch.load(checkpoint_path, map_location="cpu")
+    # Joint-training checkpoints contain optimizer/config metadata in addition
+    # to tensors. They are produced locally by this repository, so opt out of
+    # PyTorch 2.6's weights-only default before selecting the model state.
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
     elif isinstance(state, dict) and "model" in state:
@@ -183,6 +188,59 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> None:
         }
 
     model.load_state_dict(state, strict=True)
+
+
+def resolve_trans_drone_size(checkpoint_path: str) -> Tuple[int, int]:
+    """Recover TransGeo query geometry while remaining compatible with old runs."""
+    config_path = Path(checkpoint_path).with_name("train_config.json")
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        contract = config.get("data_contract", {}) if isinstance(config, dict) else {}
+        raw_size = contract.get("drone_size_wh") if isinstance(contract, dict) else None
+        if isinstance(raw_size, (list, tuple)) and len(raw_size) == 2:
+            return int(raw_size[0]), int(raw_size[1])
+
+    # Older checkpoints did not record input geometry. Infer the square query
+    # size from the learned DeiT positional embedding (two prefix tokens).
+    payload = torch.load(checkpoint_path, map_location="cpu", mmap=True, weights_only=False)
+    state = payload.get("model", payload) if isinstance(payload, dict) else payload
+    if isinstance(state, dict):
+        pos_embed = state.get("query_encoder.backbone.pos_embed")
+        if isinstance(pos_embed, torch.Tensor) and pos_embed.ndim == 3:
+            patch_tokens = int(pos_embed.shape[1]) - 2
+            grid_side = int(round(patch_tokens ** 0.5))
+            if grid_side * grid_side == patch_tokens:
+                side = grid_side * int(TRANS_PATCH_SIZE)
+                return side, side
+    return tuple(int(v) for v in TRANS_DRONE_SIZE)
+
+
+def detect_checkpoint_encoder_type(checkpoint_path: str) -> Optional[str]:
+    """Detect checkpoint-only encoder variants before constructing the model."""
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    state = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        mmap=True,
+        weights_only=True,
+    )
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    elif isinstance(state, dict) and "model" in state:
+        state = state["model"]
+    if not isinstance(state, dict):
+        return None
+
+    keys = (
+        str(key).replace("module.", "", 1)
+        for key in state
+    )
+    if any(key.startswith("satellite_vision_model.") for key in keys):
+        return "model_bi"
+    return None
 
 
 def load_yaml(path: str) -> Dict[str, Any]:
@@ -345,7 +403,7 @@ def create_unify_loader(
     subset_angles: Optional[Sequence[int]],
 ) -> DataLoader:
     sat_hw = (int(sat_size[0]), int(sat_size[1]))
-    processor = TransformProcessorWrapper(DRONE_SIZE)
+    processor = TransformProcessorWrapper(UNIFY_DRONE_SIZE)
     processor_sat = TransformProcessorWrapper((sat_hw[1], sat_hw[0]))
     dataset = ShiftedSatelliteDroneDataset(
         processor=processor,
@@ -375,14 +433,29 @@ def create_trans_loader(
     test_crop_ratio: float,
     subset_heights: Optional[Sequence[int]],
     subset_angles: Optional[Sequence[int]],
+    drone_size: Tuple[int, int],
 ) -> DataLoader:
-    return create_unify_loader(
-        batch_size=batch_size,
-        num_workers=num_workers,
-        sat_size=sat_size,
+    sat_hw = (int(sat_size[0]), int(sat_size[1]))
+    processor = TransformProcessorWrapper(drone_size)
+    processor_sat = TransformProcessorWrapper((sat_hw[1], sat_hw[0]))
+    dataset = ShiftedSatelliteDroneDataset(
+        processor=processor,
+        processor_sat=processor_sat,
+        tokenizer=DummyTokenizer(),
+        split="test",
+        sat_target_size=sat_hw,
         test_crop_ratio=test_crop_ratio,
         subset_heights=subset_heights,
         subset_angles=subset_angles,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
 
 
@@ -573,6 +646,7 @@ def extract_unify_features(
     proj_dim: int,
     detail_dim: int,
     backbone_name: str,
+    include_detail_features: bool = True,
 ) -> FeatureBundle:
     model = UnifyGeoLite(
         proj_dim=proj_dim,
@@ -612,10 +686,15 @@ def extract_unify_features(
             query_imgs = batch["target_pixel_values"].to(device, non_blocking=True)
             search_imgs = batch["search_pixel_values"].to(device, non_blocking=True)
             gt_bbox = batch["bbox"].to(device, non_blocking=True)
-            outputs = model(query_imgs, search_imgs)
+            outputs = model(
+                query_imgs,
+                search_imgs,
+                compute_rerank=include_detail_features,
+            )
 
             query_feats.append(outputs["query_global"].detach().cpu())
-            query_detail_feats.append(outputs["ground_detail"].detach().cpu())
+            if include_detail_features:
+                query_detail_feats.append(outputs["ground_detail"].detach().cpu())
 
             batch_labels = [_path_label(path) for path in batch["satellite_path"]]
             query_labels.extend(batch_labels)
@@ -625,11 +704,16 @@ def extract_unify_features(
             query_angles.extend([int(v) for v in batch["angle"].tolist()])
 
             aerial_global = outputs["aerial_global"].detach().cpu()
-            aerial_detail = outputs["aerial_detail"].detach().cpu()
+            aerial_detail = (
+                outputs["aerial_detail"].detach().cpu()
+                if include_detail_features
+                else None
+            )
             for idx, label in enumerate(batch_labels):
                 if label not in gallery_feat_dict:
                     gallery_feat_dict[label] = aerial_global[idx]
-                    gallery_detail_dict[label] = aerial_detail[idx]
+                    if aerial_detail is not None:
+                        gallery_detail_dict[label] = aerial_detail[idx]
                     gallery_path_dict[label] = str(batch["satellite_path"][idx])
 
             pred_bbox = decode_bbox(
@@ -661,8 +745,16 @@ def extract_unify_features(
         gallery_labels=gallery_labels,
         gallery_satellite_paths=[gallery_path_dict.get(label, "") for label in gallery_labels],
         gallery_feats=torch.stack([gallery_feat_dict[label] for label in gallery_labels], dim=0),
-        query_detail_feats=torch.cat(query_detail_feats, dim=0),
-        gallery_detail_feats=torch.stack([gallery_detail_dict[label] for label in gallery_labels], dim=0),
+        query_detail_feats=(
+            torch.cat(query_detail_feats, dim=0)
+            if query_detail_feats
+            else None
+        ),
+        gallery_detail_feats=(
+            torch.stack([gallery_detail_dict[label] for label in gallery_labels], dim=0)
+            if gallery_detail_dict
+            else None
+        ),
         unify_logit_scale=logit_scale,
         unify_temperature=temperature,
     )
@@ -683,11 +775,13 @@ def extract_trans_features(
     depth: int,
     num_heads: int,
     patch_size: int,
+    include_detail_features: bool = True,
 ) -> FeatureBundle:
     sat_hw = (int(sat_size[1]), int(sat_size[0]))
+    drone_size = resolve_trans_drone_size(checkpoint_path)
     model = TransGeoGrounding(
         sat_size=sat_hw,
-        drone_size=DRONE_SIZE,
+        drone_size=drone_size,
         proj_dim=proj_dim,
         detail_dim=detail_dim,
         embed_dim=embed_dim,
@@ -705,6 +799,7 @@ def extract_trans_features(
         test_crop_ratio=test_crop_ratio,
         subset_heights=subset_heights,
         subset_angles=subset_angles,
+        drone_size=drone_size,
     )
 
     query_feats: List[torch.Tensor] = []
@@ -725,10 +820,15 @@ def extract_trans_features(
             query_imgs = batch["target_pixel_values"].to(device, non_blocking=True)
             search_imgs = batch["search_pixel_values"].to(device, non_blocking=True)
             gt_bbox = batch["bbox"].to(device, non_blocking=True)
-            outputs = model(query_imgs, search_imgs)
+            outputs = model(
+                query_imgs,
+                search_imgs,
+                compute_rerank=include_detail_features,
+            )
 
             query_feats.append(outputs["query_global"].detach().cpu())
-            query_detail_feats.append(outputs["ground_detail"].detach().cpu())
+            if include_detail_features:
+                query_detail_feats.append(outputs["ground_detail"].detach().cpu())
 
             batch_labels = [_path_label(path) for path in batch["satellite_path"]]
             query_labels.extend(batch_labels)
@@ -738,11 +838,16 @@ def extract_trans_features(
             query_angles.extend([int(v) for v in batch["angle"].tolist()])
 
             aerial_global = outputs["aerial_global"].detach().cpu()
-            aerial_detail = outputs["aerial_detail"].detach().cpu()
+            aerial_detail = (
+                outputs["aerial_detail"].detach().cpu()
+                if include_detail_features
+                else None
+            )
             for idx, label in enumerate(batch_labels):
                 if label not in gallery_feat_dict:
                     gallery_feat_dict[label] = aerial_global[idx]
-                    gallery_detail_dict[label] = aerial_detail[idx]
+                    if aerial_detail is not None:
+                        gallery_detail_dict[label] = aerial_detail[idx]
                     gallery_path_dict[label] = str(batch["satellite_path"][idx])
 
             pred_bbox = decode_bbox(
@@ -774,8 +879,16 @@ def extract_trans_features(
         gallery_labels=gallery_labels,
         gallery_satellite_paths=[gallery_path_dict.get(label, "") for label in gallery_labels],
         gallery_feats=torch.stack([gallery_feat_dict[label] for label in gallery_labels], dim=0),
-        query_detail_feats=torch.cat(query_detail_feats, dim=0),
-        gallery_detail_feats=torch.stack([gallery_detail_dict[label] for label in gallery_labels], dim=0),
+        query_detail_feats=(
+            torch.cat(query_detail_feats, dim=0)
+            if query_detail_feats
+            else None
+        ),
+        gallery_detail_feats=(
+            torch.stack([gallery_detail_dict[label] for label in gallery_labels], dim=0)
+            if gallery_detail_dict
+            else None
+        ),
         unify_logit_scale=logit_scale,
         unify_temperature=temperature,
     )
@@ -997,11 +1110,21 @@ def summarize_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             "ratio_uIoU_gt_0_25": 0.0,
             "ratio_uIoU_gt_25": 0.0,
             "mean_center_distance": 0.0,
+            "uCDE": None,
+            "uCDE_num_samples": 0,
         }
 
     iou_arr = np.array([float(item["iou"]) for item in records], dtype=np.float32)
     uiou_arr = np.array([float(item["uIoU"]) for item in records], dtype=np.float32)
     center_arr = np.array([float(item["center_distance"]) for item in records], dtype=np.float32)
+    successful_center_arr = np.array(
+        [
+            float(item["center_distance"])
+            for item in records
+            if bool(item["top1_correct"])
+        ],
+        dtype=np.float32,
+    )
     n = int(len(records))
     top1_hits = int(sum(bool(item["top1_correct"]) for item in records))
     top5_hits = int(sum(bool(item["top5_correct"]) for item in records))
@@ -1022,6 +1145,14 @@ def summarize_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "ratio_uIoU_gt_0_25": ratio_uiou_gt_25,
         "ratio_uIoU_gt_25": ratio_uiou_gt_25,
         "mean_center_distance": float(center_arr.mean()),
+        # Unified CDE: retrieval failures are excluded from both the sum and
+        # denominator. None explicitly represents a group with zero Top-1 hits.
+        "uCDE": (
+            float(successful_center_arr.mean())
+            if successful_center_arr.size > 0
+            else None
+        ),
+        "uCDE_num_samples": int(successful_center_arr.size),
     }
 
 
@@ -1060,6 +1191,13 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
     subset_angles = args.subset_angles if args.subset_angles else None
 
     if model_type in ENCODER_MODEL_TYPES:
+        detected_model_type = detect_checkpoint_encoder_type(checkpoint_path)
+        if detected_model_type is not None and detected_model_type != model_type:
+            print(
+                f"Warning: checkpoint contains {detected_model_type} weights; "
+                f"using {detected_model_type} instead of requested {model_type}."
+            )
+            model_type = detected_model_type
         encoder_cls = ENCODER_CLASSES[model_type]
         encoder_eval_use_text = False
         bundle = extract_encoder_heat_features(
@@ -1097,6 +1235,7 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
             proj_dim=args.proj_dim,
             detail_dim=args.detail_dim,
             backbone_name=args.unify_backbone_name,
+            include_detail_features=args.unify_score_mode == "rerank",
         )
     elif model_type == "trans_geo":
         bundle = extract_trans_features(
@@ -1114,6 +1253,7 @@ def evaluate_model(model_type: str, checkpoint_path: str, args: argparse.Namespa
             depth=args.trans_depth,
             num_heads=args.trans_num_heads,
             patch_size=args.trans_patch_size,
+            include_detail_features=args.unify_score_mode == "rerank",
         )
     else:
         raise ValueError(f"Unsupported model_type: {model_type}")
@@ -1222,13 +1362,19 @@ def print_summary(metrics: Dict[str, Any], out_file: str) -> None:
         f"uIoU={overall['uIoU']:.4f} "
         f"uIoU>0.25={overall['ratio_uIoU_gt_0_25']:.4f}"
     )
-    print(f"Mean center distance: {overall['mean_center_distance']:.4f}px")
+    ucde = overall.get("uCDE")
+    ucde_text = f"{float(ucde):.4f}px" if ucde is not None else "N/A"
+    print(
+        f"Mean center distance: {overall['mean_center_distance']:.4f}px | "
+        f"uCDE: {ucde_text} "
+        f"(Top-1 successes: {int(overall.get('uCDE_num_samples', 0))})"
+    )
     print(f"Saved: {out_file}")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate retrieval, grounding, and uIoU in one feature-forward pass."
+        description="Evaluate retrieval, grounding, uIoU, and uCDE in one feature-forward pass."
     )
     parser.add_argument(
         "--model-types",
@@ -1296,7 +1442,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--unify-backbone-name", type=str, default=UNIFY_BACKBONE_NAME)
     parser.add_argument("--proj-dim", type=int, default=PROJECTION_DIM)
     parser.add_argument("--detail-dim", type=int, default=384)
-    parser.add_argument("--trans-proj-dim", type=int, default=PROJECTION_DIM)
+    parser.add_argument("--trans-proj-dim", type=int, default=TRANS_PROJECTION_DIM)
     parser.add_argument("--trans-detail-dim", type=int, default=TRANS_DETAIL_DIM)
     parser.add_argument("--trans-embed-dim", type=int, default=TRANS_EMBED_DIM)
     parser.add_argument("--trans-depth", type=int, default=12)

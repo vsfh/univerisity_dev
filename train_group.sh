@@ -11,26 +11,11 @@ CONFIGS=(
     # "configs/unified_siglip_supp/single_config/baseline_retrieval_only.yaml"
     # "configs/unified_siglip_supp/single_config/baseline_retrieval_text.yaml"
     
-    # "configs/unified_siglip_supp/single_config/baseline_wo_heading_input_ids.yaml"
-    # "configs/unified_siglip_supp/single_config/baseline_wo_heading.yaml"
+    "configs/unified_siglip_supp/single_config/baseline_wo_heading_input_ids.yaml"
+    "configs/unified_siglip_supp/single_config/baseline_wo_heading.yaml"
     "configs/unified_siglip_supp/single_config/baseline_pre.yaml"
     "configs/unified_siglip_supp/single_config/baseline_bi.yaml"
-    # "configs/unified_siglip_supp/single_config/baseline_5.yaml"
-)
-
-MODEL_TYPES=(
-    # "encoder_test"
-    # "encoder_test"
-    # "encoder_test"
-    # "encoder_test"
-    # "encoder_test"
-    # "encoder_test"
-
-    "encoder_test"
-    "encoder_test"
-    # "encoder_test"
-    # "encoder_test"
-    # "encoder_test"
+    "configs/unified_siglip_supp/single_config/baseline_sat.yaml"
 )
 
 CHECKPOINT_DIRS=(
@@ -41,11 +26,11 @@ CHECKPOINT_DIRS=(
     # "/media/data1/feihong/ckpt/baseline_retrieval_only"
     # "/media/data1/feihong/ckpt/baseline_retrieval_text"
 
-    # "/media/data1/feihong/ckpt/baseline_wo_heading_input_ids"
-    # "/media/data1/feihong/ckpt/baseline_wo_heading"
+    "/media/data1/feihong/ckpt/baseline_wo_heading_input_ids"
+    "/media/data1/feihong/ckpt/baseline_wo_heading"
     "/media/data1/feihong/ckpt/baseline_pre"
     "/media/data1/feihong/ckpt/baseline_bi"
-    # "/media/data1/feihong/ckpt/baseline_5"
+    "/media/data1/feihong/ckpt/baseline_sat"
 )
 
 TEXT_FLAGS=(
@@ -56,11 +41,11 @@ TEXT_FLAGS=(
 #     "--no-encoder-heat-use-text"
 #     "--encoder-heat-use-text"
 
-    # "--no-encoder-heat-use-text"
-    # "--encoder-heat-use-text"
+    "--no-encoder-heat-use-text"
     "--encoder-heat-use-text"
     "--encoder-heat-use-text"
-    # "--encoder-heat-use-text"
+    "--encoder-heat-use-text"
+    "--encoder-heat-use-text"
 )
 
 HEATMAP_FLAGS=(
@@ -71,11 +56,11 @@ HEATMAP_FLAGS=(
     # "--no-encoder-heat-use-heatmap"
     # "--no-encoder-heat-use-heatmap"
 
-    # "--encoder-heat-use-heatmap"
-    # "--encoder-heat-use-heatmap"
     "--encoder-heat-use-heatmap"
     "--encoder-heat-use-heatmap"
-    # "--encoder-heat-use-heatmap"
+    "--encoder-heat-use-heatmap"
+    "--encoder-heat-use-heatmap"
+    "--encoder-heat-use-heatmap"
 
 )
 
@@ -87,11 +72,11 @@ ANGLE_FLAGS=(
     # "--no-encoder-heat-use-angle"
     # "--no-encoder-heat-use-angle"
 
-    # "--no-encoder-heat-use-angle"
-    # "--encoder-heat-use-angle"
+    "--no-encoder-heat-use-angle"
     "--encoder-heat-use-angle"
     "--encoder-heat-use-angle"
-    # "--encoder-heat-use-angle"
+    "--encoder-heat-use-angle"
+    "--encoder-heat-use-angle"
 )
 
 CHECKPOINT_NAME="${CHECKPOINT_NAME:-last.pth}"
@@ -107,7 +92,24 @@ COMMON_TEST_ARGS=(
 
 for IDX in "${!CONFIGS[@]}"; do
     CONFIG_PATH="${CONFIGS[$IDX]}"
-    MODEL_TYPE="${MODEL_TYPES[$IDX]}"
+    MODEL_TYPE="$(python - "${CONFIG_PATH}" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    payload = yaml.safe_load(f) or {}
+encoder_type = str((payload.get("config", {}) or {}).get("ENCODER_TYPE", "heat")).lower()
+model_types = {
+    "heat": "encoder_heat",
+    "test": "encoder_test",
+    "model_pre": "model_pre",
+    "model_bi": "model_bi",
+}
+if encoder_type not in model_types:
+    raise SystemExit(f"Unsupported ENCODER_TYPE in {sys.argv[1]}: {encoder_type}")
+print(model_types[encoder_type])
+PY
+)"
     CHECKPOINT_PATH="${CHECKPOINT_DIRS[$IDX]}/${CHECKPOINT_NAME}"
     TEXT_FLAG="${TEXT_FLAGS[$IDX]}"
     HEATMAP_FLAG="${HEATMAP_FLAGS[$IDX]}"
@@ -118,7 +120,7 @@ for IDX in "${!CONFIGS[@]}"; do
     echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "============================================================"
 
-    bash train.sh "${CONFIG_PATH}"
+    # bash train.sh "${CONFIG_PATH}"
 
     echo "============================================================"
     echo "Finished experiment: ${CONFIG_PATH}"

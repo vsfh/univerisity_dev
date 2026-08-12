@@ -1,5 +1,5 @@
-exp_name: baseline_retrieval_text
-save_root: /media/data1/feihong/ckpt
+exp_name: baseline_retrieval_text_5x3
+save_root: outputs
 end_num: 0.1
 use_ap: true
 
@@ -25,6 +25,6 @@ config:
   USE_REFINE_LOSS: false
   USE_TEXT_ANCHOR_LOSS: false
   TEXT_ANCHOR_LOSS_WEIGHT: 0.5
-  TEXT_POOLER_ALIGN_WEIGHT: 0.05
+  TEXT_POOLER_ALIGN_WEIGHT: 0.046
   TEXT_POOLER_ALIGN_STOP_EPOCH: 10
   TEXT_POOLER_ALIGN_TARGET: satellite

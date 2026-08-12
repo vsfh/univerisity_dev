@@ -1,5 +1,5 @@
-exp_name: baseline_retrieval_text
-save_root: /media/data1/feihong/ckpt
+exp_name: baseline_ada_0_5x3
+save_root: outputs
 end_num: 0.1
 use_ap: true
 
@@ -12,19 +12,21 @@ config:
   MODEL_NAME: google/siglip2-base-patch16-224
   USE_AMP: true
   ENABLE_TF32: true
-  ENCODER_TYPE: test
+  ENCODER_TYPE: ada
   LORA_RANK: 8
   LORA_ALPHA: 16.0
   LORA_DROPOUT: 0.05
-  OPTIMIZE_OBJECTIVE: img_text_only
-  USE_ANGLE_INPUT: false
+  OPTIMIZE_OBJECTIVE: combined
+  GROUNDING_START_EPOCH: 0
+  GROUNDING_WARMUP_EPOCHS: 0
+  USE_ANGLE_INPUT: true
   USE_TEXT_INPUT: true
-  USE_HEATMAP_LOSS: false
+  USE_HEATMAP_LOSS: true
   HEATMAP_LOSS_WEIGHT: 0.2
   HEATMAP_CONFIDENCE_WEIGHT: 0.5
   USE_REFINE_LOSS: false
   USE_TEXT_ANCHOR_LOSS: false
-  TEXT_ANCHOR_LOSS_WEIGHT: 0.5
-  TEXT_POOLER_ALIGN_WEIGHT: 0.05
-  TEXT_POOLER_ALIGN_STOP_EPOCH: 10
+  TEXT_ANCHOR_LOSS_WEIGHT: 0
+  TEXT_POOLER_ALIGN_WEIGHT: 0.01
+  TEXT_POOLER_ALIGN_STOP_EPOCH: 5
   TEXT_POOLER_ALIGN_TARGET: satellite
