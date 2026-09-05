@@ -1,0 +1,13 @@
+无人机视觉特征分布——标识说明
+==============================
+
+数据范围：每个地点固定使用 250 米、0° 的无人机图像，共 3,507 个地点。
+编码器：google/siglip2-base-patch16-224；每张图得到一个 768 维、L2 归一化的 pooled vision feature。
+主图：视觉特征的 t-SNE 二维投影；C1–C6 为 spherical k-means 无监督视觉簇，不是真实类别。
+点云外围的六张本地 UAV 图是各簇的代表缩略图，细线指向对应簇的二维中位数位置：
+  C1：ID 2220，/media/data1/feihong/drone_img/2220/250_0.png
+  C2：ID 1928，/media/data1/feihong/drone_img/1928/250_0.png
+  C3：ID 1569，/media/data1/feihong/drone_img/1569/250_0.png
+  C4：ID 0111，/media/data1/feihong/drone_img/0111/250_0.png
+  C5：ID 0187，/media/data1/feihong/drone_img/0187/250_0.png
+  C6：ID 1140，/media/data1/feihong/drone_img/1140/250_0.png

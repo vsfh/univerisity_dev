@@ -35,9 +35,9 @@ from bbox.yolo_utils import (
 )
 from dataset import ShiftedSatelliteDroneDataset
 from hf_cache_utils import from_pretrained_prefer_local
-from model_abla import model_bi, model_pre
+from model_abla import model_bi, model_bi_ada, model_pre, model_pre_ada
 
-cudnn.benchmark = True
+cudnn.benchmark = False
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -123,7 +123,14 @@ class Config:
 GRID_ROWS = 3
 GRID_COLS = 5
 NUM_LOCATIONS = GRID_ROWS * GRID_COLS
-ENCODER_TYPES = {"test", "ada", "model_pre", "model_bi"}
+ENCODER_TYPES = {
+    "test",
+    "ada",
+    "model_pre",
+    "model_bi",
+    "model_pre_ada",
+    "model_bi_ada",
+}
 
 
 def config_to_dict() -> Dict[str, Any]:
@@ -240,6 +247,31 @@ def _to_clearml_serializable(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+def seed_everything(seed: int) -> None:
+    if not 0 <= int(seed) < 2**32:
+        raise ValueError(f"seed must be in [0, 2**32), got {seed}.")
+
+    seed = int(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    cudnn.benchmark = False
+    cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
+
+
+def seed_dataloader_worker(worker_id: int) -> None:
+    del worker_id
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 def build_dataloader_kwargs(num_workers: int, drop_last: bool = False) -> Dict:
@@ -705,6 +737,13 @@ def build_encoder(use_ap: bool, usesg: bool = True) -> nn.Module:
         "lora_dropout": Config.LORA_DROPOUT,
         "use_text_grounding_path": Config.USE_TEXT_GROUNDING_PATH,
     }
+    if Config.ENCODER_TYPE == "model_pre_ada":
+        return model_pre_ada(
+            ckpt_path=Config.PRETRAINED_CHECKPOINT,
+            **kwargs,
+        )
+    if Config.ENCODER_TYPE == "model_bi_ada":
+        return model_bi_ada(**kwargs)
     if Config.ENCODER_TYPE == "model_pre":
         return model_pre(
             ckpt_path=Config.PRETRAINED_CHECKPOINT,
@@ -1018,7 +1057,8 @@ def load_data_splits() -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], se
     return train_image_pairs, test_image_pairs, train_ids, test_ids
 
 
-def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
+def train(save_path: str, end_num: float, use_ap: bool = True, seed: int = 42) -> None:
+    seed_everything(seed)
     valid_objectives = {"combined", "img_text_only", "bbox_only"}
     if Config.OPTIMIZE_OBJECTIVE not in valid_objectives:
         raise ValueError(
@@ -1091,6 +1131,10 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     # model = Encoder_dino()
 
     anchors_full = get_tensor_anchors(accelerator.device)
+    train_generator = torch.Generator()
+    train_generator.manual_seed(seed)
+    test_generator = torch.Generator()
+    test_generator.manual_seed(seed)
 
     accelerator.print("Setting up dataset and dataloader...")
     train_dataset = ShiftedSatelliteDroneDataset(
@@ -1101,6 +1145,8 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     )
     train_dataloader = DataLoader(
         train_dataset,
+        generator=train_generator,
+        worker_init_fn=seed_dataloader_worker,
         shuffle=True,
         batch_size=Config.BATCH_SIZE,
         **build_dataloader_kwargs(
@@ -1116,6 +1162,8 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
     )
     test_dataloader = DataLoader(
         test_dataset,
+        generator=test_generator,
+        worker_init_fn=seed_dataloader_worker,
         shuffle=False,
         batch_size=Config.BATCH_SIZE,
         **build_dataloader_kwargs(Config.NUM_WORKERS_VAL),
@@ -1561,6 +1609,12 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable attention-pooling retrieval branch.",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Global random seed for Python, NumPy, PyTorch, and DataLoader workers.",
+    )
     return parser.parse_args()
 
 
@@ -1594,11 +1648,18 @@ def resolve_run_settings(args: argparse.Namespace) -> Tuple[str, str, float, boo
     return exp_name, save_dir, end_num, use_ap
 
 
-def write_effective_config(save_dir: str, exp_name: str, end_num: float, use_ap: bool) -> None:
+def write_effective_config(
+    save_dir: str,
+    exp_name: str,
+    end_num: float,
+    use_ap: bool,
+    seed: int,
+) -> None:
     payload = {
         "exp_name": exp_name,
         "save_dir": save_dir,
         "end_num": float(end_num),
+        "seed": int(seed),
         "use_ap": bool(use_ap),
         "config": _to_clearml_serializable(config_to_dict()),
     }
@@ -1620,9 +1681,9 @@ if __name__ == "__main__":
         os.makedirs(save_dir, exist_ok=True)
         print(f"Created experiment directory: {save_dir}")
 
-    write_effective_config(save_dir, exp_name, end_num, use_ap)
+    write_effective_config(save_dir, exp_name, end_num, use_ap, args.seed)
     print(
         f"Starting experiment '{exp_name}' with end_num={end_num}, "
-        f"use_ap={use_ap}, save_dir={save_dir}"
+        f"use_ap={use_ap}, seed={args.seed}, save_dir={save_dir}"
     )
-    train(save_dir, end_num, use_ap=use_ap)
+    train(save_dir, end_num, use_ap=use_ap, seed=args.seed)

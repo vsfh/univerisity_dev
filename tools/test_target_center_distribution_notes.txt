@@ -1,0 +1,13 @@
+测试集 target center 空间分布——图表说明
+=======================================
+
+数据源：/media/data1/feihong/ckpt/bbox_test_2.json
+测试 region：2,804 个。原始 JSON/测试划分有 2,829/2,829 个 ID；按 dataset.py 的有效样本条件，排除缺 drone 目录 22 个、缺有效文本或视图 3 个、缺 bbox 0 个。
+
+坐标转换：原始 satellite 图像 3840×2160 px 线性映射到 1183×660 m。图像中心映射为 (0, 0)，向东和向北为正。
+每个 region 只统计一次，中心取 150 m bbox 的几何中心。该层 bbox 均未被图像边界裁切；更大高度的部分 bbox 会被裁切，其几何中心不能可靠代表原始 target center。
+
+径向 displacement：median=292.24 m，P90=485.61 m，mean=300.86 m，max=562.41 m。
+方向中心：east mean=-1.58 m、median=0.62 m；north mean=4.08 m、median=5.81 m。
+
+主图为二维 hexbin，颜色使用对数计数；上方和右侧分别为东西、南北方向的边缘直方图。中心十字虚线表示 tile 几何中心，橙色实线/虚线圆分别表示 median/P90 径向 displacement。

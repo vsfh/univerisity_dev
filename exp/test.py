@@ -16,7 +16,7 @@ from bbox.yolo_utils import bbox_iou, build_target, eval_iou_acc
 from dataset import DEFAULT_SUBSET_ANGLES, DEFAULT_SUBSET_HEIGHTS, ShiftedSatelliteDroneDataset
 from hf_cache_utils import from_pretrained_prefer_local
 from model import Encoder_ada, Encoder_test
-from model_abla import model_bi, model_pre
+from model_abla import model_bi, model_bi_ada, model_pre, model_pre_ada
 
 
 # --- Configuration ---
@@ -124,7 +124,14 @@ def load_model(args, device):
         "lora_alpha": 16.0,
         "lora_dropout": 0.05,
     }
-    if args.encoder_type == "model_pre":
+    if args.encoder_type == "model_pre_ada":
+        model = model_pre_ada(
+            ckpt_path=args.pretrained_checkpoint,
+            **kwargs,
+        )
+    elif args.encoder_type == "model_bi_ada":
+        model = model_bi_ada(**kwargs)
+    elif args.encoder_type == "model_pre":
         model = model_pre(
             ckpt_path=args.pretrained_checkpoint,
             **kwargs,
@@ -320,6 +327,7 @@ def parse_args():
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output-dir", default="eval_results")
+    parser.add_argument("--output-suffix", default=None)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--sat-size", type=int, nargs=2, default=[432, 768])
@@ -368,7 +376,8 @@ def main():
         "query_records": records,
     }
     os.makedirs(args.output_dir, exist_ok=True)
-    output_path = os.path.join(args.output_dir, f"{args.exp_name}.json")
+    output_name = args.output_suffix or args.exp_name
+    output_path = os.path.join(args.output_dir, f"{output_name}.json")
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 

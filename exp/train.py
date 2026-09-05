@@ -36,6 +36,7 @@ from bbox.yolo_utils import (
 from dataset import ShiftedSatelliteDroneDataset
 from hf_cache_utils import from_pretrained_prefer_local
 from model_abla import model_bi, model_pre
+from retrieval_loss import build_image_retrieval_candidate_mask, info_nce_loss
 
 cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -819,74 +820,6 @@ def build_retrieval_soft_targets(
     return targets
 
 
-def build_image_retrieval_candidate_mask(
-    satellite_ids: torch.Tensor,
-    num_locations: int = NUM_LOCATIONS,
-) -> torch.Tensor:
-    """Ignore other batch rows that contain the same satellite.
-
-    Each query keeps all regions from its paired row. Regions from another row
-    with the same satellite ID are removed from the loss denominator so they
-    cannot act as false negatives or contribute gradients for that query.
-    """
-    if satellite_ids.ndim != 1:
-        raise ValueError(
-            f"Expected satellite_ids shape (B,), got {tuple(satellite_ids.shape)}."
-        )
-    if num_locations <= 0:
-        raise ValueError(f"num_locations must be positive, got {num_locations}.")
-
-    batch_size = satellite_ids.shape[0]
-    device = satellite_ids.device
-    candidate_rows = torch.arange(device=device, end=batch_size).repeat_interleave(
-        num_locations
-    )
-    query_rows = torch.arange(device=device, end=batch_size).unsqueeze(1)
-    same_satellite = satellite_ids.unsqueeze(1).eq(
-        satellite_ids[candidate_rows].unsqueeze(0)
-    )
-    same_row = query_rows.eq(candidate_rows.unsqueeze(0))
-    return ~(same_satellite & ~same_row)
-
-
-def info_nce_loss(
-    query_feats: torch.Tensor,
-    candidate_feats: torch.Tensor,
-    positive_indices: torch.Tensor,
-    temperature: float = 0.07,
-    candidate_mask: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    query_feats = F.normalize(query_feats, p=2, dim=1)
-    candidate_feats = F.normalize(candidate_feats, p=2, dim=1)
-    sim_matrix = torch.matmul(query_feats, candidate_feats.T) / temperature
-
-    if candidate_mask is not None:
-        if candidate_mask.shape != sim_matrix.shape:
-            raise ValueError(
-                "candidate_mask must match the similarity matrix shape, "
-                f"got mask={tuple(candidate_mask.shape)} and "
-                f"similarities={tuple(sim_matrix.shape)}."
-            )
-        candidate_mask = candidate_mask.to(device=sim_matrix.device, dtype=torch.bool)
-        if positive_indices.ndim == 1:
-            if positive_indices.shape[0] != sim_matrix.shape[0]:
-                raise ValueError("Class-index targets must have one entry per query.")
-        elif positive_indices.shape != sim_matrix.shape:
-            raise ValueError(
-                "positive_indices must contain class indices or a target matrix, "
-                f"got shape {tuple(positive_indices.shape)}."
-            )
-
-        # A constant replacement removes the masked logits from both the loss
-        # denominator and the backward graph. This blocks gradients on both the
-        # query and candidate sides for duplicate-satellite false negatives.
-        sim_matrix = sim_matrix.masked_fill(
-            ~candidate_mask,
-            torch.finfo(sim_matrix.dtype).min,
-        )
-    return F.cross_entropy(sim_matrix, positive_indices)
-
-
 def within_image_text_alignment_loss(
     text_feats: torch.Tensor,
     grid_feats: torch.Tensor,
@@ -1342,7 +1275,10 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                     positive_indices[row_indices_flat, global_positive_indices] = 0.92
 
                     image_retrieval_candidate_mask = (
-                        build_image_retrieval_candidate_mask(satellite_ids)
+                        build_image_retrieval_candidate_mask(
+                            satellite_ids,
+                            NUM_LOCATIONS,
+                        )
                     )
                     image_retrieval_loss = info_nce_loss(
                         anchor_feats,
@@ -1355,23 +1291,24 @@ def train(save_path: str, end_num: float, use_ap: bool = True) -> None:
                         and text_feats is not None
                         and current_text_pooler_align_weight > 0
                     ):
-                        pair_labels = torch.arange(B, device=accelerator.device)
-                        detach_image_for_text_align = text_pooler_align_detach_image(epoch)
-                        align_anchor_feats = (
-                            anchor_feats.detach()
-                            if detach_image_for_text_align
-                            else anchor_feats
+                        text_align_grid_feats = (
+                            fused_feats.get("text_align_grid_feats", grid_feats)
+                            if isinstance(fused_feats, dict)
+                            else grid_feats
                         )
                         if current_text_pooler_align_target == "inner":
                             text_pooler_align_loss = within_image_text_alignment_loss(
                                 text_feats.detach(),
-                                grid_feats,
+                                text_align_grid_feats,
                                 local_indices,
                             )
                         elif current_text_pooler_align_target == "satellite":
                             text_pooler_align_loss = info_nce_loss(
                                 text_feats.detach(),
-                                candidate_feats,
+                                text_align_grid_feats.reshape(
+                                    -1,
+                                    Config.PROJECTION_DIM,
+                                ),
                                 positive_indices,
                             )
                         # text_satellite_retrieval_loss = info_nce_loss(

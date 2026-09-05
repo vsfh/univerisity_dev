@@ -1,6 +1,6 @@
-exp_name: baseline_wo_heading_input_ids_5x3
+exp_name: baseline_wo_heading_0.7_ada_5x3
 save_root: outputs
-end_num: 0.1
+end_num: 0.7
 use_ap: true
 
 config:
@@ -12,7 +12,7 @@ config:
   MODEL_NAME: google/siglip2-base-patch16-224
   USE_AMP: true
   ENABLE_TF32: true
-  ENCODER_TYPE: test
+  ENCODER_TYPE: ada
   LORA_RANK: 8
   LORA_ALPHA: 16.0
   LORA_DROPOUT: 0.05

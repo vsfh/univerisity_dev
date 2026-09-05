@@ -1,0 +1,11 @@
+A4 数据集总览——面板说明
+========================
+
+(a) Global location coverage：合并训练与测试后的 3,530 条 KML 地点记录。颜色 Z1–Z5 表示热带、亚热带、温带、冷温带和极地纬度带。
+(b) Climate zones：各纬度气候代理带的地点占比；它不是实测 Köppen 气候标签。
+(c) Local candidate overlap：真实密集样例 1399（Toronto, Canada）；半径 1 km 内有 125 个其他 candidate region。橙色为 query，灰蓝色为其他候选；方形 tile outline 仅为重叠关系示意，不是地理配准边界。
+(d) Local ambiguity distribution：每个地点半径 1 km 内其他 candidate-region center 数量的 CCDF。中位数 5、P75=25、P90=86、均值=21.27；15.0% 的地点没有邻居。
+(e) SigLIP2 vision t-SNE：每个地点固定取 250 米、0° 的无人机图像，用 google/siglip2-base-patch16-224 得到 768 维 L2 归一化 pooled vision feature；共 3,507 张图像（相对 KML 地点缺 23 张固定视角图），颜色 C1–C6 是无监督视觉分组。
+(f) Vision feature distance：随机抽取 100,000 对固定视角图像，展示其 SigLIP2 特征余弦距离分布；中位数为 0.200。
+
+植被/气候解释边界：纬度只提供宏观气候代理，实际植被还取决于降水、海拔、土壤、洋流和土地利用。

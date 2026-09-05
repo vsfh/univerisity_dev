@@ -1,6 +1,6 @@
-exp_name: baseline_retrieval_text_5x3
+exp_name: baseline_pre_ada_2_5x3
 save_root: outputs
-end_num: 0.1
+end_num: 0.5
 use_ap: true
 
 config:
@@ -12,14 +12,17 @@ config:
   MODEL_NAME: google/siglip2-base-patch16-224
   USE_AMP: true
   ENABLE_TF32: true
-  ENCODER_TYPE: test
+  ENCODER_TYPE: model_pre_ada
+  PRETRAINED_CHECKPOINT: outputs/baseline_retrieval_only_ada_5x3/last.pth
   LORA_RANK: 8
   LORA_ALPHA: 16.0
   LORA_DROPOUT: 0.05
-  OPTIMIZE_OBJECTIVE: img_text_only
-  USE_ANGLE_INPUT: false
-  USE_TEXT_INPUT: true
-  USE_HEATMAP_LOSS: false
+  OPTIMIZE_OBJECTIVE: bbox_only
+  GROUNDING_START_EPOCH: 0
+  GROUNDING_WARMUP_EPOCHS: 0
+  USE_ANGLE_INPUT: true
+  USE_TEXT_INPUT: false
+  USE_HEATMAP_LOSS: true
   HEATMAP_LOSS_WEIGHT: 0.2
   HEATMAP_CONFIDENCE_WEIGHT: 0.5
   USE_REFINE_LOSS: false

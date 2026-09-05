@@ -683,13 +683,15 @@ class Encoder_ada(Encoder_test):
         sat_feats: torch.Tensor,
         image_h: int,
         image_w: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        build_text_align_features: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         batch_size, _, channels = sat_feats.shape
         grid_h, grid_w = _infer_patch_grid(sat_feats.shape[1], image_h, image_w)
         hidden_grid = sat_feats.reshape(batch_size, grid_h, grid_w, channels)
         row_bounds = [round(i * grid_h / GRID_ROWS) for i in range(GRID_ROWS + 1)]
         col_bounds = [round(i * grid_w / GRID_COLS) for i in range(GRID_COLS + 1)]
 
+        regions = []
         region_features = []
         for row in range(GRID_ROWS):
             for col in range(GRID_COLS):
@@ -698,10 +700,27 @@ class Encoder_ada(Encoder_test):
                     row_bounds[row]:row_bounds[row + 1],
                     col_bounds[col]:col_bounds[col + 1],
                 ].reshape(batch_size, -1, channels)
+                regions.append(region)
                 region_features.append(self.attnPooling(region, 1))
 
+        text_align_features = []
+        if build_text_align_features:
+            text_align_features = [
+                self.attnPooling(region.detach(), 1)
+                for region in regions
+            ]
+
         sat_features_2d = hidden_grid.permute(0, 3, 1, 2).contiguous()
-        return torch.cat(region_features, dim=1), sat_features_2d
+        text_align_region_features = (
+            torch.cat(text_align_features, dim=1)
+            if text_align_features
+            else None
+        )
+        return (
+            torch.cat(region_features, dim=1),
+            text_align_region_features,
+            sat_features_2d,
+        )
 
     def forward(
         self,
@@ -727,10 +746,13 @@ class Encoder_ada(Encoder_test):
             interpolate_pos_encoding=True,
         )
         sat_feats = sat_output.last_hidden_state
-        region_features, sat_features_2d = self._pool_satellite_regions(
-            sat_feats,
-            search_pixel_values.shape[-2],
-            search_pixel_values.shape[-1],
+        region_features, text_align_region_features, sat_features_2d = (
+            self._pool_satellite_regions(
+                sat_feats,
+                search_pixel_values.shape[-2],
+                search_pixel_values.shape[-1],
+                build_text_align_features=text_pooler is not None,
+            )
         )
 
         pred_anchor, heatmap_out = self._bbox_forward_from_anchor_feats(
@@ -739,12 +761,16 @@ class Encoder_ada(Encoder_test):
             angle,
             detach_anchor=True,
         )
+        aux_outputs = {}
+        if text_align_region_features is not None:
+            aux_outputs["text_align_grid_feats"] = text_align_region_features
+
         return (
             pred_anchor,
             None,
             text_pooler,
             anchor_pooler,
             region_features,
-            {},
+            aux_outputs,
             heatmap_out,
         )
