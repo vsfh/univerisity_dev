@@ -42,10 +42,20 @@ def prepare_candidate_targets(
     candidate_feats: torch.Tensor,
     batch: Dict[str, Any],
     requested_granularity: str = "auto",
+    image_wh: Optional[Tuple[int, int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, str]:
     granularity = infer_granularity(candidate_feats, requested_granularity)
     if granularity == "grid":
-        local_indices = batch["index"].to(candidate_feats.device).long()
+        if image_wh is None:
+            local_indices = batch["index"].to(candidate_feats.device).long()
+        else:
+            # exp.dataset emits 3x5 labels. Existing baseline heads remain 3x3.
+            # Re-route the SAME bbox to that head; do not change the dataset.
+            bbox = batch["bbox"].to(candidate_feats.device)
+            center = (bbox[:, :2] + bbox[:, 2:]) * 0.5
+            col = (center[:, 0] / float(image_wh[0]) * 3).long().clamp(0, 2)
+            row = (center[:, 1] / float(image_wh[1]) * 3).long().clamp(0, 2)
+            local_indices = row * 3 + col
         satellite_ids = batch.get("satellite_id")
         if isinstance(satellite_ids, torch.Tensor):
             satellite_ids = satellite_ids.to(candidate_feats.device)
@@ -78,11 +88,13 @@ def compute_retrieval_loss(
     requested_granularity: str = "auto",
     text_feats: Optional[torch.Tensor] = None,
     use_text_loss: bool = False,
+    image_wh: Optional[Tuple[int, int]] = None,
 ) -> RetrievalLossResult:
     flat_candidates, targets, granularity = prepare_candidate_targets(
         candidate_feats,
         batch,
         requested_granularity=requested_granularity,
+        image_wh=image_wh,
     )
     image_loss = contrastive_loss(query_feats, flat_candidates, targets, temperature)
     text_loss = None

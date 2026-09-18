@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from grounding.losses import build_geo_features, decode_anchor_prediction
+from grounding.losses import anchor_predictions_for_loss_and_decode, build_geo_features, decode_anchor_prediction
 from grounding.legacy.train_sm import decode_anchor_free
 
 
@@ -59,7 +59,8 @@ class BaseAdapter:
     def decode(self, output: GroundingOutput, batch: Dict[str, Any], anchors_full: torch.Tensor) -> torch.Tensor:
         if output.pred_bbox is not None:
             return output.pred_bbox
-        return decode_anchor_prediction(output.pred_anchor, anchors_full, output.image_wh)
+        predictions = anchor_predictions_for_loss_and_decode(output, self.cfg)
+        return decode_anchor_prediction(predictions, anchors_full, output.image_wh)
 
 
 class SiglipTupleAdapter(BaseAdapter):

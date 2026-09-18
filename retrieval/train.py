@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dataset import ShiftedSatelliteDroneDataset
+from exp.dataset import ShiftedSatelliteDroneDataset
 from retrieval.config import load_config
 from retrieval.losses import compute_retrieval_loss
 from retrieval.registry import build_model_and_adapter, build_processors_and_tokenizer
@@ -110,6 +110,7 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
                     requested_granularity=str(cfg["loss"]["granularity"]),
                     text_feats=payload.text_feats,
                     use_text_loss=bool(cfg["loss"]["use_text_loss"]),
+                    image_wh=(int(cfg["data"]["sat_size"]["width"]), int(cfg["data"]["sat_size"]["height"])),
                 )
                 loss_to_backward = losses.total / grad_accumulation_steps
             scaler.scale(loss_to_backward).backward()
@@ -135,7 +136,8 @@ def train(cfg: Dict[str, Any], dry_run: bool = False, max_steps: int = 0) -> Dic
         writer.add_scalar("Loss/train_epoch", avg_loss, epoch)
         if avg_loss < best_loss:
             best_loss = avg_loss
-            _save_checkpoint(model, cfg["save_dir"], "best.pth")
+            if bool(cfg["train"].get("save_best", True)):
+                _save_checkpoint(model, cfg["save_dir"], "best.pth")
         if max_steps > 0 and global_step >= max_steps:
             break
 

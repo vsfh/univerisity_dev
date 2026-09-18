@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, Tuple
 import torch.nn as nn
 
 from retrieval.adapters import BaseRetrievalAdapter, ForwardMethodAdapter, SampleRetrievalAdapter
+from retrieval.processors import FullFrameHFProcessor, FullFrameTransformProcessor, image_hw
 
 
 @dataclass
@@ -75,14 +76,19 @@ def _build_hf_io(cfg: Dict[str, Any]) -> Tuple[Any, Any]:
     else:
         processor = AutoImageProcessor.from_pretrained(model_name, cache_dir=cache_dir)
         processor_sat = AutoImageProcessor.from_pretrained(model_name, cache_dir=cache_dir)
-    _set_size(processor_sat, cfg["data"]["sat_size"])
+    if str(model_cfg["type"]) == "clip":
+        native_hw = image_hw(processor.image_processor.crop_size)
+        processor = FullFrameHFProcessor(processor, cfg["data"]["drone_size"], native_hw)
+        processor_sat = FullFrameHFProcessor(processor_sat, cfg["data"]["sat_size"], native_hw)
+    else:
+        _set_size(processor_sat, cfg["data"]["sat_size"])
     tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
     return (processor, processor_sat), tokenizer
 
 
 def _build_openclip_io(cfg: Dict[str, Any]) -> Tuple[Any, Any]:
     import open_clip
-    from retrieval.train_openclip import OpenClipImageProcessorWrapper, OpenClipTokenizerWrapper
+    from retrieval.train_openclip import OpenClipTokenizerWrapper
 
     model_cfg = cfg["model"]
     _, _, preprocess = open_clip.create_model_and_transforms(
@@ -90,23 +96,25 @@ def _build_openclip_io(cfg: Dict[str, Any]) -> Tuple[Any, Any]:
         pretrained=model_cfg.get("pretrained"),
         cache_dir=str(model_cfg["cache_dir"]),
     )
-    processor = OpenClipImageProcessorWrapper(preprocess)
+    processor = FullFrameTransformProcessor(preprocess, cfg["data"]["drone_size"])
+    processor_sat = FullFrameTransformProcessor(preprocess, cfg["data"]["sat_size"])
     tokenizer = OpenClipTokenizerWrapper(open_clip.get_tokenizer(str(model_cfg["model_name"])))
-    return (processor, processor), tokenizer
+    return (processor, processor_sat), tokenizer
 
 
 def _build_evaclip_io(cfg: Dict[str, Any]) -> Tuple[Any, Any]:
     import open_clip
-    from retrieval.train_evaclip import OpenClipImageProcessorWrapper, OpenClipTokenizerWrapper
+    from retrieval.train_evaclip import OpenClipTokenizerWrapper
 
     model_cfg = cfg["model"]
     _, _, preprocess = open_clip.create_model_and_transforms(
         str(model_cfg["model_name"]),
         cache_dir=str(model_cfg["cache_dir"]),
     )
-    processor = OpenClipImageProcessorWrapper(preprocess)
+    processor = FullFrameTransformProcessor(preprocess, cfg["data"]["drone_size"])
+    processor_sat = FullFrameTransformProcessor(preprocess, cfg["data"]["sat_size"])
     tokenizer = OpenClipTokenizerWrapper(open_clip.get_tokenizer(str(model_cfg["model_name"])))
-    return (processor, processor), tokenizer
+    return (processor, processor_sat), tokenizer
 
 
 def _build_sample_io(cfg: Dict[str, Any]) -> Tuple[Any, Any]:

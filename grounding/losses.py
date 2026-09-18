@@ -286,6 +286,21 @@ def add_heatmap_to_confidence(
     return torch.cat([pred_anchor[:, :, :4, :, :], pred_anchor[:, :, 4:5, :, :] + heat_confidence], dim=2)
 
 
+def anchor_predictions_for_loss_and_decode(output: Any, cfg: Dict[str, Any]) -> torch.Tensor:
+    """Use the same enabled heatmap fusion in training and final box selection."""
+    pred_anchor = output.pred_anchor
+    if pred_anchor.ndim == 4:
+        pred_anchor = pred_anchor.view(
+            pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3]
+        )
+    if bool(cfg["model"].get("use_heatmap", False)):
+        pred_anchor = add_heatmap_to_confidence(
+            pred_anchor, output.heatmap,
+            float(cfg["loss"].get("heatmap_confidence_weight", 0.5)),
+        )
+    return pred_anchor
+
+
 def compute_grounding_loss(
     output: Any,
     batch: Dict[str, Any],
@@ -325,13 +340,7 @@ def compute_grounding_loss(
         cls_loss = zero
         heatmap_loss = zero
     else:
-        if pred_anchor.ndim == 4:
-            pred_anchor = pred_anchor.view(pred_anchor.shape[0], 9, 5, pred_anchor.shape[2], pred_anchor.shape[3])
-        pred_anchor = add_heatmap_to_confidence(
-            pred_anchor,
-            output.heatmap,
-            float(cfg["loss"]["heatmap_confidence_weight"]),
-        )
+        pred_anchor = anchor_predictions_for_loss_and_decode(output, cfg)
         grid_wh = (pred_anchor.shape[4], pred_anchor.shape[3])
         new_gt_bbox, best_anchor_gi_gj = build_target(target_bbox, anchors_full, image_wh, grid_wh)
         geo_loss, cls_loss = yolo_loss(

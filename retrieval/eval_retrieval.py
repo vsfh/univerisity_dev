@@ -62,7 +62,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
 	sys.path.insert(0, str(REPO_ROOT))
 
-from dataset import ShiftedSatelliteDroneDataset
+from exp.dataset import ShiftedSatelliteDroneDataset
 from unified_siglip_supp import visualize_batch
 
 def _load_encoder_classes():
@@ -676,6 +676,16 @@ def _build_model_and_io(
 ):
 	model_type = _canonical_model_type(model_type)
 	model_config = model_config or {}
+	if model_type in {"clip", "siglip", "openclip", "evaclip", "sample_retrieval"}:
+		# Share exactly the training processor and encoder factory.
+		from retrieval.config import DEFAULT_CONFIG, _merge_dict
+		from retrieval.registry import build_model_and_adapter, build_processors_and_tokenizer
+		cfg = _merge_dict(DEFAULT_CONFIG, {"model": {**model_config, "type": model_type}})
+		if model_type == "sample_retrieval":
+			cfg["model"]["pretrained_backbone"] = False  # checkpoint loaded below
+		model, _ = build_model_and_adapter(cfg)
+		(processor, processor_sat), tokenizer = build_processors_and_tokenizer(cfg)
+		return model.to(device), processor, processor_sat, tokenizer
 
 	if model_type == "siglip":
 		model_name = str(model_config.get("model_name", SIGLIP_MODEL_NAME))

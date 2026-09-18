@@ -23,7 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bbox.yolo_utils import get_tensor_anchors
-from dataset import ShiftedSatelliteDroneDataset
+from exp.dataset import ShiftedSatelliteDroneDataset
 from grounding.config import load_config
 from grounding.losses import compute_grounding_loss
 from grounding.processors import build_grounding_image_processors

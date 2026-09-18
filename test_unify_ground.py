@@ -12,7 +12,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from bbox.yolo_utils import bbox_iou
-from dataset import ShiftedSatelliteDroneDataset
+from exp.dataset import ShiftedSatelliteDroneDataset
 from grounding.config import load_config
 from grounding.processors import build_grounding_image_processors
 from grounding.registry import build_model_and_adapter
