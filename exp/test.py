@@ -15,6 +15,7 @@ from transformers import AutoImageProcessor, AutoTokenizer
 from bbox.yolo_utils import bbox_iou, build_target, eval_iou_acc
 from dataset import DEFAULT_SUBSET_ANGLES, DEFAULT_SUBSET_HEIGHTS, ShiftedSatelliteDroneDataset
 from hf_cache_utils import from_pretrained_prefer_local
+from batch_parallel import wrap_batch_parallel
 from model import Encoder_ada, Encoder_test
 from model_abla import model_bi, model_bi_ada, model_pre, model_pre_ada
 
@@ -146,7 +147,7 @@ def load_model(args, device):
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(state, strict=True)
     model.eval()
-    return model
+    return wrap_batch_parallel(model, getattr(args, "data_parallel_gpus", 1), device, args.seed)
 
 
 def extract_features(args, device):
@@ -339,6 +340,7 @@ def parse_args():
     parser.add_argument("--heatmap-confidence-weight", type=float, default=0.5)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=43)
+    parser.add_argument("--data-parallel-gpus", type=int, default=1, choices=[1, 3])
     return parser.parse_args()
 
 

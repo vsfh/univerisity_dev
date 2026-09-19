@@ -32,7 +32,7 @@ class HeatmapSweepTests(unittest.TestCase):
             victim.mkdir()
             (victim / "keep").write_text("keep")
             try:
-                (root / "outputs/heatmap_lambda_box_0p5").symlink_to(victim, target_is_directory=True)
+                (root / "outputs/heatmap_lambda_box_0p5_42").symlink_to(victim, target_is_directory=True)
             except OSError:
                 self.skipTest("Symlinks unavailable on this host")
             with self.assertRaises(ValueError):
@@ -60,7 +60,8 @@ class HeatmapSweepTests(unittest.TestCase):
                 self.assertEqual(payload["config"]["HEATMAP_CONFIDENCE_WEIGHT"], 0.5)
                 self.assertTrue(runtime.is_relative_to(root / "outputs"))
                 if "--save-dir" in command:
-                    expected_weight = study.WEIGHTS[((len(calls) - 1) // 2) % 15 // 3]
+                    run_index = ((len(calls) - 1) // 2) % (len(study.WEIGHTS) * len(study.SEEDS))
+                    expected_weight = study.WEIGHTS[run_index // len(study.SEEDS)]
                     self.assertEqual(payload["config"]["HEATMAP_LOSS_WEIGHT"], expected_weight / 0.5)
                     checkpoint_dir = Path(command[command.index("--save-dir") + 1])
                     self.assertFalse(checkpoint_dir.exists())
@@ -78,11 +79,13 @@ class HeatmapSweepTests(unittest.TestCase):
                     patch.object(study, "run_command", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
                 study.main()
                 study.main()
-            self.assertEqual(len(calls), 60)
-            result = json.loads((root / "outputs/heatmap_lambda_box_0p5/summary.json").read_text())
-            self.assertEqual(len(result["completed_runs"]), 15)
-            self.assertTrue(all(row["n_completed"] == 3 for row in result["rows"]))
-            self.assertTrue(all(row["recall@1_std"] == 0 for row in result["rows"]))
+            expected_runs = len(study.WEIGHTS) * len(study.SEEDS)
+            self.assertEqual(len(calls), 4 * expected_runs)
+            result = json.loads((root / "outputs/heatmap_lambda_box_0p5_42/summary.json").read_text())
+            self.assertEqual(len(result["completed_runs"]), expected_runs)
+            self.assertTrue(all(row["n_completed"] == len(study.SEEDS) for row in result["rows"]))
+            expected_std = 0 if len(study.SEEDS) > 1 else None
+            self.assertTrue(all(row["recall@1_std"] == expected_std for row in result["rows"]))
 
 
 if __name__ == "__main__":

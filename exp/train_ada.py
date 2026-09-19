@@ -35,6 +35,7 @@ from bbox.yolo_utils import (
 )
 from dataset import ShiftedSatelliteDroneDataset
 from hf_cache_utils import from_pretrained_prefer_local
+from batch_parallel import wrap_batch_parallel
 from model_abla import model_bi, model_bi_ada, model_pre, model_pre_ada
 
 cudnn.benchmark = False
@@ -65,6 +66,7 @@ class Config:
     NUM_EPOCHS = 16
     BATCH_SIZE = 16
     GRAD_ACCUMULATION_STEPS = 2
+    DATA_PARALLEL_GPUS = 1  # Split the existing global batch; never multiply it.
     LEARNING_RATE = 5e-5
     GRAD_CLIP_NORM = 1.0
     LR_MIN = 1e-10
@@ -1128,6 +1130,13 @@ def train(save_path: str, end_num: float, use_ap: bool = True, seed: int = 42) -
     tokenizer = from_pretrained_prefer_local(AutoTokenizer, model_name, Config.CACHE_DIR)
 
     model = build_encoder(use_ap, usesg=Config.OPTIMIZE_OBJECTIVE != "bbox_only")
+    if Config.DATA_PARALLEL_GPUS > 1:
+        if accelerator.num_processes != 1:
+            raise ValueError("DATA_PARALLEL_GPUS requires one process; use the three-GPU script.")
+        if accelerator.gradient_accumulation_steps != Config.GRAD_ACCUMULATION_STEPS:
+            raise ValueError("An environment override changed gradient accumulation.")
+        # Wrap BEFORE accelerator.prepare adds its autocast/FP32-output forward wrapper.
+        model = wrap_batch_parallel(model, Config.DATA_PARALLEL_GPUS, accelerator.device, seed)
     # model = Encoder_dino()
 
     anchors_full = get_tensor_anchors(accelerator.device)
