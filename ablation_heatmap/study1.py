@@ -20,8 +20,8 @@ import zipfile
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-WEIGHTS = [0.01, 0.05, 0.1, 0.2, 0.4]
-SEEDS = [42, 43, 44]  # All seeds in the shared summary, independent of this worker.
+WEIGHTS = [0.4, 0.2, 0.1, 0.05, 0.01]
+SEEDS = [44, 43, 42]  # All seeds in the shared summary, independent of this worker.
 BOX_WEIGHT = 0.5
 METRICS = ["recall@1", "recall@5", "recall@10", "mean_iou",
            "ratio_iou_gt_0_5", "uIoU", "ratio_uIoU_gt_0_25",

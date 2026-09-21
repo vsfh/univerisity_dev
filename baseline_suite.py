@@ -51,13 +51,18 @@ def save_summary(output, rows):
         writer.writerows(rows)
 
 
-def main(names=None):
+def main(names=None, output_name="baseline_recheck"):
     from grounding.config import load_config as load_grounding
     from retrieval.config import load_config as load_retrieval
 
     names = list(MODELS) if not names else list(names)
     if len(names) != len(set(names)) or any(name not in MODELS for name in names):
         raise ValueError("Choose distinct model names from: " + ", ".join(MODELS))
+    if not output_name or output_name in (".", "..") or any(
+        char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+        for char in output_name
+    ):
+        raise ValueError("Output name must be a single directory name.")
     # Read every source config before replacing the previous suite output.
     configs = {}
     for key in names:
@@ -66,8 +71,8 @@ def main(names=None):
         configs[key] = loader(str(ROOT / "configs" / family / (name + ".yaml")))
 
     outputs = (ROOT / "outputs").resolve()
-    output = ROOT / "outputs" / "baseline_recheck"
-    if output.is_symlink() or output.resolve() != outputs / "baseline_recheck":
+    output = ROOT / "outputs" / output_name
+    if output.is_symlink() or output.resolve() != outputs / output_name:
         raise ValueError("Refusing to replace a redirected suite directory.")
     if output.exists():
         shutil.rmtree(output)

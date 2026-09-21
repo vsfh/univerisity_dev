@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import patch
 
 import torch
@@ -111,11 +112,12 @@ class ThreeGpuTests(unittest.TestCase):
                     self.assertEqual(Path(command[1]).name, "train_ada.py")
                     self.assertNotIn("accelerate.commands.launch", command)
                     run_idx = (len(calls) - 1) // 2
-                    weight = study.WEIGHTS[run_idx // len(study.SEEDS)]
+                    weight = study.WEIGHTS[run_idx // 2]
                     self.assertEqual(cfg["config"]["HEATMAP_LOSS_WEIGHT"], weight / 0.5)
                     checkpoint_dir = Path(command[command.index("--save-dir") + 1])
                     checkpoint_dir.mkdir()
-                    (checkpoint_dir / "last.pth").write_text("mock only")
+                    with zipfile.ZipFile(checkpoint_dir / "last.pth", "w") as archive:
+                        archive.writestr("mock", "not a real model")
                 else:
                     self.assertIn("--save-dir", calls[-2])
                     self.assertEqual(command[command.index("--data-parallel-gpus") + 1], "3")
@@ -126,7 +128,11 @@ class ThreeGpuTests(unittest.TestCase):
                                      calls[-2][calls[-2].index("--seed") + 1])
                     name = command[command.index("--output-suffix") + 1]
                     path = Path(command[command.index("--output-dir") + 1]) / (name + ".json")
-                    path.write_text(json.dumps({"overall": {key: 0.5 for key in study.METRICS}}))
+                    path.write_text(json.dumps({
+                        "checkpoint": str(checkpoint), "candidate_size": 100,
+                        "test_crop_ratio": 1.0, "sat_size": {"height": 432, "width": 768},
+                        "overall": {"num_samples": 32, **{key: 0.5 for key in study.METRICS}},
+                    }))
 
             with patch.object(study, "ROOT", root), \
                  patch.object(study.sys, "argv", ["three_gpu.py"]), \
@@ -136,23 +142,24 @@ class ThreeGpuTests(unittest.TestCase):
                  patch.object(study, "run_command", side_effect=fake_run), \
                  contextlib.redirect_stdout(io.StringIO()):
                 study.main(3)
-            self.assertEqual(len(calls), len(study.WEIGHTS) * len(study.SEEDS) * 2)
+                study.main(3)  # Finished experiments never launch another subprocess.
+            self.assertEqual(len(calls), len(study.WEIGHTS) * 2 * 2)
             self.assertTrue((single / "keep").exists())
-            output = root / "outputs/heatmap_lambda_box_0p5_3gpu"
-            manifest = json.loads((output / "parallel_config.json").read_text())
+            output = root / "outputs/heatmap_lambda_box_0p5"
+            manifest = json.loads(next((output / "metadata").glob("launcher_*.json")).read_text())
             self.assertEqual(manifest["effective_batch_size"], 64)
             summary = json.loads((output / "summary.json").read_text())
-            self.assertEqual(len(summary["completed_runs"]), len(study.WEIGHTS) * len(study.SEEDS))
+            self.assertEqual(len(summary["completed_runs"]), len(study.WEIGHTS) * 2)
 
-    def test_three_gpu_reset_cannot_delete_single_gpu_results(self):
+    def test_both_single_and_three_gpu_results_are_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            single = study.reset_output(root)
+            single = study.prepare_output(root)
             (single / "keep").write_text("keep")
-            parallel = study.reset_output(root, 3)
+            parallel = study.prepare_output(root, 3)
             (parallel / "old").write_text("old")
-            self.assertEqual(study.reset_output(root, 3), parallel)
-            self.assertFalse((parallel / "old").exists())
+            self.assertEqual(study.prepare_output(root, 3), parallel)
+            self.assertTrue((parallel / "old").exists())
             self.assertTrue((single / "keep").exists())
 
 

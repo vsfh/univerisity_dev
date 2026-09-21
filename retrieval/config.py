@@ -10,7 +10,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "save_dir": "/media/data1/feihong/ckpt/retrieval_exp",
     "model": {
         "type": "siglip",
-        "model_name": "google/siglip-base-patch16-224",
+        "model_name": "google/siglip2-base-patch16-224",
         "pretrained": None,
         "cache_dir": "/media/data1/feihong/hf_cache",
         "proj_dim": 768,

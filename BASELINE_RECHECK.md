@@ -24,3 +24,11 @@ bash run_baselines.sh
 CLIP token 切片、所有网络结构、原训练超参数、数据划分及候选集采样逻辑保持原样。EVA 原配置未指定预训练权重的问题也没有扩大范围修改，本脚本不保证该配置已经预训练。UnifyGeo/TransGeo 不在本次两项修复对应的重测列表中。本次修复不能单独证明所有基线已完全公平，也不保证指标必然提升。
 
 代码检查仅使用合成图像、合成张量和模拟子进程；没有自动启动真实训练或测试。
+
+
+## 2026-09-20 Loading fixes
+
+CLIP image_hw now accepts Transformers SizeDict and retains full-frame resizing. The siglip retrieval config now uses cached google/siglip2-base-patch16-224; the encoder, processor, and tokenizer honor model.cache_dir. The retrieval_siglip command key is retained, but new results must be labeled SigLIP2 rather than SigLIP1. Dataset class, retrieval head, and training hyperparameters are unchanged.
+
+
+Run only the repaired pair: CUDA_VISIBLE_DEVICES=0 bash run_clip_siglip2.sh. Trains and tests CLIP then SigLIP2, without validation or resume, using last.pth. All outputs go to ./outputs/clip_siglip2_recheck; a rerun overwrites only that directory and preserves baseline_recheck and heatmap studies.

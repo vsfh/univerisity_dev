@@ -26,7 +26,11 @@ def _build_siglip(cfg: Dict[str, Any]) -> nn.Module:
     from retrieval.train_siglip import Encoder
 
     model_cfg = cfg["model"]
-    return Encoder(str(model_cfg["model_name"]), proj_dim=int(model_cfg.get("proj_dim", 768)))
+    return Encoder(
+        str(model_cfg["model_name"]),
+        proj_dim=int(model_cfg.get("proj_dim", 768)),
+        cache_dir=model_cfg.get("cache_dir"),
+    )
 
 
 def _build_openclip(cfg: Dict[str, Any]) -> nn.Module:

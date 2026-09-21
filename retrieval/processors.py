@@ -6,10 +6,15 @@ from torchvision.transforms import CenterCrop, Compose, Resize
 
 
 def image_hw(size):
-    if isinstance(size, dict):
-        if "height" in size:
-            return int(size["height"]), int(size["width"])
-        size = size["shortest_edge"]
+    # Transformers SizeDict exposes get() but is not a dict or Mapping.
+    if hasattr(size, "get"):
+        height, width = size.get("height"), size.get("width")
+        if height is not None and width is not None:
+            return int(height), int(width)
+        edge = size.get("shortest_edge")
+        if edge is None:
+            raise ValueError(f"Expected height/width or shortest_edge, got {size!r}")
+        size = edge
     if isinstance(size, (tuple, list)):
         return int(size[0]), int(size[1])
     return int(size), int(size)

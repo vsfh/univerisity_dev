@@ -1,46 +1,41 @@
-# Heatmap ablation: one command
+# Heatmap lambda ablation: shared output
 
-For one experiment using three GPUs together, run `bash ablation_heatmap/run_three_gpu.sh`.
-See [THREE_GPU.md](THREE_GPU.md) for batch equivalence, migration, and output paths.
+Both one-GPU and three-GPU launchers now use **outputs/heatmap_lambda_box_0p5/**.
+On the currently configured servers, outputs is the SAME shared filesystem, so no rsync is required between them.
 
-On the server, from /media/data1/feihong/univerisity_dev:
-
-```bash
-bash ablation_heatmap/run.sh
-```
-
-Runs in the foreground on GPU 0 using /home/feihong/miniconda3/bin/python.
-No prepare step, arguments, resume, or completed-run skipping.
-Every invocation replaces **only outputs/heatmap_lambda_box_0p5_42/** and
-trains the current 5 experiments from scratch. Stop any previous runner before restarting.
-Other output directories are untouched.
-
-- Fixed lambda_box: 0.5.
-- Outer lambda_heatmap: 0.01, 0.05, 0.1, 0.2, 0.4.
-- Seed: 42; 20 epochs per experiment from the existing baseline.
-- Loss: 0.5 L_retrieval + 0.5 L_box + lambda_heatmap L_heatmap.
-- The exp trainer nests heatmap loss inside the box coefficient, so generated
-  HEATMAP_LOSS_WEIGHT is lambda_heatmap / 0.5.
-- USE_HEATMAP_LOSS remains true even at zero; confidence fusion is unchanged.
-- Each training run is immediately followed by exp/test.py on last.pth.
-  Evaluation uses 100 candidates, crop ratio 1.0, and the matching training seed.
-- On error, execution stops and preserves the log; rerunning starts everything over.
-- Ctrl+C stops the foreground job; no background launcher is used.
-
-Training and evaluation output is shown in the terminal and saved under logs/.
-Configs, checkpoints, evaluation JSON, TensorBoard events (runtime/runs/), and caches
-are all under outputs/heatmap_lambda_box_0p5_42/. Ephemeral DataLoader IPC uses /tmp
-because the server's outputs mount does not support Unix sockets.
-summary.csv and summary.json update after each evaluation, with completed counts,
-means and sample standard deviations. Metrics use the original test.py units;
-an empty value means no result / insufficient seeds, not zero.
-
-Optional environment overrides:
+Three GPUs, seeds 42 and 43 (run in the activated training environment):
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 PYTHON=/path/to/python bash ablation_heatmap/run.sh
+CUDA_VISIBLE_DEVICES=0,1,2 bash ablation_heatmap/run_three_gpu.sh --seeds 42 43
 ```
 
-The original exp training, model, dataset, and evaluation implementations are reused.
-The exp/run_heatmap_ablation.sh shortcut invokes this same script.
-Code generation/deployment does not launch training.
+One GPU, seed 44:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 bash ablation_heatmap/run.sh --seeds 44
+```
+
+The defaults are also 42/43 for run_three_gpu.sh and 44 for run.sh. Explicit --seeds is recommended when splitting work. PYTHON=/path/to/python can select an environment. Within each launcher experiments remain sequential; three GPUs cooperate on the same experiment.
+
+- Outer lambda_heatmap: 0.01, 0.05, 0.1, 0.2, 0.4. lambda_box: 0.5.
+- Same original 20 epochs, global batch 32, accumulation 2, learning rate and full-batch InfoNCE.
+- The three-GPU path gathers outputs before loss computation; checkpoints retain ordinary parameter names.
+- Skip completed train+test results. If last.pth is complete, only finish missing evaluation. Otherwise retrain that experiment from epoch 1.
+- Existing scientific config mismatches stop rather than overwriting results. Device count alone does not force a completed experiment to rerun.
+- Each result/checkpoint/config name contains BOTH lambda and seed, e.g. heatmap_0p1_seed_43.
+- Per-experiment mkdir locks prevent duplicate writers across hosts. Summary updates use a separate shared lock and atomic replacement.
+- summary.csv/json always include all available seeds 42,43,44, regardless of which seeds this worker executes. n_expected=3; missing seeds are not zero measurements.
+- metadata/ records original training GPU count, legacy source and subsequent evaluation mode.
+- Logs append. Ctrl+C stops the current foreground task. No training is launched by deployment or merging.
+
+Existing directories were consolidated using:
+
+```bash
+python ablation_heatmap/merge_outputs.py --apply
+```
+
+This only merges artifacts, never trains/tests. Original folders remain intact; large checkpoints and logs use **relative symlinks** to avoid copies. **Do not delete the old _42/_3gpu directories while links reference them.** The report is outputs/heatmap_lambda_box_0p5/merge_report.json. Missing configs are recovered only when effective_config.json proves matching parameters. Conflicting completed metrics for the same lambda/seed stop the merge for manual selection.
+
+Different-seed jobs can run concurrently. If a process was killed without cleanup, inspect locks/<run>/owner.json and confirm that host/process is no longer running before removing that stale lock directory. Never remove another active worker's lock.
+
+If future servers do not share outputs, using the same relative directory alone does not synchronize files; explicitly synchronize artifacts and rebuild the global summary. No automatic cross-server transfer is configured.

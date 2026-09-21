@@ -30,7 +30,7 @@ torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.benchmark = True
 
 # --- Configuration ---
-MODEL_NAME = "google/siglip-base-patch16-224"
+MODEL_NAME = "google/siglip2-base-patch16-224"
 CACHE_DIR = "/media/data1/feihong/hf_cache"
 DRONE_VIEW_FOLDER = "/media/data1/feihong/drone_view"
 IMAGE_FOLDER = "/media/data1/feihong/image_1024"
@@ -215,11 +215,13 @@ class TargetSearchDataset(Dataset):
 
 
 class Encoder(nn.Module):
-    def __init__(self, model_name, proj_dim=768):
+    def __init__(self, model_name, proj_dim=768, cache_dir=None):
         super().__init__()
 
         try:
-            self.model = AutoModel.from_pretrained(model_name, cache_dir=CACHE_DIR)
+            self.model = AutoModel.from_pretrained(
+                model_name, cache_dir=CACHE_DIR if cache_dir is None else cache_dir
+            )
             self.vision_model = self.model.vision_model
             self.text_model = self.model.text_model
 
